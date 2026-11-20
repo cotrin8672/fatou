@@ -498,6 +498,17 @@ pub fn harvest_libraries_parallel(
     cache: Option<&IndexCache>,
     pool: &rayon::ThreadPool,
 ) -> HarvestedLibrary {
+    harvest_libraries_parallel_inner(envs, cache, pool, None)
+}
+
+pub(crate) use harvest::WorkspaceParseSeeds;
+
+pub(crate) fn harvest_libraries_parallel_inner(
+    envs: &[Environment],
+    cache: Option<&IndexCache>,
+    pool: &rayon::ThreadPool,
+    mut parse_seeds: Option<&mut WorkspaceParseSeeds>,
+) -> HarvestedLibrary {
     use rayon::prelude::*;
 
     let install = envs.iter().find_map(|env| env.install.as_ref());
@@ -540,9 +551,10 @@ pub fn harvest_libraries_parallel(
     for dev in dev_packages(envs) {
         lib.packages.insert(
             dev.name.clone(),
-            Arc::new(harvest_workspace_for_project(
+            Arc::new(harvest_workspace_for_project_inner(
                 &dev,
                 projects.get(&dev.name).map(PathBuf::as_path),
+                parse_seeds.as_deref_mut(),
             )),
         );
         lib.roots.insert(dev.name.clone(), dev.root);
@@ -740,6 +752,14 @@ fn harvest_workspace_for_project(
     dev: &crate::environment::DevPackage,
     project: Option<&Path>,
 ) -> PackageIndex {
+    harvest_workspace_for_project_inner(dev, project, None)
+}
+
+fn harvest_workspace_for_project_inner(
+    dev: &crate::environment::DevPackage,
+    project: Option<&Path>,
+    parse_seeds: Option<&mut WorkspaceParseSeeds>,
+) -> PackageIndex {
     use crate::parse_context::{EditionSource, SourceRole};
 
     let options = project.map_or_else(
@@ -757,5 +777,10 @@ fn harvest_workspace_for_project(
                 .options
         },
     );
-    harvest_package_with_options(&dev.root, &dev.name, options)
+    match parse_seeds {
+        Some(seeds) => {
+            harvest::harvest_workspace_with_parse_seeds(&dev.root, &dev.name, options, seeds)
+        }
+        None => harvest_package_with_options(&dev.root, &dev.name, options),
+    }
 }

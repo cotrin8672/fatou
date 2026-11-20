@@ -53,6 +53,51 @@ pub fn harvest_package_with_options(
     harvest_entry_with_options(source_root, &entry, name, options)
 }
 
+/// Optional transient parses for seeding the LSP's exact-text reparse cache.
+#[derive(Default)]
+pub(crate) struct WorkspaceParseSeeds {
+    pub(crate) entries: Vec<(PathBuf, crate::incremental::PrevParse)>,
+    bytes: usize,
+}
+
+impl WorkspaceParseSeeds {
+    fn record(
+        &mut self,
+        path: &Path,
+        text: &str,
+        options: crate::parser::ParseOptions,
+        green: rowan::GreenNode,
+        diagnostics: &[crate::parser::ParseDiagnostic],
+    ) {
+        const SOURCE_BUDGET: usize = 2 * 1024 * 1024;
+        if self.entries.len() >= crate::incremental::MAX_REPARSE_BASES
+            || text.len() > SOURCE_BUDGET - self.bytes
+        {
+            return;
+        }
+        self.bytes += text.len();
+        self.entries.push((
+            crate::incremental::normalize_path(path),
+            crate::incremental::PrevParse {
+                options,
+                text: text.into(),
+                green,
+                diagnostics: diagnostics.to_vec(),
+            },
+        ));
+    }
+}
+
+pub(super) fn harvest_workspace_with_parse_seeds(
+    source_root: &Path,
+    name: &str,
+    options: crate::parser::ParseOptions,
+    seeds: &mut WorkspaceParseSeeds,
+) -> PackageIndex {
+    let entry = source_root.join("src").join(format!("{name}.jl"));
+    harvest_entry_with_base_includes(source_root, &entry, name, false, options, Some(seeds))
+}
+
 /// Harvest the module named `name` rooted at `source_root`, entering at the
 /// explicit file `entry`. Locations stay relative to `source_root`, so callers
 /// with a non-`src/` layout (Julia's Base at `base/Base.jl`, Core at
@@ -74,7 +119,7 @@ pub fn harvest_entry_with_options(
     name: &str,
     options: crate::parser::ParseOptions,
 ) -> PackageIndex {
-    harvest_entry_with_base_includes(source_root, entry, name, false, options)
+    harvest_entry_with_base_includes(source_root, entry, name, false, options, None)
 }
 
 /// Base's bootstrap `include` resolves from the Base source directory, while
@@ -84,7 +129,7 @@ pub(super) fn harvest_base_entry(
     entry: &Path,
     options: crate::parser::ParseOptions,
 ) -> PackageIndex {
-    harvest_entry_with_base_includes(base_dir, entry, "Base", true, options)
+    harvest_entry_with_base_includes(base_dir, entry, "Base", true, options, None)
 }
 
 fn harvest_entry_with_base_includes(
@@ -93,6 +138,7 @@ fn harvest_entry_with_base_includes(
     name: &str,
     base_includes: bool,
     options: crate::parser::ParseOptions,
+    parse_seeds: Option<&mut WorkspaceParseSeeds>,
 ) -> PackageIndex {
     let mut harvester = Harvester {
         options,
@@ -105,6 +151,7 @@ fn harvest_entry_with_base_includes(
         root_filled: false,
         follow_includes: true,
         base_includes,
+        parse_seeds,
         function_groups: None,
     };
     let mut root = ModuleIndex {
@@ -176,6 +223,7 @@ pub fn harvest_tree(cst: &SyntaxNode) -> ModuleIndex {
         root_filled: false,
         follow_includes: false,
         base_includes: false,
+        parse_seeds: None,
         function_groups: None,
     };
     let mut root = ModuleIndex {
@@ -203,7 +251,8 @@ pub fn harvest_tree(cst: &SyntaxNode) -> ModuleIndex {
     root
 }
 
-struct Harvester {
+struct Harvester<'a> {
+    parse_seeds: Option<&'a mut WorkspaceParseSeeds>,
     options: crate::parser::ParseOptions,
     /// The package source root, for relativizing [`DefLocation::file`].
     root: PathBuf,
@@ -232,7 +281,7 @@ struct Harvester {
     function_groups: Option<HashMap<String, Vec<usize>>>,
 }
 
-impl Harvester {
+impl Harvester<'_> {
     /// `file` relative to the package root, falling back to `file` as-is.
     fn relative(&self, file: &Path) -> PathBuf {
         file.strip_prefix(&self.root)
@@ -274,6 +323,15 @@ impl Harvester {
             .insert(rel.clone(), self.module_path.clone());
         self.members.push(rel);
         let parsed = crate::parser::parse_with_options(text, self.options);
+        if let Some(seeds) = &mut self.parse_seeds {
+            seeds.record(
+                file,
+                text,
+                self.options,
+                parsed.cst.green().to_owned(),
+                &parsed.diagnostics,
+            );
+        }
         if !parsed.diagnostics.is_empty() {
             self.diagnostics.push(HarvestDiagnostic::ParseError {
                 path: file.to_path_buf(),
@@ -1403,6 +1461,7 @@ mod tests {
             root_filled: false,
             follow_includes: true,
             base_includes: false,
+            parse_seeds: None,
             function_groups: None,
         };
         let mut root = ModuleIndex {

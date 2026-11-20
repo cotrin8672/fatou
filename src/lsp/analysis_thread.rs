@@ -114,6 +114,7 @@ pub(crate) enum LibraryMessage {
     Full {
         generation: u64,
         library: Box<HarvestedLibrary>,
+        parse_seeds: crate::index::WorkspaceParseSeeds,
         failed_manifests: BTreeSet<PathBuf>,
     },
     Syntax {
@@ -513,6 +514,7 @@ impl AnalysisWorker {
             LibraryMessage::Full {
                 generation,
                 mut library,
+                parse_seeds,
                 failed_manifests,
             } if self.full_harvest == Some(generation) => {
                 let before = self.open_parse_options();
@@ -525,6 +527,7 @@ impl AnalysisWorker {
                 self.db
                     .set_library(library.packages, library.roots, library.workspaces);
                 self.db.seed_workspace_members();
+                self.db.install_workspace_parse_seeds(parse_seeds);
                 self.scripts.library_changed(&self.db);
                 self.refresh_graph_diagnostics();
                 let _ = self.out_tx.send(Outbound::InlayHintsRefresh);

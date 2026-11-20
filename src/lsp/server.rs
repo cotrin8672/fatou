@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use crate::environment::EnvContext;
 use crate::incremental::normalize_path;
-use crate::index::{IndexCache, harvest_libraries_parallel};
+use crate::index::{IndexCache, WorkspaceParseSeeds, harvest_libraries_parallel_inner};
 use crate::text::PositionEncoding;
 
 use super::analysis_thread::{LibraryMessage, SyncMessage, guard, spawn_analysis_thread};
@@ -611,12 +611,19 @@ fn spawn_workspace_harvester(
                 // the previously harvested library (and the first send with nothing
                 // resolved is a cheap no-op harvest).
                 progress.report("Indexing Base and packages");
-                let library = harvest_libraries_parallel(&envs, cache.as_ref(), &index_pool);
+                let mut parse_seeds = WorkspaceParseSeeds::default();
+                let library = harvest_libraries_parallel_inner(
+                    &envs,
+                    cache.as_ref(),
+                    &index_pool,
+                    (generation == 0).then_some(&mut parse_seeds),
+                );
                 let indexed = library.packages.len();
                 if library_tx
                     .send(LibraryMessage::Full {
                         generation,
                         library: Box::new(library),
+                        parse_seeds,
                         failed_manifests,
                     })
                     .is_err()

@@ -1405,7 +1405,7 @@ struct EditionReparseState {
 /// runs [`parsed_document`], but only the handful the editor is actually
 /// touching ever gets a *hit*: the rest would hold a second copy of their text
 /// (salsa already holds one) plus a green tree, for nothing.
-const MAX_REPARSE_BASES: usize = 64;
+pub(crate) const MAX_REPARSE_BASES: usize = 64;
 
 /// The reparse side-channel for all files, bounded by [`MAX_REPARSE_BASES`].
 ///
@@ -2471,6 +2471,41 @@ impl IncrementalDatabase {
         changed
     }
 
+    /// Offer the loader's parses only as an optional exact-text speedup. The
+    /// live file (including an unsaved buffer) remains authoritative. Do not
+    /// evict another file or replace an existing reparse chain.
+    pub(crate) fn install_workspace_parse_seeds(&self, seeds: crate::index::WorkspaceParseSeeds) {
+        if seeds.entries.is_empty() {
+            return;
+        }
+        let ready: Vec<_> = {
+            let paths = self.source_map();
+            seeds
+                .entries
+                .into_iter()
+                .filter_map(|(path, mut prev)| {
+                    let file = *paths.by_path.get(&path)?;
+                    let live = file.text(self);
+                    if prev.text != *live {
+                        return None;
+                    }
+                    prev.text = Arc::clone(live);
+                    Some((file, prev))
+                })
+                .collect()
+        };
+        let mut cache = self.reparse_state();
+        for (file, prev) in ready {
+            if cache.files.len() >= MAX_REPARSE_BASES {
+                break;
+            }
+            if !cache.files.contains_key(&file) {
+                let options = prev.options;
+                cache.touch(file).editions.entry(options).or_default().prev = Some(Arc::new(prev));
+            }
+        }
+    }
+
     /// The harvested index for `name`, if the library has been populated and
     /// contains it.
     pub fn library_package(&self, name: &str) -> Option<Arc<PackageIndex>> {
@@ -3177,6 +3212,62 @@ mod tests {
             index_runs(&db),
             3,
             "another file's edit must not reparse this file's Markdown"
+        );
+    }
+
+    #[test]
+    fn workspace_parse_seed_is_exact_text_and_options_only() {
+        use crate::parser::SyntaxEdition;
+        let mut db = IncrementalDatabase::new();
+        let dir = tempfile::tempdir().unwrap();
+        let options = ParseOptions {
+            syntax_edition: SyntaxEdition::Julia114,
+        };
+        let exact_path = normalize_path(&dir.path().join("same.jl"));
+        let edited_path = normalize_path(&dir.path().join("edited.jl"));
+        let existing_path = normalize_path(&dir.path().join("existing.jl"));
+        let old_text = "module Example\nfoo(x) = x +% 1\nend\n";
+        let exact = db.upsert_file(&exact_path, old_text);
+        let edited = db.upsert_file(&edited_path, "x = 42\n");
+        let existing = db.upsert_file(&existing_path, old_text);
+        let parsed = parse_with_options(old_text, options);
+        let seed = PrevParse {
+            options,
+            text: Arc::from(old_text),
+            green: parsed.cst.green().to_owned(),
+            diagnostics: parsed.diagnostics,
+        };
+        let existing_previous = {
+            parsed_document_with_options(&db, existing, options);
+            db.reparse_prev_with_options(existing, options).unwrap()
+        };
+        let mut seeds = crate::index::WorkspaceParseSeeds::default();
+        seeds.entries = vec![
+            (exact_path, seed.clone()),
+            (edited_path, seed.clone()),
+            (existing_path, seed.clone()),
+        ];
+        db.install_workspace_parse_seeds(seeds);
+        assert!(
+            db.reparse_prev_with_options(exact, ParseOptions::default())
+                .is_none()
+        );
+        assert!(db.reparse_prev_with_options(edited, options).is_none());
+        assert!(Arc::ptr_eq(
+            &db.reparse_prev_with_options(existing, options).unwrap(),
+            &existing_previous
+        ));
+        let matching = db.reparse_prev_with_options(exact, options).unwrap();
+        assert!(Arc::ptr_eq(&matching.text, exact.text(&db)));
+        let warm = parsed_document_with_options(&db, exact, options);
+        assert_eq!(warm.green, seed.green);
+        assert_eq!(warm.diagnostics, seed.diagnostics);
+        let changed = parsed_document_with_options(&db, edited, options);
+        assert_eq!(
+            crate::syntax::SyntaxNode::new_root(changed.green.clone())
+                .text()
+                .to_string(),
+            "x = 42\n"
         );
     }
 
