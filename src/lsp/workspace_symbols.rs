@@ -60,14 +60,17 @@ pub fn compute_workspace_symbols<P: PackageSource>(
     // Phase 2: materialize each match's location off disk. Files are read once
     // and shared across the symbols they contain (a single file usually holds
     // many); an unreadable file drops its symbols rather than faking a range.
-    let mut texts: HashMap<PathBuf, Option<TextBuffer>> = HashMap::new();
+    let mut texts: HashMap<PathBuf, Option<(TextBuffer, lsp_types::Uri)>> = HashMap::new();
     matches
         .into_iter()
         .filter_map(|m| {
-            let abs = root.join(&m.file);
-            let text = texts
-                .entry(abs.clone())
-                .or_insert_with(|| std::fs::read_to_string(&abs).ok().map(TextBuffer::new))
+            let (text, uri) = texts
+                .entry(m.file)
+                .or_insert_with_key(|file| {
+                    let abs = root.join(file);
+                    let text = std::fs::read_to_string(&abs).ok()?;
+                    Some((TextBuffer::new(text), from_path(&abs)?))
+                })
                 .as_ref()?;
             let line_index = text.line_index();
             Some(WorkspaceSymbol {
@@ -76,7 +79,7 @@ pub fn compute_workspace_symbols<P: PackageSource>(
                 tags: None,
                 container_name: m.container,
                 location: OneOf::Left(Location {
-                    uri: from_path(&abs)?,
+                    uri: uri.clone(),
                     range: span_to_range(m.span, &line_index, encoding),
                 }),
                 data: None,

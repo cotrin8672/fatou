@@ -682,6 +682,18 @@ pub(crate) fn run_read(
         return;
     }
     let mut response = responses.remove(0);
+    // An identical sibling-context list (e.g. qualifying Base) is already
+    // the canonical merge result. Forward it, not several recursive clones.
+    if matches!(job, ReadJob::Completion { .. })
+        && response.response_result.is_ok()
+        && responses.iter().all(|other| {
+            other.response_result.as_ref().ok() == response.response_result.as_ref().ok()
+        })
+    {
+        let _ = reply.send(Message::Response(response));
+        return;
+    }
+
     let values: Vec<_> = std::iter::once(&response)
         .chain(&responses)
         .map(|response| {
@@ -1085,11 +1097,21 @@ fn run_read_single(
             import_trigger,
             sender,
         } => {
-            let items = if import_trigger {
+            let mut items = if import_trigger {
                 completion_for_import_trigger(&snapshot, &path, &text, position, encoding)
             } else {
                 completion_via_db(&snapshot, &path, &text, position, encoding)
             };
+            if sender.captured.is_none()
+                && sender.completion_data_defaults
+                && let Some(packed) = super::completion::compact_items(&mut items)
+            {
+                let _ = sender.send(Message::Response(Response {
+                    id,
+                    response_result: Ok(packed),
+                }));
+                return;
+            }
             let result = CompletionResponse::Array(items);
             let _ = sender.send(Message::Response(Response::new_ok(id, result)));
         }

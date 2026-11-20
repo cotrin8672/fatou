@@ -159,6 +159,7 @@ impl<'a> LineIndex<'a> {
         let prefix = &self.text[line_start..clamped];
         let character = match encoding {
             PositionEncoding::Utf8 => prefix.len() as u32,
+            PositionEncoding::Utf16 if prefix.is_ascii() => prefix.len() as u32,
             PositionEncoding::Utf16 => prefix.encode_utf16().count() as u32,
         };
         Position::new(line_idx as u32, character)
@@ -182,6 +183,20 @@ impl<'a> LineIndex<'a> {
         let line_text = self.text[line_start..line_end]
             .trim_end_matches('\n')
             .trim_end_matches('\r');
+        let mut requested = (position.character as usize).min(line_text.len());
+        // UTF-8 columns are already byte offsets. Preserve the previous rule
+        // that an offset inside a code point rounds up rather than down.
+        if encoding == PositionEncoding::Utf8 {
+            while !line_text.is_char_boundary(requested) {
+                requested += 1;
+            }
+            return line_start + requested;
+        }
+        // If the bytes up to the requested column are ASCII, each one is
+        // exactly one UTF-16 unit. Fall back unchanged for non-ASCII prefixes.
+        if line_text.as_bytes()[..requested].is_ascii() {
+            return line_start + requested;
+        }
         let mut units = 0u32;
         for (byte_off, ch) in line_text.char_indices() {
             if units >= position.character {
@@ -341,6 +356,40 @@ mod tests {
         // The emoji is 2 UTF-16 units; an offset of 1 splits the surrogate pair.
         let idx = LineIndex::new("\u{1F600}x");
         assert_eq!(idx.position_to_byte(Position::new(0, 1), UTF16), 4);
+    }
+
+    #[test]
+    fn optimized_position_conversion_agrees_with_scalar_scan() {
+        let text = "ordinary_identifier\r\n\nμa🧪e\u{0301}終\r\nxα\n";
+        let index = LineIndex::new(text);
+        let lines = text.split('\n').collect::<Vec<_>>();
+        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+            for line in 0..=lines.len() {
+                for column in 0..80 {
+                    let expected = lines.get(line).map_or(text.len(), |l| {
+                        let l = l.trim_end_matches('\r');
+                        let byte = l
+                            .char_indices()
+                            .map(|(byte, _)| byte)
+                            .chain(std::iter::once(l.len()))
+                            .find(|&byte| {
+                                let prefix = &l[..byte];
+                                (match encoding {
+                                    PositionEncoding::Utf8 => prefix.len() as u32,
+                                    PositionEncoding::Utf16 => prefix.encode_utf16().count() as u32,
+                                }) >= column
+                            })
+                            .unwrap_or(l.len());
+                        index.line_start(line) + byte
+                    });
+                    assert_eq!(
+                        index.position_to_byte(Position::new(line as u32, column), encoding),
+                        expected,
+                        "{encoding:?} line {line} column {column}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

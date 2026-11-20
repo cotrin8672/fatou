@@ -50,7 +50,7 @@ use crate::resolve::{
     Candidate, ModulePath, Namespace, PackageSource, Resolution, Resolver, Source,
     has_unresolvable_using, resolve_submodule,
 };
-use crate::semantic::{BindingKind, SemanticModel};
+use crate::semantic::{BindingId, BindingKind, SemanticModel};
 use crate::syntax::{SyntaxKind, SyntaxNode};
 use crate::text::{LineIndex, PositionEncoding, TextBuffer};
 
@@ -71,57 +71,87 @@ struct ResolveData {
 /// Private resolve-key tag carried in the standard LSP CompletionList defaults.
 const NAME_FROM_LABEL: &str = "fatouNameFromLabel";
 
-/// Compress only if the entire list has one losslessly shared resolve key
-/// prefix. LSP applies default data to *every* item whose data is absent: a
-/// mixed list with keywords, local bindings, or different modules must stay an
-/// array. Do not discard, reorder, or rewrite any other item field.
-pub(super) fn compact_response(value: &mut serde_json::Value) {
+/// Shared eligibility for typed and aggregated completion lists. Every item
+/// must have exactly the same library origin and use its displayed name.
+fn packed_defaults<'a>(
+    first: &serde_json::Value,
+    items: impl IntoIterator<Item = (Option<&'a str>, Option<&'a serde_json::Value>)>,
+) -> Option<serde_json::Value> {
     use serde_json::{Value, json};
-
-    let Some(items) = value.as_array_mut().filter(|items| items.len() >= 8) else {
-        return;
-    };
-    let Some(first) = items[0].get("data").and_then(Value::as_object) else {
-        return;
-    };
-    let (Some(path), Some(module)) = (first.get("fatouSourcePath"), first.get("module_path"))
-    else {
-        return;
-    };
+    let path = first.get("fatouSourcePath")?;
+    let module = first.get("module_path")?;
     if !path.is_string()
         || !module
             .as_array()
             .is_some_and(|parts| !parts.is_empty() && parts.iter().all(Value::is_string))
-        || !items.iter().all(|item| {
-            item.get("data")
-                .and_then(Value::as_object)
-                .is_some_and(|data| {
-                    data.len() == 3
-                        && data.get("fatouSourcePath") == Some(path)
-                        && data.get("module_path") == Some(module)
-                        && item.get("label").is_some_and(Value::is_string)
-                        && data.get("name") == item.get("label")
-                })
+        || !items.into_iter().all(|(label, data)| {
+            data.and_then(Value::as_object).is_some_and(|data| {
+                data.len() == 3
+                    && data.get("fatouSourcePath") == Some(path)
+                    && data.get("module_path") == Some(module)
+                    && label.is_some()
+                    && data.get("name").and_then(Value::as_str) == label
+            })
         })
     {
-        return;
+        return None;
     }
-    let defaults = json!({
-        "data": {
-            "fatouSourcePath": path,
-            "module_path": module,
-            (NAME_FROM_LABEL): true,
-        }
-    });
+    Some(json!({"data": {
+        "fatouSourcePath": path,
+        "module_path": module,
+        (NAME_FROM_LABEL): true,
+    }}))
+}
+
+fn completion_list(items: serde_json::Value, defaults: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    // lsp-types 0.97 lacks CompletionList.itemDefaults in its response type.
+    Value::Object(serde_json::Map::from_iter([
+        ("isIncomplete".into(), Value::Bool(false)),
+        ("itemDefaults".into(), defaults),
+        ("items".into(), items),
+    ]))
+}
+
+/// Compress a merged wire value only when its data defaults apply to all items.
+pub(super) fn compact_response(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(items) = value.as_array_mut().filter(|items| items.len() >= 8) else {
+        return;
+    };
+    let Some(defaults) = items[0].get("data").and_then(|first| {
+        packed_defaults(
+            first,
+            items
+                .iter()
+                .map(|item| (item.get("label").and_then(Value::as_str), item.get("data"))),
+        )
+    }) else {
+        return;
+    };
     for item in items.iter_mut() {
         item.as_object_mut().expect("item has data").remove("data");
     }
-    // lsp-types 0.97 lacks CompletionList.itemDefaults in its response type.
-    *value = Value::Object(serde_json::Map::from_iter([
-        ("isIncomplete".into(), Value::Bool(false)),
-        ("itemDefaults".into(), defaults),
-        ("items".into(), Value::Array(std::mem::take(items))),
-    ]));
+    *value = completion_list(Value::Array(std::mem::take(items)), defaults);
+}
+
+/// The final uncaptured response need not materialize a separate JSON resolve
+/// key for every item just to discard it. Ineligible inputs stay unmodified.
+pub(super) fn compact_items(items: &mut [CompletionItem]) -> Option<serde_json::Value> {
+    if items.len() < 8 {
+        return None;
+    }
+    let defaults = packed_defaults(
+        items[0].data.as_ref()?,
+        items
+            .iter()
+            .map(|item| (Some(item.label.as_str()), item.data.as_ref())),
+    )?;
+    for item in items.iter_mut() {
+        item.data = None;
+    }
+    let items = serde_json::to_value(items).expect("completion items serialize");
+    Some(completion_list(items, defaults))
 }
 
 /// Normalize before dispatching the resolve job, so path routing, scoped
@@ -178,6 +208,19 @@ mod transport_tests {
             expand_resolve_data(&mut restored);
             assert_eq!(serde_json::to_value(restored).unwrap(), *original);
         }
+    }
+
+    #[test]
+    fn pre_serialization_compaction_matches_aggregated_path() {
+        let mut expected = homogeneous();
+        let mut items: Vec<CompletionItem> = serde_json::from_value(expected.clone()).unwrap();
+        compact_response(&mut expected);
+        assert_eq!(compact_items(&mut items), Some(expected));
+        let mut mixed = homogeneous();
+        mixed[0].as_object_mut().unwrap().remove("data");
+        let mut items: Vec<CompletionItem> = serde_json::from_value(mixed.clone()).unwrap();
+        assert!(compact_items(&mut items).is_none());
+        assert_eq!(serde_json::to_value(items).unwrap(), mixed);
     }
 
     #[test]
@@ -858,19 +901,21 @@ fn completions_for<P: PackageSource>(
             receiver_start(text, offset, &receiver, macro_member),
             macro_member,
         ),
-        Context::Macro => Resolver::new(model, packages)
-            .with_workspace(workspace)
-            .visible(offset, Namespace::Macro)
-            .into_iter()
-            .map(|c| candidate_item(model, c, Namespace::Macro))
-            .collect(),
-        Context::Value => {
-            let mut items: Vec<CompletionItem> = Resolver::new(model, packages)
+        Context::Macro => candidate_items(
+            model,
+            Resolver::new(model, packages)
                 .with_workspace(workspace)
-                .visible(offset, Namespace::Value)
-                .into_iter()
-                .map(|c| candidate_item(model, c, Namespace::Value))
-                .collect();
+                .visible(offset, Namespace::Macro),
+            Namespace::Macro,
+        ),
+        Context::Value => {
+            let mut items = candidate_items(
+                model,
+                Resolver::new(model, packages)
+                    .with_workspace(workspace)
+                    .visible(offset, Namespace::Value),
+                Namespace::Value,
+            );
             items.extend(KEYWORDS.iter().map(|kw| keyword_item(kw)));
             items
         }
@@ -903,19 +948,21 @@ fn reference_completions<P: PackageSource>(
             None,
             macro_member,
         ),
-        Context::Macro => Resolver::new(model, packages)
-            .with_workspace(workspace)
-            .visible(semantic_offset, Namespace::Macro)
-            .into_iter()
-            .map(|candidate| candidate_item(model, candidate, Namespace::Macro))
-            .collect(),
-        Context::Value => {
-            let mut items: Vec<_> = Resolver::new(model, packages)
+        Context::Macro => candidate_items(
+            model,
+            Resolver::new(model, packages)
                 .with_workspace(workspace)
-                .visible(semantic_offset, Namespace::Value)
-                .into_iter()
-                .map(|candidate| candidate_item(model, candidate, Namespace::Value))
-                .collect();
+                .visible(semantic_offset, Namespace::Macro),
+            Namespace::Macro,
+        ),
+        Context::Value => {
+            let mut items = candidate_items(
+                model,
+                Resolver::new(model, packages)
+                    .with_workspace(workspace)
+                    .visible(semantic_offset, Namespace::Value),
+                Namespace::Value,
+            );
             let anchor_names = if anchors {
                 super::documentation::markdown_index(model, cached_docs)
                     .anchor_names()
@@ -1258,10 +1305,60 @@ fn is_lone_escape(sequence: &str) -> bool {
 
 // --- item construction -----------------------------------------------------
 
+fn static_doc_text(doc: &crate::semantic::SemanticDoc) -> Option<&str> {
+    match &doc.text {
+        crate::ast::DocText::Static(text) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// For document-heavy completion lists, visit each attachment once instead of
+/// checking every attachment for every visible binding. Preserve the first
+/// static attachment (including empty ones), and keep sparse requests on the
+/// existing no-allocation path.
+fn candidate_items(
+    model: &SemanticModel,
+    candidates: Vec<Candidate>,
+    ns: Namespace,
+) -> Vec<CompletionItem> {
+    const MIN_DOCS: usize = 24;
+    const MIN_BINDINGS: usize = 24;
+    let static_by_binding = (model.documentation().len() >= MIN_DOCS
+        && candidates
+            .iter()
+            .filter(|candidate| matches!(candidate.source, Source::Binding(_)))
+            .nth(MIN_BINDINGS - 1)
+            .is_some())
+    .then(|| {
+        let mut indexed = std::collections::HashMap::with_capacity(model.documentation().len());
+        for doc in model.documentation() {
+            if let (Some(binding), Some(text)) = (doc.binding, static_doc_text(doc)) {
+                indexed.entry(binding).or_insert(text);
+            }
+        }
+        indexed
+    });
+    let binding_doc = |id| match &static_by_binding {
+        Some(indexed) => indexed.get(&id).copied(),
+        None => model
+            .documentation_for_binding(id)
+            .find_map(static_doc_text),
+    };
+    candidates
+        .into_iter()
+        .map(|candidate| candidate_item(model, candidate, ns, binding_doc))
+        .collect()
+}
+
 /// Turn a visible [`Candidate`] into a completion item. A file binding gets a
 /// precise kind from its [`BindingKind`]; a library name is classified by
 /// convention (see [`heuristic_kind`]) and carries a lazy-resolve key.
-fn candidate_item(model: &SemanticModel, cand: Candidate, ns: Namespace) -> CompletionItem {
+fn candidate_item<'a>(
+    model: &'a SemanticModel,
+    cand: Candidate,
+    ns: Namespace,
+    binding_doc: impl FnOnce(BindingId) -> Option<&'a str>,
+) -> CompletionItem {
     let label = cand.name.to_string();
     match cand.source {
         Source::Binding(id) => {
@@ -1272,13 +1369,7 @@ fn candidate_item(model: &SemanticModel, cand: Candidate, ns: Namespace) -> Comp
                 detail: Some(binding_detail(kind).to_string()),
                 ..Default::default()
             };
-            let doc = model.documentation_for_binding(id).find_map(|doc| {
-                let crate::ast::DocText::Static(text) = &doc.text else {
-                    return None;
-                };
-                Some(text.as_str())
-            });
-            set_doc(&mut item, doc);
+            set_doc(&mut item, binding_doc(id));
             item
         }
         // A workspace sibling lives in the library map under its package name,
@@ -1799,6 +1890,66 @@ mod tests {
         let encoding = PositionEncoding::Utf16;
         let at = LineIndex::new(&text).byte_to_position(left.len(), encoding);
         completion_via_db(&snapshot, &entry, &TextBuffer::new(text), at, encoding)
+    }
+
+    fn legacy_candidate_items(
+        model: &SemanticModel,
+        candidates: Vec<Candidate>,
+        ns: Namespace,
+    ) -> Vec<CompletionItem> {
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                candidate_item(model, candidate, ns, |id| {
+                    model
+                        .documentation_for_binding(id)
+                        .find_map(static_doc_text)
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn indexed_candidate_docs_preserve_first_static_and_all_item_fields() {
+        let mut src = concat!(
+            "\"First\"\nfoo(x::Int) = x\n",
+            "\"Second\"\nfoo(x::Float64) = x\n",
+            "\"\"\nempty_doc(x::Int) = x\n",
+            "\"Later\"\nempty_doc(x::Float64) = x\n",
+            "\"$interpolated\"\nopaque_doc(x::Int) = x\n",
+            "\"Fallback static\"\nopaque_doc(x::Float64) = x\n",
+        )
+        .to_string();
+        for n in 0..35 {
+            src.push_str(&format!("\"Doc {n}\"\nf_{n}() = {n}\n"));
+        }
+        src.push_str("undoc() = 0\n");
+        let root = parse(&src).cst;
+        let model = SemanticModel::build(&root);
+        let packages = BTreeMap::new();
+        let at = (src.len() as u32).into();
+        let candidates = Resolver::new(&model, &packages).visible(at, Namespace::Value);
+        assert!(model.documentation().len() >= 24);
+        assert!(
+            candidates
+                .iter()
+                .filter(|c| matches!(c.source, Source::Binding(_)))
+                .count()
+                >= 24
+        );
+        let expected = legacy_candidate_items(&model, candidates.clone(), Namespace::Value);
+        let actual = candidate_items(&model, candidates, Namespace::Value);
+        assert_eq!(actual, expected);
+        fn text(item: &CompletionItem) -> Option<&str> {
+            match &item.documentation {
+                Some(Documentation::MarkupContent(content)) => Some(&content.value),
+                _ => None,
+            }
+        }
+        assert_eq!(text(item(&actual, "foo")), Some("First"));
+        assert_eq!(text(item(&actual, "empty_doc")), None);
+        assert_eq!(text(item(&actual, "opaque_doc")), Some("Fallback static"));
+        assert_eq!(text(item(&actual, "undoc")), None);
     }
 
     #[test]
