@@ -265,7 +265,7 @@ fn library_callee(module: &ModuleIndex, name: &str) -> Option<CalleeSig> {
     let group: &FunctionGroup = module.functions.iter().find(|f| f.name == name)?;
     Some(CalleeSig {
         name: group.name.clone(),
-        methods: group.methods.clone(),
+        methods: group.methods.iter().take(MAX_METHODS).cloned().collect(),
         doc: group.doc.as_ref().map(|d| d.text.clone()),
     })
 }

@@ -209,6 +209,21 @@ pub fn script_program(
     script_program_with_options(db, entry, primary_parse_options(db, entry))
 }
 
+/// Membership-only lookup shared by graph and import queries. Ordinary
+/// text edits are not dependencies here, and duplicate paths keep the last
+/// member, as in the original per-query maps.
+#[salsa::tracked(returns(ref))]
+fn workspace_files_by_path(
+    db: &dyn IncrementalDb,
+    files: WorkspaceFiles,
+) -> HashMap<PathBuf, SourceFile> {
+    files
+        .files(db)
+        .iter()
+        .filter_map(|&file| Some((normalize_path(file.path(db).as_deref()?), file)))
+        .collect()
+}
+
 /// Current package include closures, including module uses from live buffers.
 /// Range-free file projections keep literal and position edits from rebuilding
 /// this result, while changes to global reads refresh dependent diagnostics.
@@ -218,11 +233,7 @@ fn workspace_import_programs(
     files: WorkspaceFiles,
     library: LibraryIndex,
 ) -> Vec<Arc<project::scripts::ScriptProgram>> {
-    let by_path: BTreeMap<_, _> = files
-        .files(db)
-        .iter()
-        .filter_map(|&file| Some((normalize_path(file.path(db).as_deref()?), file)))
-        .collect();
+    let by_path = workspace_files_by_path(db, files);
     library
         .workspaces(db)
         .iter()
@@ -893,6 +904,24 @@ enum IncludeColor {
     Black,
 }
 
+/// A contextual graph may also resolve loaded script members. Keep the two
+/// views borrowed so each entry/edition does not copy and merge the full map.
+struct GraphFiles<'a> {
+    workspace: Option<&'a HashMap<PathBuf, SourceFile>>,
+    scripts: Option<&'a BTreeMap<PathBuf, Option<SourceFile>>>,
+}
+
+impl GraphFiles<'_> {
+    fn get(&self, path: &Path) -> Option<SourceFile> {
+        self.workspace
+            .and_then(|files| files.get(path).copied())
+            .or_else(|| {
+                self.scripts
+                    .and_then(|files| files.get(path).copied().flatten())
+            })
+    }
+}
+
 /// The transitive include graph of every workspace package, merged (see
 /// [`ProjectGraph`]; paths under distinct package roots cannot collide, so one
 /// shared graph is unambiguous). Demand-only: pulled by the diagnostics path
@@ -908,14 +937,10 @@ pub fn project_graph(db: &dyn IncrementalDb) -> ProjectGraph {
     let mut names = lib.workspaces(db).clone();
     names.sort();
 
-    // Normalized path -> seeded input, so an include target resolves to a member
-    // without reaching the concrete db's path map (unavailable from `&dyn`).
-    let mut by_path: HashMap<PathBuf, SourceFile> = HashMap::new();
-    for &file in wf.files(db) {
-        if let Some(path) = file.path(db) {
-            by_path.insert(normalize_path(path), file);
-        }
-    }
+    let by_path = GraphFiles {
+        workspace: Some(workspace_files_by_path(db, wf)),
+        scripts: None,
+    };
 
     // The walks share `color` (and the graph): first visit wins across
     // packages too, matching today's diamond semantics should one package's
@@ -926,7 +951,7 @@ pub fn project_graph(db: &dyn IncrementalDb) -> ProjectGraph {
             continue;
         };
         let entry = normalize_path(&root.join("src").join(format!("{name}.jl")));
-        let Some(&entry_file) = by_path.get(&entry) else {
+        let Some(entry_file) = by_path.get(&entry) else {
             continue; // Not seeded (yet); skip this package, keep the rest.
         };
         if color.contains_key(&entry) {
@@ -953,18 +978,10 @@ fn project_graph_with_options(
     entry: SourceFile,
     options: ParseOptions,
 ) -> ProjectGraph {
-    let mut by_path: HashMap<_, _> = WorkspaceFiles::try_get(db)
-        .into_iter()
-        .flat_map(|input| input.files(db))
-        .filter_map(|&file| Some((normalize_path(file.path(db).as_deref()?), file)))
-        .collect();
-    if let Some(input) = ScriptFiles::try_get(db) {
-        for (path, file) in input.files(db) {
-            if let Some(file) = file {
-                by_path.entry(path.clone()).or_insert(*file);
-            }
-        }
-    }
+    let by_path = GraphFiles {
+        workspace: WorkspaceFiles::try_get(db).map(|input| workspace_files_by_path(db, input)),
+        scripts: ScriptFiles::try_get(db).map(|input| input.files(db)),
+    };
     let mut graph = ProjectGraph::default();
     let Some(path) = entry.path(db) else {
         return graph;
@@ -995,7 +1012,7 @@ fn project_graph_with_options(
 #[allow(clippy::too_many_arguments)]
 fn walk_include_graph(
     db: &dyn IncrementalDb,
-    by_path: &HashMap<PathBuf, SourceFile>,
+    by_path: &GraphFiles<'_>,
     path: PathBuf,
     file: SourceFile,
     options: ParseOptions,
@@ -1019,7 +1036,7 @@ fn walk_include_graph(
                 continue;
             }
         };
-        let Some(&child_file) = by_path.get(&target) else {
+        let Some(child_file) = by_path.get(&target) else {
             graph.unresolved.push(UnresolvedInclude {
                 from: path.clone(),
                 path: edge.path.clone(),
@@ -1257,7 +1274,7 @@ fn context_workspace_reference_index(
             if file
                 .path(db)
                 .as_ref()
-                .is_none_or(|path| !graph.nodes.contains(path))
+                .is_none_or(|path| !graph.host_modules.contains_key(path))
             {
                 continue;
             }
@@ -1307,7 +1324,7 @@ fn context_workspace_occurrence_bucket(
             if file
                 .path(db)
                 .as_ref()
-                .is_none_or(|path| !graph.nodes.contains(path))
+                .is_none_or(|path| !graph.host_modules.contains_key(path))
             {
                 continue;
             }
@@ -1321,6 +1338,12 @@ fn context_workspace_occurrence_bucket(
         }
     }
     WorkspaceOccurrenceBucket(bucket)
+}
+
+/// Cross-file range conversions repeatedly use unchanged member text.
+#[salsa::tracked(returns(ref), lru = 128)]
+fn cross_file_line_starts(db: &dyn IncrementalDb, file: SourceFile) -> crate::text::LineStarts {
+    crate::text::LineStarts::new(file.text(db))
 }
 
 /// The unioned reverse-occurrence index (the [`workspace_reference_index`]
@@ -2925,6 +2948,17 @@ impl Analysis {
         self.0.file_text(file)
     }
 
+    pub(crate) fn cross_file_line_index(&self, file: SourceFile) -> crate::text::LineIndex<'_> {
+        let text = file.text(&self.0);
+        // Bound retained source-table size independently of the LRU count.
+        const MAX_CACHED_TEXT_BYTES: usize = 128 * 1024;
+        if text.len() <= MAX_CACHED_TEXT_BYTES {
+            crate::text::LineIndex::with_starts(text, cross_file_line_starts(&self.0, file))
+        } else {
+            crate::text::LineIndex::new(text)
+        }
+    }
+
     /// The harvested index for package `name`, if present.
     pub fn library_package(&self, name: &str) -> Option<Arc<PackageIndex>> {
         library_package_for_context(&self.0, name, self.2.as_ref())
@@ -3213,6 +3247,80 @@ mod tests {
             3,
             "another file's edit must not reparse this file's Markdown"
         );
+    }
+
+    #[test]
+    fn contextual_graph_keeps_membership_precedence_and_availability() {
+        let mut db = IncrementalDatabase::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = normalize_path(dir.path());
+        let input = |db: &IncrementalDatabase, id, name: &str, text| {
+            SourceFile::new(db, FileId(id), Some(root.join(name)), Arc::from(text))
+        };
+        let entry = input(&db, 80, "Entry.jl", "include(\"shared.jl\")\n");
+        let ws = input(&db, 81, "shared.jl", "include(\"ws.jl\")\n");
+        let script = input(&db, 82, "shared.jl", "include(\"script.jl\")\n");
+        let ws_leaf = input(&db, 83, "ws.jl", "");
+        let script_leaf = input(&db, 84, "script.jl", "");
+        let availability = BTreeMap::from([
+            (root.join("shared.jl"), Some(script)),
+            (root.join("script.jl"), Some(script_leaf)),
+        ]);
+        let scripts = ScriptFiles::new(&db, availability.clone(), BTreeSet::new(), false);
+        let opts = ParseOptions::default();
+        db.set_workspace_files(vec![entry, ws, ws_leaf]);
+        assert_eq!(
+            project_graph_with_options(&db, entry, opts).nodes,
+            [
+                root.join("Entry.jl"),
+                root.join("shared.jl"),
+                root.join("ws.jl")
+            ],
+        );
+
+        // Once it leaves workspace membership, it can still be a loaded script.
+        db.set_workspace_files(vec![entry, ws_leaf]);
+        assert_eq!(
+            project_graph_with_options(&db, entry, opts).nodes,
+            [
+                root.join("Entry.jl"),
+                root.join("shared.jl"),
+                root.join("script.jl")
+            ],
+        );
+
+        // A stale script handle is not usable after its load has failed.
+        let mut unavailable = availability;
+        unavailable.insert(root.join("shared.jl"), None);
+        scripts.set_files(&mut db).to(unavailable);
+        let graph = project_graph_with_options(&db, entry, opts);
+        assert_eq!(graph.nodes, [root.join("Entry.jl")]);
+        assert_eq!(graph.unresolved.len(), 1);
+        assert_eq!(graph.unresolved[0].path, "shared.jl");
+    }
+
+    #[test]
+    fn cross_file_line_table_tracks_edits_and_utf_encodings() {
+        use crate::text::{LineIndex, PositionEncoding};
+        let mut db = IncrementalDatabase::new();
+        let file = db.add_file("π🌱 x\n二行目\n");
+        for edited in [false, true] {
+            if edited {
+                db.set_file_text(file, Arc::from("# added\nπ🌱 x\r\n二行目"));
+            }
+            let snap = db.snapshot();
+            let text = snap.file_text_of(file);
+            let current = snap.cross_file_line_index(file);
+            let legacy = LineIndex::new(text);
+            for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+                for (byte, _) in text.char_indices() {
+                    assert_eq!(
+                        current.byte_to_position(byte, encoding),
+                        legacy.byte_to_position(byte, encoding)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

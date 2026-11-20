@@ -16,7 +16,7 @@ use rowan::TextSize;
 
 use crate::incremental::{Analysis, SourceFile};
 use crate::resolve::{OccurrenceKey, OccurrenceRec, Resolver};
-use crate::text::{LineIndex, PositionEncoding};
+use crate::text::PositionEncoding;
 
 use super::uri::from_path;
 
@@ -29,7 +29,6 @@ pub(crate) struct CrossFileSite {
     pub uri: Uri,
     pub range: Range,
     pub is_def: bool,
-    pub access: crate::semantic::Access,
 }
 
 /// The workspace top-level symbol at `offset` in the file at `path`, if the
@@ -60,6 +59,17 @@ pub(crate) fn gather_sites(
     symbol: &OccurrenceKey,
     encoding: PositionEncoding,
 ) -> Vec<CrossFileSite> {
+    gather_sites_where(snapshot, symbol, encoding, |_| true)
+}
+
+/// Skip whole read-only files for definition requests before URI and range
+/// conversion. The surviving records keep the same final file/position order.
+pub(crate) fn gather_sites_where(
+    snapshot: &Analysis,
+    symbol: &OccurrenceKey,
+    encoding: PositionEncoding,
+    keep: impl Fn(&OccurrenceRec) -> bool,
+) -> Vec<CrossFileSite> {
     let bucket = snapshot.workspace_occurrence_sites(symbol);
 
     // Group by file so each file's text is line-indexed once (a single file
@@ -67,7 +77,9 @@ pub(crate) fn gather_sites(
     let mut by_file: std::collections::HashMap<SourceFile, Vec<OccurrenceRec>> =
         std::collections::HashMap::new();
     for &(file, rec) in bucket {
-        by_file.entry(file).or_default().push(rec);
+        if keep(&rec) {
+            by_file.entry(file).or_default().push(rec);
+        }
     }
 
     let mut out = Vec::new();
@@ -78,7 +90,7 @@ pub(crate) fn gather_sites(
         let Some(uri) = from_path(&path) else {
             continue;
         };
-        let line_index = LineIndex::new(snapshot.file_text_of(file));
+        let line_index = snapshot.cross_file_line_index(file);
         for rec in recs {
             out.push(CrossFileSite {
                 uri: uri.clone(),
@@ -87,7 +99,6 @@ pub(crate) fn gather_sites(
                     end: line_index.byte_to_position(rec.range.end().into(), encoding),
                 },
                 is_def: rec.is_def,
-                access: rec.access,
             });
         }
     }

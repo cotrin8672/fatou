@@ -166,14 +166,15 @@ fn cross_file_definitions(
     symbol: &OccurrenceKey,
     encoding: PositionEncoding,
 ) -> Vec<Location> {
-    cross_file::gather_sites(snapshot, symbol, encoding)
-        .into_iter()
-        .filter(|site| site.is_def || site.access == Access::Write)
-        .map(|site| Location {
-            uri: site.uri,
-            range: site.range,
-        })
-        .collect()
+    cross_file::gather_sites_where(snapshot, symbol, encoding, |record| {
+        record.is_def || record.access == Access::Write
+    })
+    .into_iter()
+    .map(|site| Location {
+        uri: site.uri,
+        range: site.range,
+    })
+    .collect()
 }
 
 /// Shared entry point for the fresh-parse and cached-model paths. Mirrors the
