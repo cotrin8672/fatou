@@ -60,10 +60,7 @@ pub(crate) fn gather_sites(
     symbol: &OccurrenceKey,
     encoding: PositionEncoding,
 ) -> Vec<CrossFileSite> {
-    let index = snapshot.workspace_reference_index();
-    let Some(bucket) = index.0.get(symbol) else {
-        return Vec::new();
-    };
+    let bucket = snapshot.workspace_occurrence_sites(symbol);
 
     // Group by file so each file's text is line-indexed once (a single file
     // usually holds several occurrences).

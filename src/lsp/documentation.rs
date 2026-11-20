@@ -5,11 +5,11 @@
 //! document. This module composes those coordinate spaces through the parser's
 //! exact docstring source map. It never evaluates documentation metadata.
 
-use fatou_parser::ast::{DocText, StaticDocText};
-use fatou_parser::documentation::ParseOutput;
+use fatou_parser::ast::StaticDocText;
 use fatou_parser::documentation::ast::{
     CodeBlock, DocumenterLinkKind, FenceKind, FootnoteReference, Link,
 };
+use fatou_parser::documentation::syntax::SyntaxNode as MarkdownSyntaxNode;
 use rowan::ast::AstNode as _;
 use rowan::{TextRange, TextSize};
 
@@ -24,30 +24,44 @@ use std::sync::Arc;
 pub(crate) struct DocumentationContext<'a> {
     pub(crate) attachment: &'a SemanticDoc,
     pub(crate) decoded: &'a StaticDocText,
-    pub(crate) markdown: ParseOutput,
+    pub(crate) markdown: MarkdownSyntaxNode,
     pub(crate) offset: TextSize,
 }
 
 impl<'a> DocumentationContext<'a> {
     /// Find the decoded documentation position corresponding to `source_offset`.
     pub(crate) fn at(model: &'a SemanticModel, source_offset: TextSize) -> Option<Self> {
-        model.documentation().iter().find_map(|attachment| {
-            let DocText::Static(decoded) = &attachment.text else {
-                return None;
-            };
-            let offset = decoded.source_map().decoded_offset(source_offset)?;
-            Some(Self {
-                attachment,
-                decoded,
-                markdown: fatou_parser::documentation::parse(decoded.as_str()),
-                offset,
+        Self::at_cached(model, source_offset, None)
+    }
+
+    pub(crate) fn at_cached(
+        model: &'a SemanticModel,
+        source_offset: TextSize,
+        cached: Option<(&Analysis, SourceFile)>,
+    ) -> Option<Self> {
+        static_documentation(model)
+            .enumerate()
+            .find_map(|(ordinal, (attachment, decoded))| {
+                let offset = decoded.source_map().decoded_offset(source_offset)?;
+                let markdown = cached
+                    .and_then(|(snapshot, file)| {
+                        snapshot
+                            .documentation_trees(file)
+                            .tree(ordinal, decoded.as_str())
+                    })
+                    .unwrap_or_else(|| fatou_parser::documentation::parse(decoded.as_str()).cst);
+                Some(Self {
+                    attachment,
+                    decoded,
+                    markdown,
+                    offset,
+                })
             })
-        })
     }
 
     /// The explicit target of an `@ref` link under the cursor.
     pub(crate) fn explicit_ref(&self) -> Option<ExplicitRef> {
-        if let Some(reference) = self.markdown.cst.descendants().find_map(|node| {
+        if let Some(reference) = self.markdown.descendants().find_map(|node| {
             let link = Link::cast(node)?;
             let documenter = link.documenter_link()?;
             if documenter.kind() != DocumenterLinkKind::Ref {
@@ -95,7 +109,7 @@ impl<'a> DocumentationContext<'a> {
 
     /// A standard Markdown fragment or footnote reference under the cursor.
     pub(crate) fn markdown_reference(&self) -> Option<MarkdownReference> {
-        if let Some(reference) = self.markdown.cst.descendants().find_map(|node| {
+        if let Some(reference) = self.markdown.descendants().find_map(|node| {
             let link = Link::cast(node)?;
             let destination = link.destination();
             let id = destination.strip_prefix('#')?;
@@ -105,7 +119,7 @@ impl<'a> DocumentationContext<'a> {
         }) {
             return Some(reference);
         }
-        self.markdown.cst.descendants().find_map(|node| {
+        self.markdown.descendants().find_map(|node| {
             let reference = FootnoteReference::cast(node)?;
             reference
                 .syntax()
@@ -117,7 +131,7 @@ impl<'a> DocumentationContext<'a> {
 
     /// The Julia-bearing fenced block under the cursor.
     pub(crate) fn embedded_julia(&self) -> Option<EmbeddedJulia<'a>> {
-        self.markdown.cst.descendants().find_map(|node| {
+        self.markdown.descendants().find_map(|node| {
             let fence = CodeBlock::cast(node)?;
             if !fence.fence_kind().contains_julia() {
                 return None;

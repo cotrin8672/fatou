@@ -2406,7 +2406,7 @@ fn serves_completion_and_resolve() {
             );
             assert_eq!(
                 result["capabilities"]["completionProvider"]["triggerCharacters"],
-                serde_json::json!([".", "@", "\\"]),
+                serde_json::json!([".", "@", "\\", " ", ":", ","]),
             );
         }
         other => panic!("expected an InitializeResult, got {other:?}"),
@@ -3849,6 +3849,101 @@ fn recv_response(client: &Connection, id: RequestId) -> lsp_server::Response {
             other => panic!("unexpected message: {other:?}"),
         }
     }
+}
+
+#[test]
+fn import_completion_triggers_are_contextual_and_do_not_require_a_depot() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new("fatou-lsp-load-completion");
+    let _override = EnvGuard::set(&[("JULIA_PROJECT", "@.")]);
+    write_file(
+        &dir.path.join("Project.toml"),
+        "[deps]\nGhostPkg = \"00000000-0000-0000-0000-000000000001\"\n",
+    );
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || fatou::lsp::serve(&server).unwrap());
+    initialize_with_root(&client, &file_uri(&dir.path));
+    let uri = file_uri(&dir.path.join("test.jl"));
+    let source = concat!(
+        "local_name = 1\n",
+        "local_name = 2 \n",
+        "using \n",
+        "using GhWrong, Base\n",
+        "module Fixture\n",
+        "firstword = 1\n",
+        "secondword = 2\n",
+        "end\n",
+        "using .Fixture:\n",
+        "using .Fixture: firstword,",
+    );
+    open_document(&client, &uri, source);
+
+    let complete = |id: i32, line, character, trigger: Option<&str>| {
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(id),
+                method: "textDocument/completion".into(),
+                params: serde_json::json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character},
+                    "context": trigger.map(|trigger| serde_json::json!({
+                        "triggerKind": 2, "triggerCharacter": trigger,
+                    })),
+                }),
+            }))
+            .unwrap();
+        let response = recv_response(&client, RequestId::from(id));
+        serde_json::from_value::<Vec<CompletionItem>>(response.result().unwrap()).unwrap()
+    };
+    let bare = complete(20, 2, 6, Some(" "));
+    assert!(bare.iter().any(|item| item.label == "GhostPkg"), "{bare:?}");
+    assert!(
+        !bare.iter().any(|item| item.label == "local_name"),
+        "{bare:?}"
+    );
+    assert!(complete(21, 1, 15, Some(" ")).is_empty());
+    let prefixed = complete(22, 3, 8, None);
+    assert_eq!(prefixed.len(), 1, "{prefixed:?}");
+    assert_eq!(prefixed[0].label, "GhostPkg");
+    assert_eq!(
+        prefixed[0].text_edit,
+        Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
+            range: Range::new(Position::new(3, 6), Position::new(3, 13)),
+            new_text: "GhostPkg".into(),
+        }))
+    );
+    let colon = complete(23, 8, 15, Some(":"));
+    let comma = complete(24, 9, 26, Some(","));
+    for items in [colon, comma] {
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["firstword", "secondword"]);
+    }
+
+    client
+        .sender
+        .send(Message::Request(Request {
+            id: RequestId::from(25),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    assert!(
+        recv_response(&client, RequestId::from(25))
+            .result()
+            .is_some()
+    );
+    client
+        .sender
+        .send(Message::Notification(Notification {
+            method: "exit".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    server_thread.join().unwrap();
 }
 
 /// Resend `textDocument/references` at `greet`'s definition (position 0,0 of

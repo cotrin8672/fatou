@@ -9,7 +9,7 @@
 //! best-effort: unreadable files, unresolved includes, parse errors, and
 //! include cycles are recorded as [`HarvestDiagnostic`]s and the walk continues.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rowan::TextRange;
@@ -105,6 +105,7 @@ fn harvest_entry_with_base_includes(
         root_filled: false,
         follow_includes: true,
         base_includes,
+        function_groups: None,
     };
     let mut root = ModuleIndex {
         name: name.to_string(),
@@ -175,6 +176,7 @@ pub fn harvest_tree(cst: &SyntaxNode) -> ModuleIndex {
         root_filled: false,
         follow_includes: false,
         base_includes: false,
+        function_groups: None,
     };
     let mut root = ModuleIndex {
         name: String::new(),
@@ -226,6 +228,8 @@ struct Harvester {
     follow_includes: bool,
     /// Base's bootstrap paths are rooted at `root` in the root module only.
     base_includes: bool,
+    /// Temporary lookup for the currently visited module only.
+    function_groups: Option<HashMap<String, Vec<usize>>>,
 }
 
 impl Harvester {
@@ -455,11 +459,13 @@ impl Harvester {
             imported_names: Vec::new(),
         };
         self.module_path.push(name);
+        let parent_groups = self.function_groups.take();
         if let Some(block) = block {
             for item in block.children() {
                 self.walk_item(&item, file, &mut child, false, None);
             }
         }
+        self.function_groups = parent_groups;
         self.module_path.pop();
         dest.submodules.push(child);
     }
@@ -544,7 +550,7 @@ impl Harvester {
             doc,
             loc: self.loc(file, name_range),
         };
-        push_method(dest, name, owner, method);
+        push_method(dest, &mut self.function_groups, name, owner, method);
     }
 
     fn handle_macro_def(
@@ -1214,17 +1220,47 @@ fn collect_names_into(node: &SyntaxNode, out: &mut Vec<(String, TextRange)>) {
 
 /// File `method` under its `(owner, name)` group in `dest`, creating the group
 /// if absent and promoting the method's docstring to a group without one.
-fn push_method(dest: &mut ModuleIndex, name: String, owner: Option<Vec<String>>, method: Method) {
-    if let Some(group) = dest
-        .functions
-        .iter_mut()
-        .find(|g| g.name == name && g.owner == owner)
-    {
+fn push_method(
+    dest: &mut ModuleIndex,
+    slots: &mut Option<HashMap<String, Vec<usize>>>,
+    name: String,
+    owner: Option<Vec<String>>,
+    method: Method,
+) {
+    // Smaller modules do not warrant a hash table; larger ones get a side
+    // table while retaining the exact insertion order of the serialized Vec.
+    if slots.is_none() && dest.functions.len() == 32 {
+        let mut table = HashMap::<String, Vec<usize>>::new();
+        for (i, group) in dest.functions.iter().enumerate() {
+            table.entry(group.name.clone()).or_default().push(i);
+        }
+        *slots = Some(table);
+    }
+    let found = if let Some(table) = slots.as_ref() {
+        table.get(&name).and_then(|indices| {
+            indices
+                .iter()
+                .copied()
+                .find(|&i| dest.functions[i].owner == owner)
+        })
+    } else {
+        dest.functions
+            .iter()
+            .position(|g| g.name == name && g.owner == owner)
+    };
+    if let Some(i) = found {
+        let group = &mut dest.functions[i];
         if group.doc.is_none() {
             group.doc = method.doc.clone();
         }
         group.methods.push(method);
     } else {
+        if let Some(table) = slots {
+            table
+                .entry(name.clone())
+                .or_default()
+                .push(dest.functions.len());
+        }
         dest.functions.push(FunctionGroup {
             name,
             owner,
@@ -1367,6 +1403,7 @@ mod tests {
             root_filled: false,
             follow_includes: true,
             base_includes: false,
+            function_groups: None,
         };
         let mut root = ModuleIndex {
             name: name.to_string(),

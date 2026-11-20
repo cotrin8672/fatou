@@ -8,7 +8,7 @@
 //! phase first. Reads therefore always resolve against fully populated
 //! enclosing scopes, which makes forward closure captures come out right.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -34,6 +34,7 @@ pub(crate) fn build(root: &SyntaxNode) -> SemanticModel {
     let mut builder = Builder {
         model: SemanticModel::default(),
         global_decls: Vec::new(),
+        binding_lookup: Vec::new(),
         pending_macros: Vec::new(),
         testsets: HashSet::new(),
     };
@@ -556,8 +557,36 @@ enum DeclKind {
     Const,
 }
 
+const INDEX_BINDINGS_AT: usize = 32;
+
+/// Builder-only derived indexes for large scopes. The stored model, BindingIds and
+/// binding introduction order remain the source of truth and are not changed.
+#[derive(Default)]
+struct ScopeBindingIndex {
+    names: HashMap<SmolStr, BindingId>,
+    macros: HashMap<SmolStr, BindingId>,
+}
+
+impl ScopeBindingIndex {
+    fn insert(&mut self, b: &Binding, id: BindingId) {
+        self.names.insert(b.name.clone(), id);
+        match b.kind {
+            BindingKind::Macro => {
+                self.macros.insert(b.name.clone(), id);
+            }
+            BindingKind::Import => {
+                if let Some(name) = b.name.strip_prefix('@') {
+                    self.macros.insert(SmolStr::new(name), id);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct Builder {
     model: SemanticModel,
+    binding_lookup: Vec<Option<Box<ScopeBindingIndex>>>,
     /// Names declared `global` per scope (builder-transient, parallel to
     /// `model.scopes`).
     global_decls: Vec<Vec<SmolStr>>,
@@ -584,6 +613,7 @@ impl Builder {
             module_name: None,
         });
         self.global_decls.push(Vec::new());
+        self.binding_lookup.push(None);
         id
     }
 
@@ -602,7 +632,19 @@ impl Builder {
             def_range,
             read: false,
         });
-        self.model.scopes[scope.0 as usize].bindings.push(id);
+        let i = scope.0 as usize;
+        let bindings = &mut self.model.scopes[i].bindings;
+        bindings.push(id);
+        if let Some(index) = self.binding_lookup[i].as_mut() {
+            index.insert(&self.model.bindings[id.0 as usize], id);
+        } else if bindings.len() == INDEX_BINDINGS_AT {
+            let mut index = ScopeBindingIndex::default();
+            index.names.reserve(bindings.len());
+            for &b in bindings.iter() {
+                index.insert(&self.model.bindings[b.0 as usize], b);
+            }
+            self.binding_lookup[i] = Some(Box::new(index));
+        }
         id
     }
 
@@ -630,12 +672,51 @@ impl Builder {
     }
 
     fn find_in_scope(&self, scope: ScopeId, name: &str) -> Option<BindingId> {
+        self.find_in_namespace(scope, name, false)
+    }
+
+    fn find_in_namespace(&self, scope: ScopeId, name: &str, is_macro: bool) -> Option<BindingId> {
+        if let Some(index) = self.binding_lookup[scope.0 as usize].as_ref() {
+            return if is_macro {
+                &index.macros
+            } else {
+                &index.names
+            }
+            .get(name)
+            .copied();
+        }
         self.scope(scope)
             .bindings
             .iter()
             .rev()
             .copied()
-            .find(|&b| self.model.bindings[b.0 as usize].name == name)
+            .find(|&id| {
+                let binding = self.model.binding(id);
+                if !is_macro {
+                    return binding.name == name;
+                }
+                match binding.kind {
+                    BindingKind::Macro => binding.name == name,
+                    BindingKind::Import => binding.name.strip_prefix('@') == Some(name),
+                    _ => false,
+                }
+            })
+    }
+
+    fn resolve_name(&self, name: &str, scope: ScopeId, is_macro: bool) -> Option<BindingId> {
+        let mut cursor = Some(scope);
+        while let Some(id) = cursor {
+            if let Some(binding) = self.find_in_namespace(id, name, is_macro) {
+                return Some(binding);
+            }
+            let scope = self.scope(id);
+            cursor = if scope.kind.is_global() {
+                None
+            } else {
+                scope.parent
+            };
+        }
+        None
     }
 
     /// The innermost global scope enclosing (or equal to) `scope`.
@@ -693,13 +774,13 @@ impl Builder {
     /// and then terminates the search (module bodies do not see enclosing
     /// globals).
     fn resolve_read(&self, name: &str, scope: ScopeId) -> Option<BindingId> {
-        self.model.resolve_name(name, scope, false)
+        self.resolve_name(name, scope, false)
     }
 
     /// Resolve a `@name` read: the macro namespace sees `macro` definitions
     /// and imported macros (whose bindings keep the `@` sigil in the name).
     fn resolve_macro_read(&self, name: &str, scope: ScopeId) -> Option<BindingId> {
-        self.model.resolve_name(name, scope, true)
+        self.resolve_name(name, scope, true)
     }
 
     /// Record the macro read implied by a non-standard string/command literal.

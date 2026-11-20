@@ -600,7 +600,7 @@ fn delta_encode(
     let mut data = Vec::new();
     let mut prev = Position::new(0, 0);
     for &(range, kind) in spans {
-        for segment in split_at_line_breaks(range, text) {
+        for_each_line_segment(range, text, |segment| {
             let start = line_index.byte_to_position(segment.start().into(), encoding);
             let end = line_index.byte_to_position(segment.end().into(), encoding);
             debug_assert_eq!(start.line, end.line, "segments never span line breaks");
@@ -618,17 +618,16 @@ fn delta_encode(
                 token_modifiers_bitset: 0,
             });
             prev = start;
-        }
+        });
     }
     data
 }
 
 /// Split `range` at line breaks into per-line, non-empty segments, excluding
 /// the `\n` (and a preceding `\r`) itself.
-fn split_at_line_breaks(range: TextRange, text: &str) -> Vec<TextRange> {
+fn for_each_line_segment(range: TextRange, text: &str, mut push_segment: impl FnMut(TextRange)) {
     let base = usize::from(range.start());
     let slice = &text[base..usize::from(range.end())];
-    let mut segments = Vec::new();
     let mut push = |from: usize, to: usize| {
         let to = if slice.as_bytes()[from..to].last() == Some(&b'\r') {
             to - 1
@@ -636,21 +635,18 @@ fn split_at_line_breaks(range: TextRange, text: &str) -> Vec<TextRange> {
             to
         };
         if to > from {
-            segments.push(TextRange::new(
+            push_segment(TextRange::new(
                 TextSize::new((base + from) as u32),
                 TextSize::new((base + to) as u32),
             ));
         }
     };
     let mut start = 0;
-    for (i, byte) in slice.bytes().enumerate() {
-        if byte == b'\n' {
-            push(start, i);
-            start = i + 1;
-        }
+    for i in memchr::memchr_iter(b'\n', slice.as_bytes()) {
+        push(start, i);
+        start = i + 1;
     }
     push(start, slice.len());
-    segments
 }
 
 #[cfg(test)]

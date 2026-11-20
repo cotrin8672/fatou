@@ -41,7 +41,7 @@ use crate::semantic::{
 /// The namespace a name is resolved in. Julia keeps macros separate: `@time`
 /// and a value `time` never resolve to one another. `Ord` so it can key the
 /// reverse-occurrence index's per-name buckets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Namespace {
     Value,
     Macro,
@@ -59,7 +59,7 @@ pub type ModulePath = Vec<SmolStr>;
 /// bare-or-`@` name. The module path keeps same-named symbols in different
 /// (nested) modules from conflating; the package name does the same across
 /// workspace folders, whose reverse indexes share one map.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OccurrenceKey {
     /// The dev package the symbol belongs to ([`PackageIndex::name`]).
     pub package: SmolStr,
@@ -344,10 +344,20 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     /// Resolve `name` (bare, without `@` even in [`Namespace::Macro`]) as read
     /// at `offset`, walking the four tiers and returning the first hit.
     pub fn resolve(&self, name: &str, offset: TextSize, namespace: Namespace) -> Resolution {
+        self.resolve_at_scope(name, offset, namespace, self.model.scope_at(offset))
+    }
+
+    fn resolve_at_scope(
+        &self,
+        name: &str,
+        offset: TextSize,
+        namespace: Namespace,
+        scope: ScopeId,
+    ) -> Resolution {
         if let Some(scripts) = &self.scripts {
-            let mut answers = scripts
-                .iter()
-                .map(|context| self.resolve_in_script(name, offset, namespace, context));
+            let mut answers = scripts.iter().map(|context| {
+                self.resolve_with_script(name, offset, namespace, scope, Some(context))
+            });
             let Some(first) = answers.next() else {
                 return Resolution::Ambiguous;
             };
@@ -357,7 +367,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                 Resolution::Ambiguous
             };
         }
-        self.resolve_with_script(name, offset, namespace, None)
+        self.resolve_with_script(name, offset, namespace, scope, None)
     }
 
     pub fn resolve_in_script(
@@ -367,7 +377,13 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         namespace: Namespace,
         context: &crate::project::scripts::ScriptContext<'_>,
     ) -> Resolution {
-        self.resolve_with_script(name, offset, namespace, Some(context))
+        self.resolve_with_script(
+            name,
+            offset,
+            namespace,
+            self.model.scope_at(offset),
+            Some(context),
+        )
     }
 
     fn resolve_with_script(
@@ -375,30 +391,25 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         name: &str,
         offset: TextSize,
         namespace: Namespace,
+        scope: ScopeId,
         script: Option<&crate::project::scripts::ScriptContext<'_>>,
     ) -> Resolution {
         let wanted = wanted_name(name, namespace);
 
         // Tiers 1 + 2: a binding in this file.
-        if let Some(binding) = self.file_binding(&wanted, offset, namespace) {
+        if let Some(binding) = self.file_binding(&wanted, scope, namespace) {
             return Resolution::Binding(binding);
         }
         let script_module = script.and_then(|context| {
             let mut path = context.host.clone();
-            path.extend(
-                self.model
-                    .enclosing_module_path(self.model.scope_at(offset)),
-            );
+            path.extend(self.model.enclosing_module_path(scope));
             context.program.modules.get(&path)
         });
         if namespace == Namespace::Value
             && let Some(context) = script
         {
             let mut path = context.host.clone();
-            path.extend(
-                self.model
-                    .enclosing_module_path(self.model.scope_at(offset)),
-            );
+            path.extend(self.model.enclosing_module_path(scope));
             let own_name = path.last().map(SmolStr::as_str).unwrap_or("Main");
             if wanted == own_name {
                 return Resolution::Script { name: wanted };
@@ -418,7 +429,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         if let Some(workspace) = &self.workspace
             && script.is_none()
         {
-            let path = self.full_module_path(workspace, self.model.scope_at(offset));
+            let path = self.full_module_path(workspace, scope);
             if let Some(module) = module_at(&workspace.pkg.root, &path) {
                 if self.workspace_defines(module, &wanted, offset, namespace)
                     || (namespace == Namespace::Value && module.name == wanted.as_str())
@@ -483,6 +494,136 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             };
         }
         Resolution::Unresolved
+    }
+
+    /// Resolve the receiver of a dotted read before consulting a package
+    /// index. A known value is never a package merely because its spelling
+    /// matches one. For an unresolved head, keep the existing best-effort
+    /// indexed-package lookup (also useful in incomplete source).
+    pub(crate) fn module_receiver_path(
+        &self,
+        written: &[SmolStr],
+        offset: TextSize,
+        receiver_start: Option<TextSize>,
+    ) -> Option<ModulePath> {
+        let (head, tail) = written.split_first()?;
+        // A recorded occurrence has the actual scope of a read. In a let/for
+        // initializer, that is outside the scope that binds the new variable,
+        // even when the latter's source range overlaps the initializer.
+        let scope = receiver_start
+            .and_then(|start| {
+                self.model.ident_at(start).filter(|ident| {
+                    ident.range.start() == start && &ident.name == head && !ident.is_macro
+                })
+            })
+            .map_or_else(|| self.model.scope_at(offset), |ident| ident.scope);
+        let mut path = match self.resolve_at_scope(head, offset, Namespace::Value, scope) {
+            Resolution::Binding(id) => {
+                let binding = self.model.binding(id);
+                match binding.kind {
+                    BindingKind::Module => {
+                        let workspace = self.workspace.as_ref()?;
+                        let mut path = self.full_module_path(workspace, binding.scope);
+                        path.insert(0, SmolStr::new(&workspace.pkg.name));
+                        path.push(head.clone());
+                        path
+                    }
+                    BindingKind::Import => {
+                        let load = self.model.module_loads().iter().find(|load| {
+                            load.scope == binding.scope
+                                && load.range.contains_range(binding.def_range)
+                        })?;
+                        if load.path.leading_dots != 0 {
+                            return None;
+                        }
+                        let mut path = load.path.components.clone();
+                        if let Some(items) = &load.items {
+                            let item = items.iter().find(|item| {
+                                item.range.contains_range(binding.def_range)
+                                    && item.alias.as_ref().unwrap_or(&item.name) == head
+                            })?;
+                            path.push(item.name.clone());
+                        }
+                        // A clause can import a function, type, or value rather
+                        // than a module. Confirm the target before using it.
+                        self.indexed_module_at(&path)?;
+                        path
+                    }
+                    _ => return None,
+                }
+            }
+            Resolution::Workspace { mut module, name } => {
+                let workspace = self.workspace.as_ref()?;
+                let host = module_at(&workspace.pkg.root, &module)?;
+                if host.name != name.as_str() {
+                    host.submodules
+                        .iter()
+                        .find(|sub| sub.name == name.as_str())?;
+                    module.push(name);
+                }
+                module.insert(0, SmolStr::new(&workspace.pkg.name));
+                module
+            }
+            Resolution::WorkspaceImport { .. } => {
+                // The index retains whole-module using paths, but other
+                // sibling imports record names only: don't guess their type.
+                let workspace = self.workspace.as_ref()?;
+                let host = module_at(
+                    &workspace.pkg.root,
+                    &self.full_module_path(workspace, scope),
+                )?;
+                let using = host.usings.iter().find(|using| {
+                    using.leading_dots == 0
+                        && using
+                            .components
+                            .last()
+                            .is_some_and(|name| name == head.as_str())
+                })?;
+                using.components.iter().map(SmolStr::new).collect()
+            }
+            Resolution::Using { module, name } | Resolution::System { module, name } => {
+                let mut path: ModulePath = module.split('.').map(SmolStr::new).collect();
+                if module != name {
+                    path.push(name);
+                }
+                self.indexed_module_at(&path)?;
+                path
+            }
+            Resolution::Unresolved => {
+                if let Some(workspace) = &self.workspace {
+                    let mut host_path = self.full_module_path(workspace, scope);
+                    if module_at(&workspace.pkg.root, &host_path).is_some_and(|host| {
+                        host.submodules.iter().any(|sub| sub.name == head.as_str())
+                    }) {
+                        host_path.push(head.clone());
+                        host_path.insert(0, SmolStr::new(&workspace.pkg.name));
+                        host_path
+                    } else {
+                        vec![head.clone()]
+                    }
+                } else {
+                    vec![head.clone()]
+                }
+            }
+            Resolution::Script { .. } | Resolution::Ambiguous => return None,
+        };
+        path.extend_from_slice(tail);
+        Some(path)
+    }
+
+    fn indexed_module_at(&self, path: &[SmolStr]) -> Option<ModuleIndexHandle> {
+        let (head, rest) = path.split_first()?;
+        let pkg = self
+            .workspace
+            .as_ref()
+            .filter(|workspace| workspace.pkg.name == head.as_str())
+            .map(|workspace| workspace.pkg.clone())
+            .or_else(|| self.packages.package(head))?;
+        module_at(&pkg.root, rest)?;
+        Some(ModuleIndexHandle {
+            pkg,
+            rest: rest.to_vec(),
+        })
     }
 
     /// Whether a fully qualified package path names a harvested symbol.
@@ -564,9 +705,33 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         {
             // Same-module top-level definitions, then the names a sibling file's
             // module-level `using`/`import` binds — both module globals.
+            let definite: HashSet<&str> = match namespace {
+                Namespace::Value => module
+                    .types
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .chain(module.consts.iter().map(|c| c.name.as_str()))
+                    .chain(
+                        module
+                            .functions
+                            .iter()
+                            .filter(|f| f.methods.iter().any(|m| !m.is_generated))
+                            .map(|f| f.name.as_str()),
+                    )
+                    .collect(),
+                Namespace::Macro => HashSet::new(),
+            };
             for name in defined_names(module, namespace)
                 .into_iter()
-                .filter(|name| self.workspace_defines(module, name, offset, namespace))
+                .filter(|name| {
+                    namespace == Namespace::Macro
+                        || definite.contains(name.as_str())
+                        || !self
+                            .export_provider(name, offset)
+                            .is_some_and(|(_, provider)| {
+                                module_declares_type_or_const(&provider, name)
+                            })
+                })
                 .chain(imported_names(module, namespace))
             {
                 if seen.insert(name.clone()) {
@@ -853,10 +1018,10 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     fn file_binding(
         &self,
         wanted: &SmolStr,
-        offset: TextSize,
+        at: ScopeId,
         namespace: Namespace,
     ) -> Option<BindingId> {
-        let mut cursor = Some(self.model.scope_at(offset));
+        let mut cursor = Some(at);
         while let Some(id) = cursor {
             let scope = self.model.scope(id);
             let hit = scope.bindings.iter().rev().copied().find(|&b| {

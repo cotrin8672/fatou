@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_channel::Sender;
 use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
@@ -180,6 +180,7 @@ pub(crate) enum Outbound {
     ReadReply {
         message: Message,
         membership_generation: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
     },
 }
 
@@ -188,6 +189,7 @@ pub(crate) enum Outbound {
 /// `$/cancelRequest` can find and cancel it. A non-document read (e.g.
 /// `workspace/symbol`) carries `None`: it is cancellable but never stale.
 struct ReadMeta {
+    cancelled: Arc<AtomicBool>,
     context_epoch: u64,
     uri: Option<Uri>,
     version: Option<i32>,
@@ -239,6 +241,7 @@ pub(crate) struct GlobalState {
     /// no push channel: without this an open `Project.toml` shows no version
     /// beside a UUID until the user happens to edit or scroll it.
     inlay_hint_refresh: bool,
+    pub(crate) completion_data_defaults: bool,
     pub(crate) semantic_tokens_refresh: bool,
     /// Sequence number for server-to-client refresh requests, so each carries
     /// a fresh JSON-RPC id.
@@ -311,6 +314,7 @@ impl GlobalState {
             diagnostic_refresh,
             inlay_hint_refresh,
             semantic_tokens_refresh: false,
+            completion_data_defaults: false,
             refresh_seq: 0,
             config,
         };
@@ -693,6 +697,10 @@ impl GlobalState {
             self.respond_err(id, "invalid completion params");
             return;
         };
+        let import_trigger = params.context.is_some_and(|context| {
+            context.trigger_kind == lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER
+                && matches!(context.trigger_character.as_deref(), Some(" " | ":" | ","))
+        });
         let uri = params.text_document_position.text_document.uri;
         let Some(text) = self.julia_text(&uri) else {
             self.respond_ok(id, serde_json::Value::Null);
@@ -704,7 +712,8 @@ impl GlobalState {
             path: path_for(&uri),
             text,
             position: params.text_document_position.position,
-            sender: reply,
+            import_trigger,
+            sender: reply.with_completion_data_defaults(self.completion_data_defaults),
         });
     }
 
@@ -1038,10 +1047,11 @@ impl GlobalState {
 
     fn on_completion_resolve(&mut self, req: Request) {
         let id = req.id.clone();
-        let Ok((_, item)) = req.extract::<CompletionItem>(ResolveCompletionItem::METHOD) else {
+        let Ok((_, mut item)) = req.extract::<CompletionItem>(ResolveCompletionItem::METHOD) else {
             self.respond_err(id, "invalid completionItem/resolve params");
             return;
         };
+        super::completion::expand_resolve_data(&mut item);
         let reply = self.read_reply(id.clone(), None);
         self.dispatch_read(ReadJob::CompletionResolve {
             id,
@@ -1112,9 +1122,11 @@ impl GlobalState {
         rewrite_epoch: Option<u64>,
     ) -> ReadReply {
         let document = uri.and_then(|uri| self.documents.get(uri));
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.inflight_reads.insert(
             id,
             ReadMeta {
+                cancelled: Arc::clone(&cancelled),
                 context_epoch: self.context_epoch,
                 uri: uri.cloned(),
                 version: document.map(|doc| doc.version),
@@ -1122,7 +1134,7 @@ impl GlobalState {
                 rewrite_epoch,
             },
         );
-        ReadReply::new(self.out_tx.clone())
+        ReadReply::new(self.out_tx.clone()).with_cancelled(cancelled)
     }
 
     /// Hand a read job to the analysis thread; if its channel is gone
@@ -1578,8 +1590,13 @@ impl GlobalState {
             Outbound::ReadReply {
                 message,
                 membership_generation,
+                cancelled,
             } => {
-                self.on_read_reply(message, membership_generation);
+                // A client may reuse an ID after observing cancellation; a
+                // reply from the old worker must not take the new registry entry.
+                if !cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    self.on_read_reply(message, membership_generation);
+                }
             }
         }
     }
@@ -1629,17 +1646,17 @@ impl GlobalState {
     }
 
     /// Handle `$/cancelRequest`. If the id names a read still in flight, answer
-    /// it now with `RequestCancelled` and forget it — its eventual worker reply
-    /// finds no entry and is dropped, so the request is still answered exactly
-    /// once. An unknown id (already answered, or never a tracked read) is a
-    /// no-op, as the spec allows. The in-flight salsa work runs to completion;
-    /// only its result is discarded (cooperative cancellation).
+    /// it now with `RequestCancelled` and forget it. Queued jobs can skip
+    /// work; a running Salsa query completes, but its response is discarded.
+    /// The flag identifies this request instance even if the ID is reused.
+    /// An unknown id (already answered, or never a tracked read) is a no-op.
     fn on_cancel(&mut self, id: NumberOrString) {
         let id = match id {
             NumberOrString::Number(n) => RequestId::from(n),
             NumberOrString::String(s) => RequestId::from(s),
         };
-        if self.inflight_reads.remove(&id).is_some() {
+        if let Some(meta) = self.inflight_reads.remove(&id) {
+            meta.cancelled.store(true, Ordering::Relaxed);
             let cancelled = Response::new_err(
                 id,
                 ErrorCode::RequestCanceled as i32,
@@ -2277,6 +2294,55 @@ mod tests {
             rx.try_recv().is_err(),
             "a cancelled request is not answered twice"
         );
+    }
+
+    #[test]
+    fn cancelled_reply_cannot_consume_reused_numeric_or_string_id() {
+        let (mut state, rx) = test_state();
+        for (id, cancel) in [
+            (RequestId::from(1), NumberOrString::Number(1)),
+            (
+                RequestId::from("text-id".to_string()),
+                NumberOrString::String("text-id".to_string()),
+            ),
+        ] {
+            let (out_tx, out_rx) = unbounded();
+            state.out_tx = out_tx;
+            let old = state.read_reply(id.clone(), None);
+            // Simulate a worker that posted its response just before the cancel
+            // notification won the main loop's select.
+            old.send(Message::Response(Response::new_ok(id.clone(), "old")))
+                .unwrap();
+            state.on_cancel(cancel.clone());
+            let Message::Response(response) = rx.try_recv().unwrap() else {
+                panic!("expected cancellation response");
+            };
+            assert_eq!(response.id, id);
+            assert_eq!(
+                response.response_result.unwrap_err().code,
+                ErrorCode::RequestCanceled as i32
+            );
+            state.on_cancel(cancel);
+            assert!(rx.try_recv().is_err());
+
+            let fresh = state.read_reply(id.clone(), None);
+            state.on_outbound(out_rx.try_recv().unwrap());
+            assert!(rx.try_recv().is_err());
+            assert!(state.inflight_reads.contains_key(&id));
+            fresh
+                .send(Message::Response(Response::new_ok(id.clone(), "fresh")))
+                .unwrap();
+            state.on_outbound(out_rx.try_recv().unwrap());
+            let Message::Response(response) = rx.try_recv().unwrap() else {
+                panic!("expected fresh response");
+            };
+            assert_eq!(response.id, id);
+            assert_eq!(
+                response.response_result.unwrap(),
+                serde_json::json!("fresh")
+            );
+            assert!(state.inflight_reads.is_empty());
+        }
     }
 
     #[test]

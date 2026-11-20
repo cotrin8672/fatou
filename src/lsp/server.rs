@@ -67,6 +67,14 @@ pub fn serve(connection: &Connection) -> Result<(), DynError> {
     let register_watchers =
         supports_watched_files_registration(&params.capabilities) && !workspace_roots.is_empty();
     let pull_diagnostics = supports_pull_diagnostics(&params.capabilities);
+    let completion_data_defaults = params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|text| text.completion.as_ref())
+        .and_then(|completion| completion.completion_list.as_ref())
+        .and_then(|list| list.item_defaults.as_ref())
+        .is_some_and(|fields| fields.iter().any(|field| field == "data"));
     let diagnostic_refresh = supports_diagnostic_refresh(&params.capabilities);
     let inlay_hint_refresh = supports_inlay_hint_refresh(&params.capabilities);
     let semantic_tokens_refresh = params
@@ -90,6 +98,7 @@ pub fn serve(connection: &Connection) -> Result<(), DynError> {
         inlay_hint_refresh,
         work_done_progress,
         semantic_tokens_refresh,
+        completion_data_defaults,
         params.initialization_options,
     )
 }
@@ -236,9 +245,9 @@ fn server_capabilities(encoding: PositionEncoding, pull_diagnostics: bool) -> Se
         document_symbol_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
-            // `.` opens member completion, `@` opens macro completion, and `\`
-            // opens the LaTeX/emoji input sequences.
-            trigger_characters: Some(vec![".".to_string(), "@".to_string(), "\\".to_string()]),
+            // Space, colon and comma are gated to Julia import clauses;
+            // the other characters open member, macro and input sequences.
+            trigger_characters: Some([".", "@", "\\", " ", ":", ","].map(str::to_string).to_vec()),
             resolve_provider: Some(true),
             ..Default::default()
         }),
@@ -358,6 +367,7 @@ fn main_loop(
     inlay_hint_refresh: bool,
     work_done_progress: bool,
     semantic_tokens_refresh: bool,
+    completion_data_defaults: bool,
     initialization_options: Option<serde_json::Value>,
 ) -> Result<(), DynError> {
     let (out_tx, out_rx) = crossbeam_channel::unbounded::<Outbound>();
@@ -424,6 +434,7 @@ fn main_loop(
     );
 
     state.semantic_tokens_refresh = semantic_tokens_refresh;
+    state.completion_data_defaults = completion_data_defaults;
 
     // `initialize_finish` has already consumed the client's `initialized`
     // notification (lsp-server handles it inside the handshake), so the

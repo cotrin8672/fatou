@@ -335,15 +335,7 @@ impl AnalysisWorker {
                 }
                 recv(read_rx) -> job => {
                     let Ok(job) = job else { break };
-                    guard("read-dispatch", || {
-                        self.drain_sync(sync_rx);
-                        if job.produces_edits() {
-                            self.deferred_edits.push(job);
-                        } else {
-                            self.try_dispatch();
-                            self.dispatch_read(job);
-                        }
-                    });
+                    guard("read-dispatch", || self.on_read_job(job, sync_rx));
                 }
             }
             guard("dispatch", || {
@@ -354,6 +346,20 @@ impl AnalysisWorker {
         }
     }
 
+    fn on_read_job(&mut self, mut job: ReadJob, sync_rx: &Receiver<SyncMessage>) {
+        // A cancelled read still wakes this loop. Drain edits and keep the
+        // outer dispatch epilogue rather than skipping an event-loop turn.
+        self.drain_sync(sync_rx);
+        if job.produces_edits() {
+            if !job.is_cancelled() {
+                self.deferred_edits.push(job);
+            }
+        } else {
+            self.try_dispatch();
+            self.dispatch_read(job);
+        }
+    }
+
     fn drain_sync(&mut self, sync_rx: &Receiver<SyncMessage>) {
         while let Ok(msg) = sync_rx.try_recv() {
             self.on_sync_message(msg);
@@ -361,6 +367,7 @@ impl AnalysisWorker {
     }
 
     fn dispatch_ready_edits(&mut self) {
+        self.deferred_edits.retain_mut(|job| !job.is_cancelled());
         if self.full_harvest.is_some() || self.syntax_harvest.is_some() || self.scripts.loading() {
             return;
         }
@@ -391,13 +398,21 @@ impl AnalysisWorker {
     }
 
     fn dispatch_read(&self, job: ReadJob) {
-        let job =
+        let mut job =
             job.with_membership_generation(self.membership_generation.load(Ordering::Acquire));
+        if job.is_cancelled() {
+            return;
+        }
         let snapshot = self.db.snapshot();
         let contexts = job.contexts(&snapshot);
         let encoding = self.encoding;
-        self.read_spawner
-            .spawn(move || run_read(snapshot, job, encoding, contexts));
+        self.read_spawner.spawn(move || {
+            // Cancellation never interrupts a running Salsa query. State
+            // already answered the client and will drop any raced reply.
+            if !job.is_cancelled() {
+                run_read(snapshot, job, encoding, contexts);
+            }
+        });
     }
 
     fn on_sync_message(&mut self, msg: SyncMessage) {
@@ -952,6 +967,132 @@ mod tests {
                 import_projections: HashMap::new(),
             }
         }
+    }
+
+    #[test]
+    fn cancelled_inbound_read_still_drains_pending_sync() {
+        use crate::lsp::read_jobs::ReadReply;
+        use std::sync::atomic::AtomicBool;
+
+        let (sync_tx, sync_rx) = crossbeam_channel::unbounded();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let mut worker = AnalysisWorker::for_test();
+        let path = PathBuf::from("pending.jl");
+        sync_tx
+            .send(SyncMessage::SourceChanged(path.clone()))
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        worker.on_read_job(
+            ReadJob::WillRenameFiles {
+                id: lsp_server::RequestId::from(1),
+                files: Vec::new(),
+                open_docs: Vec::new(),
+                sender: ReadReply::new(out_tx).with_cancelled(cancelled),
+            },
+            &sync_rx,
+        );
+        assert!(sync_rx.is_empty());
+        assert!(worker.syntax_dirty);
+        assert!(
+            worker
+                .changed_sources
+                .contains(&crate::incremental::normalize_path(&path))
+        );
+        assert!(worker.deferred_edits.is_empty());
+        assert!(out_rx.is_empty());
+    }
+
+    #[test]
+    fn cancelled_deferred_rewrite_does_not_discard_next_live_membership() {
+        use crate::lsp::read_jobs::ReadReply;
+        use crate::lsp::task_pool::TaskPool;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let pool = TaskPool::new("test-cancelled-rewrite", 1);
+        let mut worker = AnalysisWorker {
+            read_spawner: pool.spawner(),
+            full_harvest: Some(1),
+            ..AnalysisWorker::for_test()
+        };
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let make_job = |id, sender| ReadJob::Format {
+            id: lsp_server::RequestId::from(id),
+            path: PathBuf::from("rewrite.jl"),
+            text: Arc::new(TextBuffer::new("x = 1\n")),
+            style: Default::default(),
+            safe: true,
+            sender,
+        };
+        worker.deferred_edits.push(make_job(
+            1,
+            ReadReply::new(out_tx.clone()).with_cancelled(Arc::clone(&cancelled)),
+        ));
+        worker
+            .deferred_edits
+            .push(make_job(2, ReadReply::new(out_tx)));
+        worker.dispatch_ready_edits();
+        assert_eq!(worker.deferred_edits.len(), 2);
+        cancelled.store(true, Ordering::Relaxed);
+        worker.dispatch_ready_edits();
+        assert_eq!(worker.deferred_edits.len(), 1);
+        assert!(out_rx.is_empty());
+
+        worker.membership_generation.store(7, Ordering::Release);
+        worker.full_harvest = None;
+        worker.dispatch_ready_edits();
+        let Outbound::ReadReply {
+            message: lsp_server::Message::Response(response),
+            membership_generation,
+            ..
+        } = out_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("expected response from the remaining rewrite");
+        };
+        assert_eq!(response.id, lsp_server::RequestId::from(2));
+        assert_eq!(membership_generation, Some(7));
+        assert!(worker.deferred_edits.is_empty());
+        assert!(out_rx.is_empty());
+    }
+
+    #[test]
+    fn queued_read_cancelled_after_dispatch_does_not_run() {
+        use crate::lsp::read_jobs::ReadReply;
+        use crate::lsp::task_pool::TaskPool;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let pool = TaskPool::new("test-cancelled-read", 1);
+        let worker = AnalysisWorker {
+            read_spawner: pool.spawner(),
+            ..AnalysisWorker::for_test()
+        };
+        let (release, wait) = crossbeam_channel::bounded::<()>(0);
+        pool.spawner().spawn(move || wait.recv().unwrap());
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        worker.dispatch_read(ReadJob::WorkspaceSymbols {
+            id: lsp_server::RequestId::from(1),
+            query: String::new(),
+            sender: ReadReply::new(out_tx.clone()).with_cancelled(Arc::clone(&cancelled)),
+        });
+        cancelled.store(true, Ordering::Relaxed);
+        worker.dispatch_read(ReadJob::WorkspaceSymbols {
+            id: lsp_server::RequestId::from(2),
+            query: String::new(),
+            sender: ReadReply::new(out_tx),
+        });
+        release.send(()).unwrap();
+        let Outbound::ReadReply {
+            message: lsp_server::Message::Response(response),
+            ..
+        } = out_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("expected response from the uncancelled read");
+        };
+        assert_eq!(response.id, lsp_server::RequestId::from(2));
+        assert!(out_rx.is_empty());
     }
 
     #[test]

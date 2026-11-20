@@ -23,7 +23,7 @@ use crate::incremental::Analysis;
 use crate::index::model::Span;
 use crate::index::{DefLocation, ModuleIndex, TypeKind};
 use crate::resolve::PackageSource;
-use crate::text::{LineIndex, PositionEncoding};
+use crate::text::{LineIndex, PositionEncoding, TextBuffer};
 
 use super::uri::from_path;
 
@@ -60,16 +60,16 @@ pub fn compute_workspace_symbols<P: PackageSource>(
     // Phase 2: materialize each match's location off disk. Files are read once
     // and shared across the symbols they contain (a single file usually holds
     // many); an unreadable file drops its symbols rather than faking a range.
-    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut texts: HashMap<PathBuf, Option<TextBuffer>> = HashMap::new();
     matches
         .into_iter()
         .filter_map(|m| {
             let abs = root.join(&m.file);
             let text = texts
                 .entry(abs.clone())
-                .or_insert_with(|| std::fs::read_to_string(&abs).ok())
-                .as_deref()?;
-            let line_index = LineIndex::new(text);
+                .or_insert_with(|| std::fs::read_to_string(&abs).ok().map(TextBuffer::new))
+                .as_ref()?;
+            let line_index = text.line_index();
             Some(WorkspaceSymbol {
                 name: m.name,
                 kind: m.kind,

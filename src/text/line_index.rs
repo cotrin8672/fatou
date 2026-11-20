@@ -304,6 +304,25 @@ mod tests {
     }
 
     #[test]
+    fn julials_regression_range_end_past_eof_clamps() {
+        // Port of LanguageServer.jl 6.0.1's corresponding test_textdocument.jl case.
+        let text = "abc\ndef\n";
+        let index = LineIndex::new(text);
+        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+            assert_eq!(index.byte_to_position(0, encoding), Position::new(0, 0));
+            assert_eq!(index.byte_to_position(3, encoding), Position::new(0, 3));
+            assert_eq!(
+                index.byte_to_position(text.len() + 3, encoding),
+                index.byte_to_position(text.len(), encoding)
+            );
+            assert_eq!(
+                index.byte_to_position(text.len(), encoding),
+                Position::new(2, 0)
+            );
+        }
+    }
+
+    #[test]
     fn position_to_byte_clamps_before_line_terminator() {
         let idx = LineIndex::new("ab\ncd");
         assert_eq!(idx.position_to_byte(Position::new(0, 9), UTF16), 2);

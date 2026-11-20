@@ -1,8 +1,8 @@
 //! Go-to-definition (`textDocument/definition`).
 //!
-//! The symbol under the cursor is classified exactly as hover classifies it —
-//! qualified read, local occurrence, or free read — but instead of rendering
-//! markdown, the definition site is returned as an LSP [`Location`]:
+//! The symbol under the cursor is classified as a qualified member, local
+//! occurrence, or free read. A dotted expression's receiver is still an
+//! ordinary read. The definition site is returned as an LSP [`Location`]:
 //!
 //! - an **intra-file** binding points back into the current document at its
 //!   `def_range`;
@@ -269,16 +269,30 @@ fn definition_for<P: PackageSource>(
         return Vec::new();
     }
 
-    // A qualified name (`Foo.bar`, `Base.@time`) carries its whole module path.
+    let ident = model.ident_at(offset);
+    // A dotted chain records the receiver as an ordinary identifier in
+    // addition to the range-wide qualified read. Only the suffix is a
+    // possible module member; the token on the left resolves like a bare read.
     if let Some(q) = model
         .qualified_reads()
         .iter()
         .find(|q| q.range.contains_inclusive(offset))
+        && !ident.is_some_and(|ident| {
+            ident.range.start() == q.range.start() && q.path.first() == Some(&ident.name)
+        })
     {
-        return qualified_locations(q, packages, workspace.as_ref(), encoding);
+        return qualified_locations(
+            model,
+            q,
+            packages,
+            workspace,
+            q.range.start(),
+            Some(q.range.start()),
+            encoding,
+        );
     }
     // An ordinary identifier occurrence: local when it binds, else a free read.
-    if let Some(ident) = model.ident_at(offset) {
+    if let Some(ident) = ident {
         if let Some(bid) = ident.binding {
             return binding_locations(model, uri, bid, line_index, encoding);
         }
@@ -326,7 +340,15 @@ fn reference_locations<P: PackageSource>(
     let parsed = parse_with_options(target, packages.syntax_options());
     let reference = SemanticModel::build(&parsed.cst);
     if let Some(qualified) = reference.qualified_reads().first() {
-        return qualified_locations(qualified, packages, workspace.as_ref(), encoding);
+        return qualified_locations(
+            model,
+            qualified,
+            packages,
+            workspace,
+            semantic_offset,
+            None,
+            encoding,
+        );
     }
     let operator = parsed
         .cst
@@ -366,15 +388,23 @@ fn reference_locations<P: PackageSource>(
 /// is best-effort, so an unindexed target package still surfaces the
 /// workspace extensions.
 fn qualified_locations<P: PackageSource>(
+    model: &SemanticModel,
     q: &QualifiedRead,
     packages: &P,
-    workspace: Option<&(Arc<PackageIndex>, ModulePath)>,
+    workspace: Option<(Arc<PackageIndex>, ModulePath)>,
+    offset: TextSize,
+    receiver_start: Option<TextSize>,
     encoding: PositionEncoding,
 ) -> Vec<Location> {
-    let Some((name, module_path)) = q.path.split_last() else {
+    let Some((name, written)) = q.path.split_last() else {
         return Vec::new();
     };
-    let mut sites = workspace_extension_sites(packages, workspace, module_path, name);
+    let resolver = Resolver::new(model, packages).with_workspace(workspace.clone());
+    let Some(module_path) = resolver.module_receiver_path(written, offset, receiver_start) else {
+        return Vec::new();
+    };
+    let workspace = workspace.as_ref();
+    let mut sites = workspace_extension_sites(packages, workspace, &module_path, name);
     if let Some(head) = module_path.first() {
         let pkg = workspace
             .map(|(package, _)| package)
@@ -1395,6 +1425,26 @@ mod tests {
             mypkg_entry,
             _dirs: (base_tmp, ws_tmp),
         }
+    }
+
+    #[test]
+    fn dotted_receiver_definition_matches_the_same_bare_read() {
+        for receiver in ["state", "Base", "η", "Core"] {
+            let plain = format!("function f({receiver})\n    {receiver}|\nend");
+            let dotted = format!("function f({receiver})\n    {receiver}|.field\nend");
+            let lib = TestLib::default();
+            let expected = def_at(&plain, &lib);
+            assert_eq!(expected.len(), 1);
+            assert_eq!(def_at(&dotted, &lib), expected, "{receiver}");
+        }
+    }
+
+    #[test]
+    fn shadowed_receiver_has_no_unrelated_module_definition() {
+        let fx = extension_fixture("module MyPkg\nBase.show(io, x) = 1\nend\n");
+        assert!(def_at("f(Base) = Base.sho|w(1)", &fx.lib).is_empty());
+        assert_eq!(def_at("f(x) = Base.sho|w(x)", &fx.lib).len(), 2);
+        assert_eq!(def_at("let Base = Base.sho|w; end", &fx.lib).len(), 2);
     }
 
     #[test]

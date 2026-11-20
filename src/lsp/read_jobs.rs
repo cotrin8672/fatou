@@ -13,6 +13,7 @@ use lsp_types::{
     TypeHierarchyItem, UnchangedDocumentDiagnosticReport, Uri, WorkspaceSymbolResponse,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::formatter::{FormatStyle, VerifiedFormatError};
@@ -23,7 +24,7 @@ use super::call_hierarchy::{
     incoming_calls_via_db, outgoing_calls_via_db, prepare_call_hierarchy_via_db,
 };
 use super::code_action::code_actions_via_db;
-use super::completion::{completion_via_db, resolve_completion};
+use super::completion::{completion_for_import_trigger, completion_via_db, resolve_completion};
 use super::definition::definition_via_db;
 use super::document_link::document_links_via_db;
 use super::folding::folding_ranges_via_db;
@@ -58,7 +59,9 @@ use super::workspace_symbols::workspace_symbols_via_db;
 pub(crate) struct ReadReply {
     out_tx: Sender<Outbound>,
     captured: Option<Arc<Mutex<Vec<Message>>>>,
+    cancelled: Option<Arc<AtomicBool>>,
     membership_generation: Option<u64>,
+    completion_data_defaults: bool,
 }
 
 impl ReadReply {
@@ -66,14 +69,26 @@ impl ReadReply {
         Self {
             out_tx,
             captured: None,
+            cancelled: None,
             membership_generation: None,
+            completion_data_defaults: false,
         }
+    }
+
+    pub(crate) fn with_cancelled(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
+    pub(crate) fn with_completion_data_defaults(mut self, supported: bool) -> Self {
+        self.completion_data_defaults = supported;
+        self
     }
 
     /// Route `message` (always a `Message::Response`) to the main loop for
     /// gating. Errors only if the main loop is gone (shutdown), like the old
     /// direct send.
-    pub(crate) fn send(self, message: Message) -> Result<(), SendError<Outbound>> {
+    pub(crate) fn send(self, mut message: Message) -> Result<(), SendError<Outbound>> {
         if let Some(captured) = self.captured {
             captured
                 .lock()
@@ -81,9 +96,18 @@ impl ReadReply {
                 .push(message);
             Ok(())
         } else {
+            // Captured replies above stay arrays. Only the final wire response
+            // (including any multi-context merge) may become a CompletionList.
+            if self.completion_data_defaults
+                && let Message::Response(response) = &mut message
+                && let Ok(value) = &mut response.response_result
+            {
+                super::completion::compact_response(value);
+            }
             self.out_tx.send(Outbound::ReadReply {
                 message,
                 membership_generation: self.membership_generation,
+                cancelled: self.cancelled,
             })
         }
     }
@@ -186,6 +210,7 @@ pub(crate) enum ReadJob {
         path: PathBuf,
         text: Arc<TextBuffer>,
         position: Position,
+        import_trigger: bool,
         sender: ReadReply,
     },
     CompletionResolve {
@@ -364,6 +389,13 @@ impl ReadJob {
             self.sender_mut().membership_generation = Some(generation);
         }
         self
+    }
+
+    pub(crate) fn is_cancelled(&mut self) -> bool {
+        self.sender_mut()
+            .cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     fn sender_mut(&mut self) -> &mut ReadReply {
@@ -726,8 +758,9 @@ fn merge_results(values: &[serde_json::Value]) -> serde_json::Value {
         .all(|value| value.is_array() || value.is_null())
     {
         let mut merged = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for item in values.iter().filter_map(Value::as_array).flatten() {
-            if !merged.contains(item) {
+            if seen.insert(item) {
                 merged.push(item.clone());
             }
         }
@@ -1049,9 +1082,14 @@ fn run_read_single(
             path,
             text,
             position,
+            import_trigger,
             sender,
         } => {
-            let items = completion_via_db(&snapshot, &path, &text, position, encoding);
+            let items = if import_trigger {
+                completion_for_import_trigger(&snapshot, &path, &text, position, encoding)
+            } else {
+                completion_via_db(&snapshot, &path, &text, position, encoding)
+            };
             let result = CompletionResponse::Array(items);
             let _ = sender.send(Message::Response(Response::new_ok(id, result)));
         }
@@ -1278,6 +1316,28 @@ mod tests {
     use crate::incremental::IncrementalDatabase;
     use crate::parse_context::{EditionSource, SourceContext};
     use crate::parser::SyntaxEdition;
+
+    #[test]
+    fn merges_differing_context_arrays_in_first_seen_order() {
+        use serde_json::{Value, json};
+
+        let a = json!({"label": "shared", "data": {"source": "A", "path": ["Foo"]}});
+        let b = json!({"label": "shared", "data": {"source": "B", "path": ["Foo"]}});
+        let c = json!({"label": "third"});
+        assert_eq!(
+            merge_results(&[
+                json!([a, a, b]),
+                Value::Null,
+                json!([b, c, a]),
+                json!([c, b]),
+            ]),
+            json!([a, b, c])
+        );
+        // Identical responses take the fast path, preserving even duplicates.
+        let equal = json!([a, a]);
+        assert_eq!(merge_results(&[equal.clone(), equal.clone()]), equal);
+        assert_eq!(merge_results(&[a, b]), Value::Null);
+    }
 
     fn contexts(db: &mut IncrementalDatabase, path: &std::path::Path) {
         db.set_source_contexts(

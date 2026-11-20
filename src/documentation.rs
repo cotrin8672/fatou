@@ -5,6 +5,7 @@
 //! does not invalidate Markdown parsing or leave cached source positions stale.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use fatou_parser::ast::{DocText, StaticDocText};
 use fatou_parser::documentation::ast::{DocumenterLinkKind, FootnoteDefinition, Heading, Link};
@@ -12,6 +13,65 @@ use rowan::TextRange;
 use rowan::ast::AstNode as _;
 
 use crate::semantic::{SemanticDoc, SemanticModel};
+
+/// Lazy GreenNodes over a stable sequence of decoded payloads. Source maps
+/// remain in the current semantic model, so body edits and document movement
+/// do not force a Markdown reparse. Only the requested payload is parsed.
+pub(crate) struct DocumentationTrees {
+    payloads: Arc<[String]>,
+    trees: Vec<OnceLock<rowan::GreenNode>>,
+}
+
+impl DocumentationTrees {
+    pub(crate) fn new(payloads: Arc<[String]>) -> Self {
+        let trees = (0..payloads.len()).map(|_| OnceLock::new()).collect();
+        Self { payloads, trees }
+    }
+
+    pub(crate) fn tree(
+        &self,
+        ordinal: usize,
+        text: &str,
+    ) -> Option<fatou_parser::documentation::syntax::SyntaxNode> {
+        let payload = self.payloads.get(ordinal)?;
+        if payload != text {
+            return None;
+        }
+        let tree = self.trees[ordinal].get_or_init(|| {
+            fatou_parser::documentation::parse(payload)
+                .cst
+                .green()
+                .to_owned()
+        });
+        Some(fatou_parser::documentation::syntax::SyntaxNode::new_root(
+            tree.clone(),
+        ))
+    }
+}
+
+impl PartialEq for DocumentationTrees {
+    fn eq(&self, other: &Self) -> bool {
+        self.payloads == other.payloads
+    }
+}
+
+impl Eq for DocumentationTrees {}
+
+#[cfg(test)]
+#[test]
+fn decoded_documentation_trees_are_lazy_and_match_the_current_payload() {
+    let trees = DocumentationTrees::new(Arc::from([
+        String::from("# First"),
+        String::from("# Second"),
+    ]));
+    assert!(trees.trees.iter().all(|tree| tree.get().is_none()));
+    assert!(trees.tree(0, "# Wrong").is_none());
+    let first = trees.tree(0, "# First").unwrap();
+    let again = trees.tree(0, "# First").unwrap();
+    assert_eq!(first.to_string(), "# First");
+    assert!(std::ptr::eq(first.green(), again.green()));
+    assert!(trees.trees[1].get().is_none());
+}
 
 /// A Markdown destination in the current Julia file.
 pub enum MarkdownReference {

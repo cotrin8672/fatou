@@ -683,6 +683,17 @@ pub fn static_docstring_payloads(db: &dyn IncrementalDb, file: SourceFile) -> &A
     static_docstring_payloads_with_options(db, file, primary_parse_options(db, file))
 }
 
+#[salsa::tracked(returns(ref), lru = 32)]
+fn documentation_trees_with_options(
+    db: &dyn IncrementalDb,
+    file: SourceFile,
+    options: ParseOptions,
+) -> Arc<crate::documentation::DocumentationTrees> {
+    Arc::new(crate::documentation::DocumentationTrees::new(Arc::clone(
+        static_docstring_payloads_with_options(db, file, options),
+    )))
+}
+
 /// The demand-only Markdown navigation index. Depend only on decoded payloads
 /// so edits to Julia code do not repeat the file's documentation parses.
 #[salsa::tracked(returns(ref))]
@@ -1260,6 +1271,56 @@ fn context_workspace_reference_index(
         }
     }
     WorkspaceReferenceIndex(out)
+}
+
+/// Keep a bounded cache for requests that only need one symbol's bucket.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct WorkspaceOccurrenceBucket(Vec<(SourceFile, OccurrenceRec)>);
+
+#[salsa::tracked(returns(ref), lru = 32)]
+fn workspace_occurrence_bucket(
+    db: &dyn IncrementalDb,
+    input: WorkspaceFiles,
+    key: OccurrenceKey,
+) -> WorkspaceOccurrenceBucket {
+    let mut bucket = Vec::new();
+    for &file in input.files(db) {
+        if let Some(records) = file_workspace_occurrences(db, file).0.get(&key) {
+            bucket.extend(records.iter().map(|r| (file, *r)));
+        }
+    }
+    WorkspaceOccurrenceBucket(bucket)
+}
+
+#[salsa::tracked(returns(ref), lru = 32)]
+fn context_workspace_occurrence_bucket(
+    db: &dyn IncrementalDb,
+    entry: SourceFile,
+    options: ParseOptions,
+    context: SourceContext,
+    key: OccurrenceKey,
+) -> WorkspaceOccurrenceBucket {
+    let mut bucket = Vec::new();
+    let graph = project_graph_with_options(db, entry, options);
+    if let Some(input) = WorkspaceFiles::try_get(db) {
+        for &file in input.files(db) {
+            if file
+                .path(db)
+                .as_ref()
+                .is_none_or(|path| !graph.nodes.contains(path))
+            {
+                continue;
+            }
+            if let Some(records) =
+                context_workspace_occurrences(db, file, entry, options, context.clone())
+                    .0
+                    .get(&key)
+            {
+                bucket.extend(records.iter().map(|r| (file, *r)));
+            }
+        }
+    }
+    WorkspaceOccurrenceBucket(bucket)
 }
 
 /// The unioned reverse-occurrence index (the [`workspace_reference_index`]
@@ -2705,6 +2766,13 @@ impl Analysis {
         documentation_index_with_options(&self.0, file, self.parse_options(file))
     }
 
+    pub(crate) fn documentation_trees(
+        &self,
+        file: SourceFile,
+    ) -> &crate::documentation::DocumentationTrees {
+        documentation_trees_with_options(&self.0, file, self.parse_options(file))
+    }
+
     /// The cached control-flow graph for `file` (the [`control_flow`] query).
     pub fn control_flow(&self, file: SourceFile) -> &FileControlFlow {
         control_flow_with_options(&self.0, file, self.parse_options(file))
@@ -2747,6 +2815,29 @@ impl Analysis {
             );
         }
         workspace_reference_index(&self.0)
+    }
+
+    /// The occurrences of a single workspace symbol without unioning other symbols.
+    pub(crate) fn workspace_occurrence_sites(
+        &self,
+        key: &OccurrenceKey,
+    ) -> &[(SourceFile, OccurrenceRec)] {
+        if let Some(context) = &self.2
+            && let Some(entry) = self.lookup_file(&context.entry)
+        {
+            return &context_workspace_occurrence_bucket(
+                &self.0,
+                entry,
+                self.1.unwrap_or_else(|| self.parse_options(entry)),
+                context.clone(),
+                key.clone(),
+            )
+            .0;
+        }
+        let Some(input) = WorkspaceFiles::try_get(&self.0) else {
+            return &[];
+        };
+        &workspace_occurrence_bucket(&self.0, input, key.clone()).0
     }
 
     /// The seeded workspace member files (the [`WorkspaceFiles`] input), for a
@@ -2802,6 +2893,30 @@ impl Analysis {
     /// The harvested index for package `name`, if present.
     pub fn library_package(&self, name: &str) -> Option<Arc<PackageIndex>> {
         library_package_for_context(&self.0, name, self.2.as_ref())
+    }
+
+    /// Exact environment membership for optional auto-import edits: a direct
+    /// [deps] pin must match the manifest source backing this indexed package.
+    /// Never fall back to another environment's same-named package.
+    pub(crate) fn auto_import_package(
+        &self,
+        project: &Path,
+        name: &str,
+        uuid: crate::environment::Uuid,
+    ) -> Option<Arc<PackageIndex>> {
+        let input = LibrarySyntaxInput::try_get(&self.0)?;
+        let data = input.data(&self.0);
+        let source = data.environments.get(project)?.get(name)?;
+        match source {
+            crate::parse_context::EditionSource::Manifest {
+                name: pin,
+                uuid: id,
+                ..
+            } if pin == name && *id == uuid && &data.packages.get(name)?.source == source => {
+                self.library_package(name)
+            }
+            _ => None,
+        }
     }
 
     /// The absolute source root of package `name`, if the live server has

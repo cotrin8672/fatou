@@ -27,9 +27,11 @@
 //! (`Base.`, `LinearAlgebra.`, nested `A.B.`); value and type receivers are out
 //! of scope until there is type inference.
 
+mod imports;
+
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, InsertReplaceEdit,
@@ -40,11 +42,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::incremental::{Analysis, SourceFile};
 use crate::index::{ModuleIndex, PackageIndex};
+use crate::parse_context::{EditionSource, SourceRole};
 #[cfg(test)]
 use crate::parser::parse;
 use crate::parser::{KEYWORDS, parse_with_options};
 use crate::resolve::{
-    Candidate, ModulePath, Namespace, PackageSource, Resolver, Source, resolve_submodule,
+    Candidate, ModulePath, Namespace, PackageSource, Resolution, Resolver, Source,
+    has_unresolvable_using, resolve_submodule,
 };
 use crate::semantic::{BindingKind, SemanticModel};
 use crate::syntax::{SyntaxKind, SyntaxNode};
@@ -64,6 +68,140 @@ struct ResolveData {
     name: String,
 }
 
+/// Private resolve-key tag carried in the standard LSP CompletionList defaults.
+const NAME_FROM_LABEL: &str = "fatouNameFromLabel";
+
+/// Compress only if the entire list has one losslessly shared resolve key
+/// prefix. LSP applies default data to *every* item whose data is absent: a
+/// mixed list with keywords, local bindings, or different modules must stay an
+/// array. Do not discard, reorder, or rewrite any other item field.
+pub(super) fn compact_response(value: &mut serde_json::Value) {
+    use serde_json::{Value, json};
+
+    let Some(items) = value.as_array_mut().filter(|items| items.len() >= 8) else {
+        return;
+    };
+    let Some(first) = items[0].get("data").and_then(Value::as_object) else {
+        return;
+    };
+    let (Some(path), Some(module)) = (first.get("fatouSourcePath"), first.get("module_path"))
+    else {
+        return;
+    };
+    if !path.is_string()
+        || !module
+            .as_array()
+            .is_some_and(|parts| !parts.is_empty() && parts.iter().all(Value::is_string))
+        || !items.iter().all(|item| {
+            item.get("data")
+                .and_then(Value::as_object)
+                .is_some_and(|data| {
+                    data.len() == 3
+                        && data.get("fatouSourcePath") == Some(path)
+                        && data.get("module_path") == Some(module)
+                        && item.get("label").is_some_and(Value::is_string)
+                        && data.get("name") == item.get("label")
+                })
+        })
+    {
+        return;
+    }
+    let defaults = json!({
+        "data": {
+            "fatouSourcePath": path,
+            "module_path": module,
+            (NAME_FROM_LABEL): true,
+        }
+    });
+    for item in items.iter_mut() {
+        item.as_object_mut().expect("item has data").remove("data");
+    }
+    // lsp-types 0.97 lacks CompletionList.itemDefaults in its response type.
+    *value = Value::Object(serde_json::Map::from_iter([
+        ("isIncomplete".into(), Value::Bool(false)),
+        ("itemDefaults".into(), defaults),
+        ("items".into(), Value::Array(std::mem::take(items))),
+    ]));
+}
+
+/// Normalize before dispatching the resolve job, so path routing, scoped
+/// lookups, and fallback responses see exactly the same key as old clients.
+pub(super) fn expand_resolve_data(item: &mut CompletionItem) {
+    if let Some(data) = item
+        .data
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+        && data.len() == 3
+        && data
+            .get(NAME_FROM_LABEL)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && data.contains_key("fatouSourcePath")
+        && data.contains_key("module_path")
+    {
+        data.remove(NAME_FROM_LABEL);
+        data.insert("name".into(), item.label.clone().into());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn homogeneous() -> Value {
+        Value::Array((0..12).map(|i| {
+            let name = format!("α_{i}");
+            json!({"label":name, "filterText":format!("alpha_{i}"), "sortText":format!("{i:03}"),
+                   "data":{"module_path":["Test", "Nested"], "fatouSourcePath":"/p/test.jl", "name":name}})
+        }).collect())
+    }
+
+    #[test]
+    fn inherited_data_reconstructs_every_item_exactly() {
+        let original = homogeneous();
+        let mut packed = original.clone();
+        compact_response(&mut packed);
+        let defaults = &packed["itemDefaults"]["data"];
+        assert_eq!(defaults[NAME_FROM_LABEL], true);
+        assert_eq!(packed["isIncomplete"], false);
+        assert_eq!(packed["items"].as_array().unwrap().len(), 12);
+        for (original, wire) in original
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(packed["items"].as_array().unwrap())
+        {
+            assert!(wire.get("data").is_none());
+            let mut restored: CompletionItem = serde_json::from_value(wire.clone()).unwrap();
+            restored.data = Some(defaults.clone());
+            expand_resolve_data(&mut restored);
+            assert_eq!(serde_json::to_value(restored).unwrap(), *original);
+        }
+    }
+
+    #[test]
+    fn mixed_local_items_modules_or_hidden_names_do_not_get_defaults() {
+        for incompatible in [
+            json!({"label":"variable"}),
+            json!({"label":"foo","data":{"module_path":["Other"],"fatouSourcePath":"/p/test.jl","name":"foo"}}),
+            json!({"label":"alias","data":{"module_path":["Test","Nested"],"fatouSourcePath":"/p/test.jl","name":"full"}}),
+            json!({"label":"foo","data":{"module_path":["Test","Nested"],"fatouSourcePath":"/q/test.jl","name":"foo"}}),
+            json!({"label":"foo","data":{"module_path":["Test","Nested"],"fatouSourcePath":"/p/test.jl","name":"foo","extra":true}}),
+        ] {
+            let mut value = homogeneous();
+            value[5] = incompatible;
+            let original = value.clone();
+            compact_response(&mut value);
+            assert_eq!(value, original);
+        }
+        let original = json!([]);
+        let mut value = original.clone();
+        compact_response(&mut value);
+        assert_eq!(value, original);
+    }
+}
+
 /// The completion items for `text` at `position`, re-parsing it. Pure and
 /// unit-testable; `packages` supplies the library (Base/Core and loaded
 /// packages) the value and member contexts draw on.
@@ -75,6 +213,9 @@ pub fn compute_completions<P: PackageSource>(
 ) -> Vec<CompletionItem> {
     let offset = LineIndex::new(text).position_to_byte(position, encoding);
     let root = parse_with_options(text, packages.syntax_options()).cst;
+    if let Some(items) = syntax_only_completion(&root, text, offset, encoding) {
+        return items;
+    }
     let model = SemanticModel::build(&root);
     // The pure path has no file path to key workspace membership on; the live
     // server passes the workspace module through `completion_via_db`.
@@ -109,43 +250,469 @@ pub(crate) fn completion_via_db(
             return None;
         }
         let root = snapshot.parsed_tree(file);
+        if let Some(items) = syntax_only_completion(&root, text, offset.into(), encoding) {
+            return Some(items);
+        }
         let model = snapshot.semantic_model(file);
+        if let Some(context) = imports::context_at(&root, text, offset) {
+            return Some(complete_import(
+                &context, model, snapshot, path, text, offset, encoding,
+            ));
+        }
         let workspace = snapshot.workspace_member(path);
-        Some(completions_for(
+        let mut items = completions_for(
             model,
             &root,
             snapshot,
-            workspace,
+            workspace.clone(),
             text,
             offset,
             encoding,
             Some((snapshot, file)),
-        ))
+        );
+        if let Some(workspace) = workspace {
+            append_auto_imports(
+                snapshot, file, path, model, &root, workspace, text, offset, encoding, &mut items,
+            );
+        }
+        Some(items)
     }));
     let mut items = match cached {
         Ok(Some(items)) => items,
         // Cache miss (`Ok(None)`) or a racing write (`Err`): re-parse from text.
-        Ok(None) | Err(_) => compute_completions(text, position, encoding, snapshot),
+        Ok(None) | Err(_) => {
+            let parsed = parse_with_options(text, snapshot.options_for_path(path));
+            // A cold or racing read can still use the real file's project.
+            let from_import = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                import_from_tree(snapshot, path, text, &parsed.cst, offset, encoding)
+            }));
+            match from_import {
+                Ok(Some(items)) => items,
+                _ => completions_for(
+                    &SemanticModel::build(&parsed.cst),
+                    &parsed.cst,
+                    snapshot,
+                    None,
+                    text,
+                    offset,
+                    encoding,
+                    None,
+                ),
+            }
+        }
     };
-    for item in &mut items {
+    add_completion_source_path(&mut items, path);
+    items
+}
+
+/// Space, colon and comma are advertised for import directives only. A
+/// trigger request for ordinary code must not build a semantic model or
+/// consult the package index (nor flood the editor with the value list).
+pub(crate) fn completion_for_import_trigger(
+    snapshot: &Analysis,
+    path: &Path,
+    text: &TextBuffer,
+    position: Position,
+    encoding: PositionEncoding,
+) -> Vec<CompletionItem> {
+    let offset = TextSize::new(text.line_index().position_to_byte(position, encoding) as u32);
+    // An advertised colon can also complete an existing Julia emoji escape.
+    // Preserve that independent feature instead of claiming every colon.
+    let before = &text[..usize::from(offset)];
+    if before.ends_with(':') && matches!(context_at(text, offset.into()), Context::Latex { .. }) {
+        return completion_via_db(snapshot, path, text, position, encoding);
+    }
+    salsa::Cancelled::catch(AssertUnwindSafe(|| {
+        let cached = snapshot
+            .lookup_file(path)
+            .filter(|file| snapshot.file_text(*file) == text);
+        let root = match cached {
+            Some(file) => snapshot.parsed_tree(file),
+            None => {
+                // A cold, ordinary keystroke is far more common than an
+                // import clause. The prefix gate is only a cheap rejection;
+                // the CST, not this text check, determines the context.
+                let before = &text[..usize::from(offset)];
+                let recent = before.rsplitn(9, '\n').take(8);
+                if !recent
+                    .into_iter()
+                    .any(|line| line.contains("using") || line.contains("import"))
+                {
+                    return Vec::new();
+                }
+                parse_with_options(text, snapshot.options_for_path(path)).cst
+            }
+        };
+        let Some(context) = imports::context_at(&root, text, offset) else {
+            return Vec::new();
+        };
+        let model;
+        let model = match cached {
+            Some(file) => snapshot.semantic_model(file),
+            None => {
+                model = SemanticModel::build(&root);
+                &model
+            }
+        };
+        let mut items = complete_import(&context, model, snapshot, path, text, offset, encoding);
+        add_completion_source_path(&mut items, path);
+        items
+    }))
+    .unwrap_or_default()
+}
+
+fn import_from_tree(
+    snapshot: &Analysis,
+    path: &Path,
+    text: &TextBuffer,
+    root: &SyntaxNode,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Option<Vec<CompletionItem>> {
+    let context = imports::context_at(root, text, offset)?;
+    Some(complete_import(
+        &context,
+        &SemanticModel::build(root),
+        snapshot,
+        path,
+        text,
+        offset,
+        encoding,
+    ))
+}
+
+fn complete_import(
+    context: &imports::ImportContext<'_>,
+    model: &SemanticModel,
+    snapshot: &Analysis,
+    path: &Path,
+    text: &TextBuffer,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Vec<CompletionItem> {
+    let project_names = if context.package_root() {
+        imports::project_names(snapshot, path)
+    } else {
+        Default::default()
+    };
+    context.complete(
+        model,
+        snapshot,
+        snapshot.workspace_member(path).as_ref(),
+        project_names,
+        offset,
+        &text.line_index(),
+        encoding,
+    )
+}
+
+fn add_completion_source_path(items: &mut [CompletionItem], path: &Path) {
+    let mut source = None;
+    for item in items {
         if let Some(serde_json::Value::Object(data)) = &mut item.data {
             data.insert(
                 "fatouSourcePath".into(),
-                serde_json::to_value(path).expect("path serializes"),
+                source
+                    .get_or_insert_with(|| serde_json::to_value(path).expect("path serializes"))
+                    .clone(),
             );
         }
     }
-    items
+}
+
+/// Unicode input outside literals is determined by the token spelling. Never
+/// infer module identity from spelling: a local binding may shadow Base or a
+/// package alias. Treat both sides of a token boundary as possible literals so
+/// decoded docstring mappings remain the authority there.
+fn syntax_only_completion(
+    root: &SyntaxNode,
+    text: &str,
+    offset: usize,
+    encoding: PositionEncoding,
+) -> Option<Vec<CompletionItem>> {
+    let at = root.token_at_offset(TextSize::new(offset as u32));
+    let lexical = context_at(text, offset);
+    if let Some(left) = at.clone().left_biased()
+        && !matches!(lexical, Context::Latex { .. })
+        && ((left.kind() == SyntaxKind::COMMENT && usize::from(left.text_range().start()) < offset)
+            || (left.kind() == SyntaxKind::BLOCK_COMMENT
+                && usize::from(left.text_range().start()) + 1 < offset
+                && (offset < usize::from(left.text_range().end()) || !left.text().ends_with("=#"))))
+    {
+        return Some(Vec::new());
+    }
+    let Context::Latex { start } = lexical else {
+        return None;
+    };
+    let in_literal = [at.clone().left_biased(), at.right_biased()]
+        .into_iter()
+        .flatten()
+        .any(|token| {
+            token.parent_ancestors().any(|node| {
+                matches!(
+                    node.kind(),
+                    SyntaxKind::CMD_LITERAL | SyntaxKind::STRING_LITERAL
+                )
+            })
+        });
+    (!in_literal).then(|| latex_items(text, start, offset, encoding))
+}
+
+/// Conservative first version: only a statically verified bare value read in the package
+/// entry's root module. Editing an included file, quoted code or a declaration
+/// would require proving a different insertion scope and execution order.
+#[allow(clippy::too_many_arguments)]
+fn append_auto_imports(
+    snapshot: &Analysis,
+    file: SourceFile,
+    path: &Path,
+    model: &SemanticModel,
+    root: &SyntaxNode,
+    workspace: (Arc<PackageIndex>, ModulePath),
+    text: &TextBuffer,
+    offset: TextSize,
+    encoding: PositionEncoding,
+    items: &mut Vec<CompletionItem>,
+) {
+    let Some((prefix, callee)) = auto_import_site(model, root, text, offset) else {
+        return;
+    };
+    let Some(context) = snapshot.context() else {
+        return;
+    };
+    let EditionSource::Project {
+        path: project,
+        role: SourceRole::Package,
+    } = &context.source
+    else {
+        return;
+    };
+    let editions = snapshot.source_editions(file);
+    if !matches!(editions.as_slice(), [(active, selected)] if active == context && selected.certain)
+    {
+        return;
+    }
+    let (package, host) = &workspace;
+    if crate::incremental::normalize_path(path) != context.entry
+        || !host.is_empty()
+        || package.root.bare
+        || package.members.len() != 1
+        || !package.diagnostics.is_empty()
+        || !snapshot.parse_diagnostics(file).is_empty()
+        || model
+            .enclosing_module_path(model.scope_at(callee.start()))
+            .as_slice()
+            != [package.name.as_str()]
+        || root.descendants().any(|node| {
+            matches!(node.kind(), SyntaxKind::MACRO_CALL)
+                && model
+                    .scope(model.scope_at(node.text_range().start()))
+                    .kind
+                    .is_global()
+        })
+        || model
+            .idents()
+            .iter()
+            .any(|read| matches!(read.name.as_str(), "eval" | "include" | "include_string"))
+        || model.qualified_reads().iter().any(|read| {
+            read.path
+                .last()
+                .is_some_and(|name| matches!(name.as_str(), "eval" | "include" | "include_string"))
+        })
+        || has_unresolvable_using(model, snapshot, Some(&workspace))
+        || model
+            .module_loads()
+            .iter()
+            .any(|load| load.path.components.is_empty())
+    {
+        return;
+    }
+    let Some((anchor, eol)) = auto_import_anchor(root, text, &package.name) else {
+        return;
+    };
+    if TextSize::from(anchor as u32) >= callee.start() {
+        return;
+    }
+    let Some(project_file) = snapshot.lookup_file(project) else {
+        return;
+    };
+    let Some(project_details) =
+        crate::environment::parse_project_str(snapshot.file_text_of(project_file))
+    else {
+        return;
+    };
+    let mut offers =
+        std::collections::BTreeMap::<String, Option<(String, CompletionItemKind)>>::new();
+    for (dep, uuid) in project_details.deps {
+        let dep = dep.into_inner();
+        let Ok(uuid) = uuid.into_inner().parse() else {
+            continue;
+        };
+        if !simple_import_name(&dep)
+            || dep == package.name
+            || model.module_loads().iter().any(|load| {
+                load.path.leading_dots == 0
+                    && load
+                        .path
+                        .components
+                        .first()
+                        .is_some_and(|name| name == dep.as_str())
+            })
+        {
+            continue;
+        }
+        let Some(index) = snapshot.auto_import_package(project, &dep, uuid) else {
+            continue;
+        };
+        let module = &index.root;
+        if !index.diagnostics.is_empty() || module.name != dep {
+            continue;
+        }
+        for export in &module.exports {
+            let name = &export.name;
+            if export.visibility != crate::index::Visibility::Exported
+                || !name.starts_with(prefix)
+                || name == prefix
+                || !simple_import_name(name)
+            {
+                continue;
+            }
+            // Verify an actual callable definition, not only an `export` of an
+            // undefined/macro-generated/re-exported symbol.
+            let kind = if module.types.iter().any(|t| &t.name == name) {
+                CompletionItemKind::CLASS
+            } else if module
+                .functions
+                .iter()
+                .any(|f| f.owner.is_none() && &f.name == name)
+            {
+                CompletionItemKind::FUNCTION
+            } else {
+                continue;
+            };
+            offers
+                .entry(name.clone())
+                .and_modify(|offer| {
+                    if offer.as_ref().is_some_and(|(provider, _)| provider != &dep) {
+                        *offer = None;
+                    }
+                })
+                .or_insert_with(|| Some((dep.clone(), kind)));
+        }
+    }
+    let resolver = Resolver::new(model, snapshot).with_workspace(Some(workspace));
+    let range = super::documentation::lsp_range(callee, &text.line_index(), encoding);
+    let at = text.line_index().byte_to_position(anchor, encoding);
+    for (name, (dep, kind)) in offers
+        .into_iter()
+        .filter_map(|(name, offer)| Some((name, offer?)))
+    {
+        if resolver.resolve(&name, callee.start(), Namespace::Value) != Resolution::Unresolved {
+            continue;
+        }
+        let mut item = member_item(&name, kind, std::slice::from_ref(&dep));
+        item.detail = Some(format!("Auto-import from {dep}"));
+        item.sort_text = Some(format!("~~fatou-auto-import:{name}"));
+        item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+            range,
+            new_text: name.clone(),
+        }));
+        item.additional_text_edits = Some(vec![TextEdit {
+            range: lsp_types::Range::new(at, at),
+            new_text: format!("using {dep}: {name}{eol}"),
+        }]);
+        items.push(item);
+    }
+}
+
+fn simple_import_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !KEYWORDS.contains(&name)
+}
+
+fn auto_import_site<'a>(
+    model: &SemanticModel,
+    root: &SyntaxNode,
+    text: &'a str,
+    offset: TextSize,
+) -> Option<(&'a str, rowan::TextRange)> {
+    let offset_bytes = usize::from(offset);
+    let (prefix, _) = take_ident_back(text.get(..offset_bytes)?);
+    if prefix.len() < 3
+        || !simple_import_name(prefix)
+        || !matches!(context_at(text, offset_bytes), Context::Value)
+    {
+        return None;
+    }
+    let start = TextSize::from((offset_bytes - prefix.len()) as u32);
+    let at_start = token_at(root, start)?;
+    let name = at_start.parent()?;
+    if name.kind() != SyntaxKind::NAME
+        || name.text_range().start() != start
+        || name.text_range().end() != offset
+        || name.ancestors().any(|node| {
+            (node.kind() == SyntaxKind::BINARY_EXPR
+                && super::symbols::op_token(&node).is_some_and(|op| op.kind() == SyntaxKind::DOT))
+                || matches!(
+                    node.kind(),
+                    SyntaxKind::MACRO_CALL
+                        | SyntaxKind::MACRO_DEF
+                        | SyntaxKind::DOC
+                        | SyntaxKind::QUOTE_EXPR
+                        | SyntaxKind::QUOTE_SYM
+                        | SyntaxKind::INTERPOLATION
+                        | SyntaxKind::SIGNATURE
+                        | SyntaxKind::TYPE_ANNOTATION
+                        | SyntaxKind::IMPORT_STMT
+                        | SyntaxKind::USING_STMT
+                        | SyntaxKind::STRUCT_DEF
+                        | SyntaxKind::ERROR
+                )
+        })
+        || !model.free_reads().any(|read| {
+            read.range == name.text_range()
+                && read.name == prefix
+                && read.access == crate::semantic::Access::Read
+        })
+    {
+        return None;
+    }
+    Some((prefix, name.text_range()))
+}
+
+fn auto_import_anchor<'a>(
+    root: &SyntaxNode,
+    text: &'a str,
+    expected: &str,
+) -> Option<(usize, &'a str)> {
+    let mut children = root.children();
+    let module = children.next()?;
+    if module.kind() != SyntaxKind::MODULE_DEF || children.next().is_some() {
+        return None;
+    }
+    let start = usize::from(module.text_range().start());
+    let header_end = start + text.get(start..)?.find('\n')?;
+    let mut header = text[start..header_end].split_whitespace();
+    if header.next()? != "module" || header.next()? != expected || header.next().is_some() {
+        return None;
+    }
+    let eol = if text.as_bytes().get(header_end.checked_sub(1)?) == Some(&b'\r') {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    Some((header_end + 1, eol))
 }
 
 /// Fill an item's `documentation` (and, for a function, its `detail` signature)
 /// from the harvested library, keyed by the item's [`ResolveData`]. Returns the
 /// item unchanged when it carries no key or the symbol has no docs.
 pub(crate) fn resolve_completion(snapshot: &Analysis, item: CompletionItem) -> CompletionItem {
-    resolve_completion_with(
-        &|name| snapshot.library_package(name).map(|p| (*p).clone()),
-        item,
-    )
+    resolve_completion_with(&|name| snapshot.library_package(name), item)
 }
 
 /// The masking-order candidate set for `text` at `offset`, mapped to LSP items.
@@ -161,7 +728,9 @@ fn completions_for<P: PackageSource>(
     cached_docs: Option<(&Analysis, SourceFile)>,
 ) -> Vec<CompletionItem> {
     let offset_bytes: usize = offset.into();
-    if let Some(context) = super::documentation::DocumentationContext::at(model, offset) {
+    if let Some(context) =
+        super::documentation::DocumentationContext::at_cached(model, offset, cached_docs)
+    {
         if let Some(embedded) = context.embedded_julia() {
             let parsed = parse_with_options(embedded.text, packages.syntax_options());
             let embedded_model = SemanticModel::build(&parsed.cst);
@@ -175,6 +744,9 @@ fn completions_for<P: PackageSource>(
                 encoding,
                 None,
             );
+            if imports::context_at(&parsed.cst, embedded.text, embedded.offset).is_some() {
+                return map_embedded_edits(items, &embedded, text, encoding);
+            }
             // Anchors name Markdown targets, so they stay out of the Julia
             // names merged in from the enclosing scope.
             let outer = reference_completions(
@@ -233,6 +805,18 @@ fn completions_for<P: PackageSource>(
         return Vec::new();
     }
 
+    if let Some(context) = imports::context_at(root, text, offset) {
+        return context.complete(
+            model,
+            packages,
+            workspace.as_ref(),
+            Default::default(),
+            offset,
+            &LineIndex::new(text),
+            encoding,
+        );
+    }
+
     let context = context_at(text, offset_bytes);
     match context {
         // A sequence is an input method, not code, so it wins over the
@@ -265,7 +849,15 @@ fn completions_for<P: PackageSource>(
         Context::Member {
             receiver,
             macro_member,
-        } => member_completions(packages, workspace.as_ref(), &receiver, macro_member),
+        } => member_completions(
+            model,
+            packages,
+            workspace,
+            &receiver,
+            offset,
+            receiver_start(text, offset, &receiver, macro_member),
+            macro_member,
+        ),
         Context::Macro => Resolver::new(model, packages)
             .with_workspace(workspace)
             .visible(offset, Namespace::Macro)
@@ -302,7 +894,15 @@ fn reference_completions<P: PackageSource>(
         Context::Member {
             receiver,
             macro_member,
-        } => member_completions(packages, workspace.as_ref(), &receiver, macro_member),
+        } => member_completions(
+            model,
+            packages,
+            workspace,
+            &receiver,
+            semantic_offset,
+            None,
+            macro_member,
+        ),
         Context::Macro => Resolver::new(model, packages)
             .with_workspace(workspace)
             .visible(semantic_offset, Namespace::Macro)
@@ -445,6 +1045,20 @@ fn take_ident_back(prefix: &str) -> (&str, &str) {
         .map(|(i, _)| i)
         .unwrap_or(prefix.len());
     (&prefix[start..], &prefix[..start])
+}
+
+/// Byte position of the first receiver component. This mirrors the backward
+/// scan without extending the parser's recovery requirements.
+fn receiver_start(
+    text: &str,
+    offset: TextSize,
+    path: &[String],
+    macro_member: bool,
+) -> Option<TextSize> {
+    let (_, before_member) = take_ident_back(text.get(..usize::from(offset))?);
+    let receiver_bytes = path.iter().map(String::len).sum::<usize>() + path.len().checked_sub(1)?;
+    let skip = receiver_bytes + 1 + usize::from(macro_member);
+    Some(TextSize::new(before_member.len().checked_sub(skip)? as u32))
 }
 
 /// The dotted module path ending `s` (`"A.B"` → `["A", "B"]`), or empty when the
@@ -743,25 +1357,105 @@ fn heuristic_kind(name: &str, ns: Namespace) -> CompletionItemKind {
 /// `Foo.@` case) keeps only macros; otherwise macros are dropped and the rest
 /// kept.
 fn member_completions<P: PackageSource>(
+    model: &SemanticModel,
     packages: &P,
-    workspace: Option<&(Arc<PackageIndex>, ModulePath)>,
+    workspace: Option<(Arc<PackageIndex>, ModulePath)>,
     receiver: &[String],
+    offset: TextSize,
+    receiver_start: Option<TextSize>,
     macro_member: bool,
 ) -> Vec<CompletionItem> {
-    let Some((head, tail)) = receiver.split_first() else {
+    let written: ModulePath = receiver.iter().map(Into::into).collect();
+    let resolver = Resolver::new(model, packages).with_workspace(workspace.clone());
+    let Some(resolved) = resolver.module_receiver_path(&written, offset, receiver_start) else {
+        return Vec::new();
+    };
+    let Some((head, tail)) = resolved.split_first() else {
         return Vec::new();
     };
     let pkg = workspace
+        .as_ref()
         .map(|(package, _)| package)
-        .filter(|package| package.name == *head)
+        .filter(|package| package.name == head.as_str())
         .cloned()
         .or_else(|| packages.package(head));
     let Some(pkg) = pkg else { return Vec::new() };
-    let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+    let tail: Vec<&str> = tail.iter().map(|part| part.as_str()).collect();
     let Some(module) = resolve_submodule(&pkg.root, &tail) else {
         return Vec::new();
     };
-    member_items(module, receiver, macro_member)
+    let resolved: Vec<String> = resolved.iter().map(ToString::to_string).collect();
+    cached_member_items(&pkg, module, &resolved, macro_member)
+}
+
+/// Keep candidate templates only after resolving the receiver in its actual
+/// lexical context. A weak key ties the entry to the exact immutable index
+/// generation, without pinning replaced indexes or mixing loading contexts.
+/// Requests still add their own resolve source path after cloning templates.
+struct MemberTemplates {
+    package: Weak<PackageIndex>,
+    path: Vec<String>,
+    macros: bool,
+    items: Arc<Vec<CompletionItem>>,
+}
+
+fn cached_member_items(
+    package: &Arc<PackageIndex>,
+    module: &ModuleIndex,
+    path: &[String],
+    macros: bool,
+) -> Vec<CompletionItem> {
+    static CACHE: Mutex<Vec<MemberTemplates>> = Mutex::new(Vec::new());
+    let size = if macros {
+        module.macros.len()
+    } else {
+        module.types.len() + module.consts.len() + module.functions.len() + module.submodules.len()
+    };
+    if !(32..=4096).contains(&size) || path.iter().map(String::len).sum::<usize>() > 256 {
+        return member_items(module, path, macros);
+    }
+    let key = Arc::downgrade(package);
+    let hit = {
+        let mut entries = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| entry.package.strong_count() > 0);
+        entries
+            .iter()
+            .position(|entry| {
+                Weak::ptr_eq(&entry.package, &key) && entry.macros == macros && entry.path == path
+            })
+            .map(|index| {
+                let entry = entries.remove(index);
+                let result = Arc::clone(&entry.items);
+                entries.push(entry);
+                result
+            })
+    };
+    if let Some(items) = hit {
+        return items.as_ref().clone();
+    }
+    let items = member_items(module, path, macros);
+    let name_bytes: usize = items.iter().map(|item| item.label.len()).sum();
+    if name_bytes <= 128 * 1024 {
+        let mut entries = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.iter().any(|entry| {
+            Weak::ptr_eq(&entry.package, &key) && entry.macros == macros && entry.path == path
+        }) {
+            if entries.len() == 8 {
+                entries.remove(0);
+            }
+            entries.push(MemberTemplates {
+                package: key,
+                path: path.to_vec(),
+                macros,
+                items: Arc::new(items.clone()),
+            });
+        }
+    }
+    items
 }
 
 /// The items for a resolved module's defined names, preferring type and alias
@@ -814,7 +1508,7 @@ fn member_item(name: &str, kind: CompletionItemKind, module_path: &[String]) -> 
 /// The resolve step, taking a `lookup` from package name to its index so it can
 /// be unit-tested without a salsa db.
 fn resolve_completion_with(
-    lookup: &dyn Fn(&str) -> Option<crate::index::PackageIndex>,
+    lookup: &dyn Fn(&str) -> Option<Arc<PackageIndex>>,
     mut item: CompletionItem,
 ) -> CompletionItem {
     let Some(data) = item.data.take() else {
@@ -957,6 +1651,41 @@ mod tests {
         items.iter().map(|i| i.label.clone()).collect()
     }
 
+    #[test]
+    fn member_templates_are_scoped_to_the_exact_package_index() {
+        let make_index = |last: &str| {
+            let mut root = module("TemplatePkg", &[]);
+            root.functions = (0..64).map(|i| func(&format!("f{i}"))).collect();
+            root.functions.push(func(last));
+            package(root)
+        };
+        let first = make_index("before");
+        let second = make_index("after");
+        let path = vec!["TemplatePkg".into()];
+        let mut first_items = cached_member_items(&first, &first.root, &path, false);
+        assert_eq!(first_items.last().unwrap().label, "before");
+        first_items.pop();
+        assert_eq!(
+            cached_member_items(&first, &first.root, &path, false).len(),
+            65
+        );
+        assert_eq!(
+            cached_member_items(&second, &second.root, &path, false)
+                .last()
+                .unwrap()
+                .label,
+            "after"
+        );
+    }
+
+    #[test]
+    fn comments_are_quiet_but_keep_unicode_sequences() {
+        assert!(completions_bare("# comment_name", "comment_name").is_empty());
+        assert!(completions_bare("#= comment_name =#", "comment_name").is_empty());
+        assert!(!completions_bare("#= comment_name =#", "=#").is_empty());
+        assert_eq!(labels(&completions_bare("# \\alph", "\\alph")), ["\\alpha"]);
+    }
+
     /// Completions at the position just past `needle`, resolving free names
     /// against `workspace` (the enclosing package's module) too.
     fn completions_ws(
@@ -998,6 +1727,169 @@ mod tests {
         match item.text_edit.as_ref().expect("a text edit") {
             CompletionTextEdit::Edit(e) => (e.new_text.as_str(), e.range),
             other => panic!("expected a plain edit, got {other:?}"),
+        }
+    }
+
+    fn auto_import_fixture(source: &str, mode: &str) -> Vec<CompletionItem> {
+        use crate::environment::{EnvSource, Environment, Package, PackageKind};
+        use crate::incremental::IncrementalDatabase;
+        use std::collections::BTreeSet;
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let project = dir.join("Project.toml");
+        let manifest = dir.join("Manifest.toml");
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id2 = "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff";
+        let direct = match mode {
+            "transitive" => format!("[extras]\nTools = \"{id}\"\n"),
+            "uuid_mismatch" => format!("[deps]\nTools = \"{id2}\"\n"),
+            "duplicate" => format!("[deps]\nTools = \"{id}\"\nTools2 = \"{id2}\"\n"),
+            _ => format!("[deps]\nTools = \"{id}\"\n"),
+        };
+        fs::write(&project, format!("name = \"Tester\"\n{direct}")).unwrap();
+        fs::write(&manifest, format!(
+            "manifest_format = \"2.0\"\n[[deps.Tools]]\nuuid = \"{id}\"\npath = \"Tools\"\n[[deps.Tools2]]\nuuid = \"{id2}\"\npath = \"Tools2\"\n"
+        )).unwrap();
+        fs::create_dir(dir.join("src")).unwrap();
+        fs::write(dir.join("src").join("sibling.jl"), "helper() = 1\n").unwrap();
+        let entry = dir.join("src").join("Tester.jl");
+        let (left, right) = source.split_once('|').unwrap();
+        let text = format!("{left}{right}");
+        fs::write(&entry, &text).unwrap();
+        let packages = [("Tools", id), ("Tools2", id2)].into_iter().map(|(name, id)| {
+            let root = dir.join(name);
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src").join(format!("{name}.jl")), format!(
+                "module {name}\nexport calculate, ghost, calculator\ncalculate() = 2\nstruct calculator end\nend\n"
+            )).unwrap();
+            Package {
+                syntax_edition: crate::parser::SyntaxEdition::OLDEST,
+                name: name.into(), uuid: id.parse().unwrap(), version: None, tree_sha1: None,
+                deps: vec![], extensions: vec![], kind: PackageKind::Dev, source: Some(root),
+            }
+        }).collect();
+        let env = Environment {
+            project_file: project,
+            project_dir: dir.into(),
+            manifest_file: Some(manifest),
+            name: Some("Tester".into()),
+            uuid: None,
+            direct_deps: BTreeMap::new(),
+            declared_deps: BTreeSet::new(),
+            packages,
+            depots: vec![],
+            source: EnvSource::WorkspaceWalkUp,
+            install: None,
+        };
+        let indexed = crate::index::harvest_library(&env);
+        let mut db = IncrementalDatabase::default();
+        db.set_library_syntax(indexed.syntax);
+        db.set_project_files(indexed.project_files);
+        db.set_library(indexed.packages, indexed.roots, indexed.workspaces);
+        db.seed_workspace_members();
+        let snapshot = db.snapshot();
+        let (context, selection) = snapshot
+            .capture_source_editions(&entry)
+            .into_iter()
+            .next()
+            .unwrap();
+        let snapshot = snapshot.with_context(context, selection.options);
+        let encoding = PositionEncoding::Utf16;
+        let at = LineIndex::new(&text).byte_to_position(left.len(), encoding);
+        completion_via_db(&snapshot, &entry, &TextBuffer::new(text), at, encoding)
+    }
+
+    #[test]
+    fn auto_import_adds_exact_using_at_root_with_non_overlapping_edits() {
+        let offered = auto_import_fixture(
+            "#!/usr/bin/julia\r\nmodule Tester\r\n\r\n# user comment\r\n\"Docs\"\r\nprior() = 1\r\nf() = (\"🚀\"; calc|())\r\nend\r\n",
+            "direct",
+        );
+        let item = item(&offered, "calculate");
+        assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(item.detail.as_deref(), Some("Auto-import from Tools"));
+        let (replacement, range) = edit(item);
+        assert_eq!(replacement, "calculate");
+        assert_eq!(
+            range,
+            lsp_types::Range::new(Position::new(6, 13), Position::new(6, 17))
+        );
+        let imports = item.additional_text_edits.as_ref().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(
+            imports[0].range,
+            lsp_types::Range::new(Position::new(2, 0), Position::new(2, 0))
+        );
+        assert_eq!(imports[0].new_text, "using Tools: calculate\r\n");
+    }
+
+    #[test]
+    fn auto_import_offers_bare_value_and_only_defined_exports() {
+        let offered = auto_import_fixture("module Tester\nf() = calc|\nend\n", "direct");
+        assert!(item(&offered, "calculate").additional_text_edits.is_some());
+        assert_eq!(
+            item(&offered, "calculator").kind,
+            Some(CompletionItemKind::CLASS)
+        );
+        assert!(
+            auto_import_fixture("module Tester\nf() = gho|\nend\n", "direct")
+                .iter()
+                .all(|item| item.label != "ghost")
+        );
+    }
+
+    #[test]
+    fn auto_import_skips_unknown_scope_collisions_and_non_direct_packages() {
+        let cases = [
+            ("module Tester\nf() = calc|()\nend", "transitive"),
+            ("module Tester\nf() = calc|()\nend", "uuid_mismatch"),
+            ("module Tester\nf() = calc|()\nend", "duplicate"),
+            ("module Tester\nusing Unknown\nf() = calc|()\nend", "direct"),
+            (
+                "module Tester\nusing Tools: calculator\nf() = calc|()\nend",
+                "direct",
+            ),
+            (
+                "module Tester\n@eval calculate() = 3\nf() = calc|()\nend",
+                "direct",
+            ),
+            (
+                "module Tester\ncalculate() = 2\ncalculator() = 3\nf() = calc|()\nend",
+                "direct",
+            ),
+            ("module Tester\nf(calculator) = calc|()\nend", "duplicate"),
+            (
+                "module Tester\nmodule Child\nf() = calc|()\nend\nend",
+                "direct",
+            ),
+            ("module Tester\nf() = :(calc|())\nend", "direct"),
+            ("module Tester\nf() = @foo calc|()\nend", "direct"),
+            ("module Tester\nf() = Tools.calc|()\nend", "direct"),
+            (
+                "module Tester\nf() = g(calc|())\nend # no parser error",
+                "duplicate",
+            ),
+            ("module Tester\ncalc|() = 3\nend", "direct"),
+            (
+                "module Tester\ninclude(\"sibling.jl\")\nf() = calc|()\nend",
+                "direct",
+            ),
+            (
+                "module Tester # same-line comment\nf() = calc|()\nend",
+                "direct",
+            ),
+            ("module Tester\nf() = calc|()", "direct"),
+            ("baremodule Tester\nf() = calc|()\nend", "direct"),
+        ];
+        for (source, mode) in cases {
+            assert!(
+                auto_import_fixture(source, mode)
+                    .iter()
+                    .all(|item| item.additional_text_edits.is_none()),
+                "{mode}: {source}"
+            );
         }
     }
 
@@ -1220,6 +2112,42 @@ mod tests {
     }
 
     #[test]
+    fn member_context_respects_a_visible_receiver_binding() {
+        let mut base = module("Base", &[]);
+        base.functions.push(func("indexed_member"));
+        let lib = library(vec![package(base)]);
+        for (source, cursor) in [
+            ("function f(Base)\n    Base.in\nend", "Base.in"),
+            ("function f()\n    Base.in\n    Base = 1\nend", "Base.in"),
+            ("let Base = 1\n    Base.in\nend", "Base.in"),
+            ("Base = 1\nBase.in", "Base.in"),
+        ] {
+            assert!(completions_at(source, cursor, &lib).is_empty(), "{source}");
+        }
+        // The new let binding is not visible in its own initializer.
+        let source = "let Base = Base.ind\n    Base.in\nend";
+        assert_eq!(
+            labels(&completions_at(source, "Base.ind", &lib)),
+            vec!["indexed_member"]
+        );
+        let source = "function f(Base)\n    Base.in\nend\nBase.ind";
+        let names = labels(&completions_at(source, "Base.ind", &lib));
+        assert_eq!(names, vec!["indexed_member"]);
+    }
+
+    #[test]
+    fn member_context_follows_the_resolved_import_alias() {
+        let mut lib_module = module("Library", &[]);
+        lib_module.functions.push(func("correct_member"));
+        let mut alias_module = module("Alias", &[]);
+        alias_module.functions.push(func("unrelated_member"));
+        let lib = library(vec![package(lib_module), package(alias_module)]);
+        let source = "import Library as Alias\nAlias.";
+        let names = labels(&completions_at(source, "Alias.", &lib));
+        assert_eq!(names, vec!["correct_member"]);
+    }
+
+    #[test]
     fn member_context_lists_defined_names_and_submodules() {
         let mut root = module("A", &[]);
         root.functions.push(func("foo"));
@@ -1333,7 +2261,7 @@ mod tests {
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let mut creatures = crate::index::harvest_tree(&parsed.cst);
         creatures.name = "Creatures".into();
-        let pkg = (*package(creatures)).clone();
+        let pkg = package(creatures);
         let item = CompletionItem {
             label: "Animal".into(),
             data: resolve_data(&["Creatures".into()], "Animal"),
@@ -1362,7 +2290,7 @@ mod tests {
         let mut aliases = crate::index::harvest_tree(&parsed.cst);
         assert_eq!(aliases.functions.len(), 1);
         aliases.name = "Aliases".into();
-        let pkg = (*package(aliases)).clone();
+        let pkg = package(aliases);
         let item = CompletionItem {
             label: "Alias".into(),
             data: resolve_data(&["Aliases".into()], "Alias"),
@@ -1405,7 +2333,7 @@ mod tests {
             loc: loc(),
         });
         root.functions.push(group);
-        let pkg = (*package(root)).clone();
+        let pkg = package(root);
         let item = CompletionItem {
             label: "foo".into(),
             data: resolve_data(&["A".into()], "foo"),

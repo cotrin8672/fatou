@@ -113,7 +113,7 @@ fn selections_for_tree(
                         }
                     }
                 }
-                for range in documentation_range_chain(&context.markdown.cst, context.offset) {
+                for range in documentation_range_chain(&context.markdown, context.offset) {
                     if let Some(source) = context.source_range(range) {
                         push_widening(&mut chain, source);
                     }
