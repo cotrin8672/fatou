@@ -254,7 +254,7 @@ impl ImportContext<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn complete<P: PackageSource>(
         &self,
-        model: &SemanticModel,
+        model: Option<&SemanticModel>,
         packages: &P,
         workspace: Option<&(Arc<PackageIndex>, ModulePath)>,
         project_names: BTreeSet<String>,
@@ -274,6 +274,10 @@ impl ImportContext<'_> {
             names.extend(workspace.map(|(pkg, _)| pkg.name.clone()));
             names.iter().map(|name| module_item(name)).collect()
         } else if self.parent.dots > 0 || mode.first() == Some(&"Main") {
+            // Only relative and Main paths can refer to file-local names.
+            let Some(model) = model else {
+                return Vec::new();
+            };
             let source_scope = model.scope_at(offset);
             let lexical_path = model.enclosing_module_path(source_scope);
             let host: Vec<&str> = workspace
@@ -439,7 +443,7 @@ mod tests {
         let packages = std::collections::BTreeMap::new();
         let context = context_at(&root, &source, offset)?;
         Some(context.complete(
-            &model,
+            (!context.package_root()).then_some(&model),
             &packages,
             None,
             ["FFTW".into(), "Plots".into()].into(),

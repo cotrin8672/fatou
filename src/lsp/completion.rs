@@ -296,12 +296,13 @@ pub(crate) fn completion_via_db(
         if let Some(items) = syntax_only_completion(&root, text, offset.into(), encoding) {
             return Some(items);
         }
-        let model = snapshot.semantic_model(file);
         if let Some(context) = imports::context_at(&root, text, offset) {
+            let model = (!context.package_root()).then(|| snapshot.semantic_model(file));
             return Some(complete_import(
                 &context, model, snapshot, path, text, offset, encoding,
             ));
         }
+        let model = snapshot.semantic_model(file);
         let workspace = snapshot.workspace_member(path);
         let mut items = completions_for(
             model,
@@ -389,13 +390,14 @@ pub(crate) fn completion_for_import_trigger(
         let Some(context) = imports::context_at(&root, text, offset) else {
             return Vec::new();
         };
-        let model;
-        let model = match cached {
-            Some(file) => snapshot.semantic_model(file),
-            None => {
-                model = SemanticModel::build(&root);
-                &model
-            }
+        let fresh;
+        let model = if context.package_root() {
+            None
+        } else if let Some(file) = cached {
+            Some(snapshot.semantic_model(file))
+        } else {
+            fresh = SemanticModel::build(&root);
+            Some(&fresh)
         };
         let mut items = complete_import(&context, model, snapshot, path, text, offset, encoding);
         add_completion_source_path(&mut items, path);
@@ -413,9 +415,10 @@ fn import_from_tree(
     encoding: PositionEncoding,
 ) -> Option<Vec<CompletionItem>> {
     let context = imports::context_at(root, text, offset)?;
+    let model = (!context.package_root()).then(|| SemanticModel::build(root));
     Some(complete_import(
         &context,
-        &SemanticModel::build(root),
+        model.as_ref(),
         snapshot,
         path,
         text,
@@ -426,7 +429,7 @@ fn import_from_tree(
 
 fn complete_import(
     context: &imports::ImportContext<'_>,
-    model: &SemanticModel,
+    model: Option<&SemanticModel>,
     snapshot: &Analysis,
     path: &Path,
     text: &TextBuffer,
@@ -850,7 +853,7 @@ fn completions_for<P: PackageSource>(
 
     if let Some(context) = imports::context_at(root, text, offset) {
         return context.complete(
-            model,
+            Some(model),
             packages,
             workspace.as_ref(),
             Default::default(),
