@@ -24,7 +24,10 @@ use super::call_hierarchy::{
     incoming_calls_via_db, outgoing_calls_via_db, prepare_call_hierarchy_via_db,
 };
 use super::code_action::code_actions_via_db;
-use super::completion::{completion_for_import_trigger, completion_via_db, resolve_completion};
+use super::completion::{
+    CompletionTrigger, completion_for_path_trigger, completion_for_punctuation_trigger,
+    completion_via_db, resolve_completion,
+};
 use super::definition::definition_via_db;
 use super::document_link::document_links_via_db;
 use super::folding::folding_ranges_via_db;
@@ -210,7 +213,7 @@ pub(crate) enum ReadJob {
         path: PathBuf,
         text: Arc<TextBuffer>,
         position: Position,
-        import_trigger: bool,
+        trigger: CompletionTrigger,
         sender: ReadReply,
     },
     CompletionResolve {
@@ -745,6 +748,8 @@ pub(crate) fn run_read(
         );
         let merged = if definitions {
             merge_definitions(&values)
+        } else if matches!(job, ReadJob::Completion { .. }) {
+            merge_completion_results(&values)
         } else if let ReadJob::CompletionResolve { item, .. } = &job {
             let merged = merge_results(&values);
             if merged.is_null() {
@@ -758,6 +763,32 @@ pub(crate) fn run_read(
         response = Response::new_ok(response.id, merged);
     }
     let _ = reply.send(Message::Response(response));
+}
+
+fn merge_completion_results(values: &[serde_json::Value]) -> serde_json::Value {
+    use serde_json::Value;
+    let mut merged = merge_results(values);
+    let Some(items) = merged.as_array_mut() else {
+        return merged;
+    };
+    // A path edit is safe to suggest only when all loading contexts confirm
+    // the same loader and path candidate. Keep the ordinary completion union.
+    let is_path = |item: &Value| matches!(item.get("kind").and_then(Value::as_u64), Some(17 | 19));
+    if items.iter().any(is_path) {
+        let common = values
+            .iter()
+            .map(|value| {
+                value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| is_path(item))
+                    .collect::<std::collections::HashSet<&Value>>()
+            })
+            .collect::<Vec<_>>();
+        items.retain(|item| !is_path(item) || common.iter().all(|arm| arm.contains(item)));
+    }
+    merged
 }
 
 fn merge_results(values: &[serde_json::Value]) -> serde_json::Value {
@@ -1094,13 +1125,19 @@ fn run_read_single(
             path,
             text,
             position,
-            import_trigger,
+            trigger,
             sender,
         } => {
-            let mut items = if import_trigger {
-                completion_for_import_trigger(&snapshot, &path, &text, position, encoding)
-            } else {
-                completion_via_db(&snapshot, &path, &text, position, encoding)
+            let mut items = match trigger {
+                CompletionTrigger::Punctuation => {
+                    completion_for_punctuation_trigger(&snapshot, &path, &text, position, encoding)
+                }
+                CompletionTrigger::Path => {
+                    completion_for_path_trigger(&snapshot, &path, &text, position, encoding)
+                }
+                CompletionTrigger::Standard => {
+                    completion_via_db(&snapshot, &path, &text, position, encoding)
+                }
             };
             if sender.captured.is_none()
                 && sender.completion_data_defaults
@@ -1334,6 +1371,23 @@ fn goto_response(mut locations: Vec<Location>) -> Option<GotoDefinitionResponse>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn path_completions_require_agreement_across_loading_contexts() {
+        use serde_json::json;
+        let a = json!({"label":"a.jl", "kind":17});
+        let folder = json!({"label":"dir", "kind":19});
+        let b = json!({"label":"b.jl", "kind":17});
+        let normal = json!({"label":"visible", "kind":6});
+        assert_eq!(
+            super::merge_completion_results(&[json!([a, folder, normal]), json!([b, folder]),]),
+            json!([folder, normal])
+        );
+        assert_eq!(
+            super::merge_completion_results(&[json!([a]), json!([])]),
+            json!([])
+        );
+    }
+
     use super::*;
     use crate::incremental::IncrementalDatabase;
     use crate::parse_context::{EditionSource, SourceContext};

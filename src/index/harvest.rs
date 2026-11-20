@@ -1049,7 +1049,7 @@ fn qualified_path(node: &SyntaxNode) -> Option<(Vec<String>, SyntaxNode)> {
 }
 
 /// The positional and keyword parameters of a `CALL_EXPR` signature.
-fn extract_params(call: &SyntaxNode) -> (Vec<Param>, Vec<Param>) {
+pub(crate) fn extract_params(call: &SyntaxNode) -> (Vec<Param>, Vec<Param>) {
     let mut positional = Vec::new();
     let mut keyword = Vec::new();
     let Some(arg_list) = call.children().find(|c| c.kind() == SyntaxKind::ARG_LIST) else {

@@ -697,10 +697,19 @@ impl GlobalState {
             self.respond_err(id, "invalid completion params");
             return;
         };
-        let import_trigger = params.context.is_some_and(|context| {
-            context.trigger_kind == lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER
-                && matches!(context.trigger_character.as_deref(), Some(" " | ":" | ","))
-        });
+        use super::completion::CompletionTrigger;
+        let trigger = match params
+            .context
+            .filter(|context| {
+                context.trigger_kind == lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER
+            })
+            .and_then(|context| context.trigger_character)
+            .as_deref()
+        {
+            Some(" " | ":" | "," | ";") => CompletionTrigger::Punctuation,
+            Some("/") => CompletionTrigger::Path,
+            _ => CompletionTrigger::Standard,
+        };
         let uri = params.text_document_position.text_document.uri;
         let Some(text) = self.julia_text(&uri) else {
             self.respond_ok(id, serde_json::Value::Null);
@@ -712,7 +721,7 @@ impl GlobalState {
             path: path_for(&uri),
             text,
             position: params.text_document_position.position,
-            import_trigger,
+            trigger,
             sender: reply.with_completion_data_defaults(self.completion_data_defaults),
         });
     }

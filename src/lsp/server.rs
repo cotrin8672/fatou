@@ -245,9 +245,12 @@ fn server_capabilities(encoding: PositionEncoding, pull_diagnostics: bool) -> Se
         document_symbol_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
-            // Space, colon and comma are gated to Julia import clauses;
-            // the other characters open member, macro and input sequences.
-            trigger_characters: Some([".", "@", "\\", " ", ":", ","].map(str::to_string).to_vec()),
+            // Import, keyword and path punctuation is gated by the parsed context.
+            trigger_characters: Some(
+                [".", "@", "\\", " ", ":", ",", ";", "/"]
+                    .map(str::to_string)
+                    .to_vec(),
+            ),
             resolve_provider: Some(true),
             ..Default::default()
         }),

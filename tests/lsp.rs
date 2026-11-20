@@ -2406,7 +2406,7 @@ fn serves_completion_and_resolve() {
             );
             assert_eq!(
                 result["capabilities"]["completionProvider"]["triggerCharacters"],
-                serde_json::json!([".", "@", "\\", " ", ":", ","]),
+                serde_json::json!([".", "@", "\\", " ", ":", ",", ";", "/"]),
             );
         }
         other => panic!("expected an InitializeResult, got {other:?}"),
@@ -3852,6 +3852,80 @@ fn recv_response(client: &Connection, id: RequestId) -> lsp_server::Response {
 }
 
 #[test]
+fn declaration_name_completion_preserves_the_neighboring_reference_slots() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new("fatou-lsp-declaration-names");
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || fatou::lsp::serve(&server).unwrap());
+    initialize_with_root(&client, &file_uri(&dir.path));
+    for (i, (body, suppressed)) in [
+        ("map(xs) do (name│, other)\nend", true),
+        ("map(xs) do name\n ex│isting\nend", false),
+        ("map(xs) do name::Ex│isting\nend", false),
+        ("for arg│ in xs\nend", true),
+        ("for arg in ex│isting\nend", false),
+        ("let loc│=1\nend", true),
+        ("let loc=ex│isting\nend", false),
+        ("t = (; key│=1)", true),
+        ("t = (; ex│isting)", false),
+        ("f(; key=ex│isting)", false),
+        ("f(; ex│isting)", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let uri = file_uri(&dir.path.join(format!("test-{i}.jl")));
+        let mut source = format!("const existing = 1\n{body}\n");
+        let offset = source.find('│').unwrap();
+        source.remove(offset);
+        let position = LineIndex::new(&source).byte_to_position(offset, PositionEncoding::Utf16);
+        open_document(&client, &uri, &source);
+        let id = RequestId::from(i as i32 + 20);
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: id.clone(),
+                method: "textDocument/completion".into(),
+                params: serde_json::json!({
+                    "textDocument": {"uri": uri},
+                    "position": position,
+                    "context": {"triggerKind": 1},
+                }),
+            }))
+            .unwrap();
+        let response = recv_response(&client, id);
+        let result = response.result().expect("completion result");
+        let items = serde_json::from_value::<Vec<CompletionItem>>(result).unwrap();
+        if suppressed {
+            assert!(items.is_empty(), "{body}: {items:?}");
+        } else {
+            assert!(
+                items.iter().any(|item| item.label == "existing"),
+                "{body}: {items:?}"
+            );
+        }
+    }
+    let id = RequestId::from(99);
+    client
+        .sender
+        .send(Message::Request(Request {
+            id: id.clone(),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    assert!(recv_response(&client, id).result().is_some());
+    client
+        .sender
+        .send(Message::Notification(Notification {
+            method: "exit".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn import_completion_triggers_are_contextual_and_do_not_require_a_depot() {
     let _env = ENV_LOCK.lock().unwrap();
     let dir = TempDir::new("fatou-lsp-load-completion");
@@ -3933,6 +4007,111 @@ fn import_completion_triggers_are_contextual_and_do_not_require_a_depot() {
         .unwrap();
     assert!(
         recv_response(&client, RequestId::from(25))
+            .result()
+            .is_some()
+    );
+    client
+        .sender
+        .send(Message::Notification(Notification {
+            method: "exit".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn keyword_completion_punctuation_triggers_are_contextual() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new("fatou-lsp-keyword-completion");
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || fatou::lsp::serve(&server).unwrap());
+    initialize_with_root(&client, &file_uri(&dir.path));
+    let uri = file_uri(&dir.path.join("calls.jl"));
+    let source = concat!(
+        "choose(x; alp=1, beta=2) = x\n",
+        "alp = 42\n",
+        "choose(1;)\n",
+        "choose(1; alp=other(1, 2),)\n",
+        "choose(1; alp=other(1, 2))\n",
+        "choose(1,)\n",
+        "(; x=1,)\n",
+        "one = 1;two = 2\n",
+        "missing(1;)\n",
+        "choose(1; alWrong=2)\n",
+        "choose(1;",
+    );
+    open_document(&client, &uri, source);
+
+    let complete = |id: i32, line, character, trigger: Option<&str>| {
+        let id = RequestId::from(id);
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: id.clone(),
+                method: "textDocument/completion".into(),
+                params: serde_json::json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character},
+                    "context": trigger.map(|trigger| serde_json::json!({
+                        "triggerKind": 2, "triggerCharacter": trigger,
+                    })),
+                }),
+            }))
+            .unwrap();
+        let response = recv_response(&client, id);
+        serde_json::from_value::<Vec<CompletionItem>>(response.result().unwrap()).unwrap()
+    };
+    // Ensure the live source reached analysis before asserting a trigger reply.
+    assert!(
+        complete(30, 1, 3, None)
+            .iter()
+            .any(|item| item.label == "choose")
+    );
+    for (id, line) in [(31, 2), (32, 10)] {
+        let items = complete(id, line, 9, Some(";"));
+        assert_eq!(items[0].label, "alp=");
+        assert_eq!(items[1].label, "beta=");
+        assert!(items.iter().any(|item| item.label == "alp"));
+        assert_eq!(
+            items[0].text_edit,
+            Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(line, 9), Position::new(line, 9)),
+                new_text: "alp=".into(),
+            }))
+        );
+    }
+    let after_outer_comma = complete(33, 3, 26, Some(","));
+    assert_eq!(after_outer_comma[0].label, "beta=");
+    assert!(!after_outer_comma.iter().any(|item| item.label == "alp="));
+    for (id, line, column, trigger) in [
+        (34, 4, 22, ","),
+        (35, 5, 9, ","),
+        (36, 6, 7, ","),
+        (37, 7, 8, ";"),
+        (38, 8, 10, ";"),
+    ] {
+        assert!(complete(id, line, column, Some(trigger)).is_empty());
+    }
+    let existing_eq = complete(39, 9, 12, None);
+    assert_eq!(
+        existing_eq[0].text_edit,
+        Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
+            range: Range::new(Position::new(9, 10), Position::new(9, 17)),
+            new_text: "alp".into(),
+        }))
+    );
+
+    client
+        .sender
+        .send(Message::Request(Request {
+            id: RequestId::from(40),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    assert!(
+        recv_response(&client, RequestId::from(40))
             .result()
             .is_some()
     );

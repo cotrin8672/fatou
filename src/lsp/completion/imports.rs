@@ -32,6 +32,7 @@ pub(super) struct ImportContext<'a> {
     /// Everything before the currently edited component.
     parent: PathParts<'a>,
     symbols: bool,
+    alias_destination: bool,
     prefix: &'a str,
     start: usize,
     end: usize,
@@ -102,6 +103,63 @@ pub(super) fn context_at<'a>(
         }
         anchor = anchor.prev_token()?;
     };
+    // An ordinary RHS alias declares a new name; it is not a reference.
+    // The parser owns both the contextual keyword and the destination token,
+    // so an unrelated `as` expression or a cursor after the clause cannot
+    // suppress ordinary completion.
+    let alias_destination = anchor
+        .parent_ancestors()
+        .take_while(|node| node != &stmt)
+        .find(|node| node.kind() == SyntaxKind::IMPORT_ALIAS)
+        .is_some_and(|alias| {
+            let mut tokens = alias.children_with_tokens().filter_map(|e| e.into_token());
+            let Some(keyword) = tokens.find(|token| token.text() == "as") else {
+                return false;
+            };
+            let Some(destination) = tokens.find(|token| !is_trivia(token.kind())) else {
+                return false;
+            };
+            destination.kind() == SyntaxKind::IDENT
+                && keyword.text_range().end() <= offset
+                && offset <= destination.text_range().end()
+        });
+    // A missing destination cannot form IMPORT_ALIAS. The parser keeps
+    // its `as` as a direct recovery token in the original statement, after
+    // the parsed IMPORT_PATH. Accept only that unfinished same-line tail.
+    let dangling_alias = || {
+        if offset > stmt.text_range().end() {
+            return false;
+        }
+        let mut previous = None;
+        let mut last = None;
+        for element in stmt.children_with_tokens().filter(|element| {
+            element
+                .as_token()
+                .is_none_or(|token| !is_trivia(token.kind()))
+        }) {
+            previous = last.replace(element);
+        }
+        let Some(keyword) = last.and_then(|element| element.into_token()) else {
+            return false;
+        };
+        keyword.kind() == SyntaxKind::IDENT
+            && keyword.text() == "as"
+            && keyword.text_range().end() <= offset
+            && previous.is_some_and(|element| element.kind() == SyntaxKind::IMPORT_PATH)
+            && text[usize::from(keyword.text_range().end())..usize::from(offset)]
+                .chars()
+                .all(|c| matches!(c, ' ' | '\t'))
+    };
+    if alias_destination || dangling_alias() {
+        return Some(ImportContext {
+            parent: path_parts("")?,
+            symbols: false,
+            alias_destination: true,
+            prefix: "",
+            start: offset.into(),
+            end: offset.into(),
+        });
+    }
     let mut clause_start = stmt.text_range().start();
     let mut base_end = None;
     let mut first_start = clause_start;
@@ -203,6 +261,7 @@ pub(super) fn context_at<'a>(
     Some(ImportContext {
         parent,
         symbols,
+        alias_destination: false,
         prefix,
         start,
         end,
@@ -247,6 +306,10 @@ pub(super) fn project_names(snapshot: &Analysis, path: &Path) -> BTreeSet<String
 }
 
 impl ImportContext<'_> {
+    pub(super) fn alias_destination(&self) -> bool {
+        self.alias_destination
+    }
+
     pub(super) fn package_root(&self) -> bool {
         self.parent.dots == 0 && self.parent.components.is_empty() && !self.symbols
     }
@@ -262,6 +325,9 @@ impl ImportContext<'_> {
         index: &LineIndex,
         encoding: PositionEncoding,
     ) -> Vec<CompletionItem> {
+        if self.alias_destination {
+            return Vec::new();
+        }
         let module_item = |label: &str| CompletionItem {
             label: label.to_string(),
             kind: Some(CompletionItemKind::MODULE),
@@ -481,11 +547,48 @@ mod tests {
             "using FFTW\n│",
             "using FFTW; │",
             "using FFTW │",
-            "import FFTW as alias│",
             "using FFTW, # using │",
             "using FFTW, \n α = 1; β│",
         ] {
             assert!(candidates(source).is_none(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_alias_destination_is_handled_without_candidates() {
+        for source in [
+            "outer_name = 1\nimport Base as ou│",
+            "import Base as │",
+            "import Base as │outer_name",
+            "import Base as outer_│name",
+            "using .LocalTool: bell as ou│",
+            "using .LocalTool: bell as │",
+            "import Base, Core as ca│",
+            "import Base as 木│",
+        ] {
+            assert_eq!(candidates(source), Some(Vec::new()), "{source}");
+        }
+        for source in [
+            "import B│ase as outer_name",
+            "import Base as outer_name, Plo│ts",
+            "using .LocalTool: be│ll as outer_name",
+        ] {
+            let (text, at) = marked(source);
+            let context = context_at(&parse(&text).cst, &text, at).unwrap();
+            assert!(!context.alias_destination(), "{source}");
+        }
+        for source in [
+            "import Base as outer_name\nouter│",
+            "import Base as outer_name; outer│",
+            "as = outer│",
+            "import Base: @time as @ou│",
+        ] {
+            let (text, at) = marked(source);
+            assert!(
+                !context_at(&parse(&text).cst, &text, at)
+                    .is_some_and(|context| context.alias_destination()),
+                "{source}"
+            );
         }
     }
 
@@ -521,7 +624,10 @@ mod tests {
         assert_eq!(names("using .Utils: answer, @ac│"), ["@action"]);
         assert_eq!(names("using .Utils.an│"), Vec::<String>::new());
         assert_eq!(names("import .Utils.an│"), ["answer"]);
-        assert!(candidates(&format!("{src}using .Utils: ans as al│")).is_none());
+        assert_eq!(
+            candidates(&format!("{src}using .Utils: ans as al│")).unwrap(),
+            []
+        );
     }
 
     #[test]

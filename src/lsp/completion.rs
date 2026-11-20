@@ -27,7 +27,10 @@
 //! (`Base.`, `LinearAlgebra.`, nested `A.B.`); value and type receivers are out
 //! of scope until there is type inference.
 
+mod call_keywords;
+mod declaration_names;
 mod imports;
+mod paths;
 
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -254,7 +257,8 @@ pub fn compute_completions<P: PackageSource>(
     encoding: PositionEncoding,
     packages: &P,
 ) -> Vec<CompletionItem> {
-    let offset = LineIndex::new(text).position_to_byte(position, encoding);
+    let lines = LineIndex::new(text);
+    let offset = lines.position_to_byte(position, encoding);
     let root = parse_with_options(text, packages.syntax_options()).cst;
     if let Some(items) = syntax_only_completion(&root, text, offset, encoding) {
         return items;
@@ -270,6 +274,7 @@ pub fn compute_completions<P: PackageSource>(
         text,
         TextSize::new(offset as u32),
         encoding,
+        &lines,
         None,
     )
 }
@@ -285,6 +290,36 @@ pub(crate) fn completion_via_db(
     position: Position,
     encoding: PositionEncoding,
 ) -> Vec<CompletionItem> {
+    completion_via_db_impl(snapshot, path, text, position, encoding, false)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CompletionTrigger {
+    Standard,
+    Punctuation,
+    Path,
+}
+
+/// Slash is advertised only for static paths. Do not open generic completion
+/// for division, comments, strings in other calls, or interpolations.
+pub(crate) fn completion_for_path_trigger(
+    snapshot: &Analysis,
+    path: &Path,
+    text: &TextBuffer,
+    position: Position,
+    encoding: PositionEncoding,
+) -> Vec<CompletionItem> {
+    completion_via_db_impl(snapshot, path, text, position, encoding, true)
+}
+
+fn completion_via_db_impl(
+    snapshot: &Analysis,
+    path: &Path,
+    text: &TextBuffer,
+    position: Position,
+    encoding: PositionEncoding,
+    path_only: bool,
+) -> Vec<CompletionItem> {
     let offset = TextSize::new(text.line_index().position_to_byte(position, encoding) as u32);
     let cached = salsa::Cancelled::catch(AssertUnwindSafe(|| {
         let file = snapshot.lookup_file(path)?;
@@ -293,10 +328,29 @@ pub(crate) fn completion_via_db(
             return None;
         }
         let root = snapshot.parsed_tree(file);
+        if let Some(context) = paths::context_at(&root, offset)
+            && let Some(items) = paths::complete(
+                context,
+                snapshot,
+                snapshot.semantic_model(file),
+                path,
+                text,
+                offset,
+                encoding,
+            )
+        {
+            return Some(items);
+        }
+        if path_only {
+            return Some(Vec::new());
+        }
         if let Some(items) = syntax_only_completion(&root, text, offset.into(), encoding) {
             return Some(items);
         }
         if let Some(context) = imports::context_at(&root, text, offset) {
+            if context.alias_destination() {
+                return Some(Vec::new());
+            }
             let model = (!context.package_root()).then(|| snapshot.semantic_model(file));
             return Some(complete_import(
                 &context, model, snapshot, path, text, offset, encoding,
@@ -312,6 +366,7 @@ pub(crate) fn completion_via_db(
             text,
             offset,
             encoding,
+            &text.line_index(),
             Some((snapshot, file)),
         );
         if let Some(workspace) = workspace {
@@ -326,22 +381,41 @@ pub(crate) fn completion_via_db(
         // Cache miss (`Ok(None)`) or a racing write (`Err`): re-parse from text.
         Ok(None) | Err(_) => {
             let parsed = parse_with_options(text, snapshot.options_for_path(path));
+            if path_only {
+                let from_path = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                    let context = paths::context_at(&parsed.cst, offset)?;
+                    let model = SemanticModel::build(&parsed.cst);
+                    paths::complete(context, snapshot, &model, path, text, offset, encoding)
+                }));
+                return from_path.ok().flatten().unwrap_or_default();
+            }
             // A cold or racing read can still use the real file's project.
             let from_import = salsa::Cancelled::catch(AssertUnwindSafe(|| {
                 import_from_tree(snapshot, path, text, &parsed.cst, offset, encoding)
             }));
             match from_import {
                 Ok(Some(items)) => items,
-                _ => completions_for(
-                    &SemanticModel::build(&parsed.cst),
-                    &parsed.cst,
-                    snapshot,
-                    None,
-                    text,
-                    offset,
-                    encoding,
-                    None,
-                ),
+                _ => {
+                    let model = SemanticModel::build(&parsed.cst);
+                    let from_path = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                        let context = paths::context_at(&parsed.cst, offset)?;
+                        paths::complete(context, snapshot, &model, path, text, offset, encoding)
+                    }));
+                    match from_path {
+                        Ok(Some(items)) => items,
+                        _ => completions_for(
+                            &model,
+                            &parsed.cst,
+                            snapshot,
+                            None,
+                            text,
+                            offset,
+                            encoding,
+                            &text.line_index(),
+                            None,
+                        ),
+                    }
+                }
             }
         }
     };
@@ -349,10 +423,10 @@ pub(crate) fn completion_via_db(
     items
 }
 
-/// Space, colon and comma are advertised for import directives only. A
-/// trigger request for ordinary code must not build a semantic model or
-/// consult the package index (nor flood the editor with the value list).
-pub(crate) fn completion_for_import_trigger(
+/// Space, colon and comma are advertised for import directives; semicolons
+/// and top-level keyword commas also open ordinary calls' keyword slots.
+/// Unrelated punctuation requests do not build a model or flood the editor.
+pub(crate) fn completion_for_punctuation_trigger(
     snapshot: &Analysis,
     path: &Path,
     text: &TextBuffer,
@@ -366,6 +440,7 @@ pub(crate) fn completion_for_import_trigger(
     if before.ends_with(':') && matches!(context_at(text, offset.into()), Context::Latex { .. }) {
         return completion_via_db(snapshot, path, text, position, encoding);
     }
+    let maybe_keyword = before.trim_end_matches([' ', '\t']).ends_with([';', ',']);
     salsa::Cancelled::catch(AssertUnwindSafe(|| {
         let cached = snapshot
             .lookup_file(path)
@@ -376,30 +451,57 @@ pub(crate) fn completion_for_import_trigger(
                 // A cold, ordinary keystroke is far more common than an
                 // import clause. The prefix gate is only a cheap rejection;
                 // the CST, not this text check, determines the context.
-                let before = &text[..usize::from(offset)];
                 let recent = before.rsplitn(9, '\n').take(8);
                 if !recent
                     .into_iter()
                     .any(|line| line.contains("using") || line.contains("import"))
+                    && !(maybe_keyword && before.contains(';'))
                 {
                     return Vec::new();
                 }
                 parse_with_options(text, snapshot.options_for_path(path)).cst
             }
         };
-        let Some(context) = imports::context_at(&root, text, offset) else {
+        let mut items = if let Some(context) = imports::context_at(&root, text, offset) {
+            if context.alias_destination() {
+                return Vec::new();
+            }
+            let fresh;
+            let model = if context.package_root() {
+                None
+            } else if let Some(file) = cached {
+                Some(snapshot.semantic_model(file))
+            } else {
+                fresh = SemanticModel::build(&root);
+                Some(&fresh)
+            };
+            complete_import(&context, model, snapshot, path, text, offset, encoding)
+        } else if maybe_keyword && let Some(site) = call_keywords::site_at(&root, offset) {
+            let fresh;
+            let model = if let Some(file) = cached {
+                snapshot.semantic_model(file)
+            } else {
+                fresh = SemanticModel::build(&root);
+                &fresh
+            };
+            let workspace = snapshot.workspace_member(path);
+            let Some(mut items) = site.items(
+                model,
+                snapshot,
+                workspace.as_ref(),
+                &root,
+                &text.line_index(),
+                encoding,
+            ) else {
+                return Vec::new();
+            };
+            if !site.explicit() {
+                items.extend(ordinary_value_items(model, snapshot, workspace, offset));
+            }
+            items
+        } else {
             return Vec::new();
         };
-        let fresh;
-        let model = if context.package_root() {
-            None
-        } else if let Some(file) = cached {
-            Some(snapshot.semantic_model(file))
-        } else {
-            fresh = SemanticModel::build(&root);
-            Some(&fresh)
-        };
-        let mut items = complete_import(&context, model, snapshot, path, text, offset, encoding);
         add_completion_source_path(&mut items, path);
         items
     }))
@@ -415,6 +517,9 @@ fn import_from_tree(
     encoding: PositionEncoding,
 ) -> Option<Vec<CompletionItem>> {
     let context = imports::context_at(root, text, offset)?;
+    if context.alias_destination() {
+        return Some(Vec::new());
+    }
     let model = (!context.package_root()).then(|| SemanticModel::build(root));
     Some(complete_import(
         &context,
@@ -771,6 +876,7 @@ fn completions_for<P: PackageSource>(
     text: &str,
     offset: TextSize,
     encoding: PositionEncoding,
+    lines: &LineIndex,
     cached_docs: Option<(&Analysis, SourceFile)>,
 ) -> Vec<CompletionItem> {
     let offset_bytes: usize = offset.into();
@@ -780,6 +886,9 @@ fn completions_for<P: PackageSource>(
         if let Some(embedded) = context.embedded_julia() {
             let parsed = parse_with_options(embedded.text, packages.syntax_options());
             let embedded_model = SemanticModel::build(&parsed.cst);
+            if declaration_names::introduces_name(&parsed.cst, &embedded_model, embedded.offset) {
+                return Vec::new();
+            }
             let mut items = completions_for(
                 &embedded_model,
                 &parsed.cst,
@@ -788,6 +897,7 @@ fn completions_for<P: PackageSource>(
                 embedded.text,
                 embedded.offset,
                 encoding,
+                &LineIndex::new(embedded.text),
                 None,
             );
             if imports::context_at(&parsed.cst, embedded.text, embedded.offset).is_some() {
@@ -858,7 +968,7 @@ fn completions_for<P: PackageSource>(
             workspace.as_ref(),
             Default::default(),
             offset,
-            &LineIndex::new(text),
+            lines,
             encoding,
         );
     }
@@ -911,18 +1021,37 @@ fn completions_for<P: PackageSource>(
                 .visible(offset, Namespace::Macro),
             Namespace::Macro,
         ),
+        Context::Value if declaration_names::introduces_name(root, model, offset) => Vec::new(),
         Context::Value => {
-            let mut items = candidate_items(
-                model,
-                Resolver::new(model, packages)
-                    .with_workspace(workspace)
-                    .visible(offset, Namespace::Value),
-                Namespace::Value,
-            );
-            items.extend(KEYWORDS.iter().map(|kw| keyword_item(kw)));
-            items
+            if let Some(site) = call_keywords::site_at(root, offset)
+                && let Some(mut items) =
+                    site.items(model, packages, workspace.as_ref(), root, lines, encoding)
+            {
+                if !site.explicit() {
+                    items.extend(ordinary_value_items(model, packages, workspace, offset));
+                }
+                return items;
+            }
+            ordinary_value_items(model, packages, workspace, offset)
         }
     }
+}
+
+fn ordinary_value_items<P: PackageSource>(
+    model: &SemanticModel,
+    packages: &P,
+    workspace: Option<(Arc<PackageIndex>, ModulePath)>,
+    offset: TextSize,
+) -> Vec<CompletionItem> {
+    let mut items = candidate_items(
+        model,
+        Resolver::new(model, packages)
+            .with_workspace(workspace)
+            .visible(offset, Namespace::Value),
+        Namespace::Value,
+    );
+    items.extend(KEYWORDS.iter().map(|kw| keyword_item(kw)));
+    items
 }
 
 /// Completion inside an explicit `@ref target`, resolved in the documented
@@ -1745,6 +1874,139 @@ mod tests {
         items.iter().map(|i| i.label.clone()).collect()
     }
 
+    fn at_declaration_marker(body: &str) -> Vec<CompletionItem> {
+        let mut src = format!("const visible_candidate = 1\n{body}\n");
+        let offset = src.find('│').unwrap();
+        src.remove(offset);
+        let pos = LineIndex::new(&src).byte_to_position(offset, PositionEncoding::Utf16);
+        compute_completions(&src, pos, PositionEncoding::Utf16, &library(vec![]))
+    }
+
+    #[test]
+    fn declaration_names_withhold_existing_names_only_for_proven_binders() {
+        for body in [
+            "map(xs) do arg│\n end",
+            "map(xs) do a, arg│\n end",
+            "map(xs) do (arg│, a)\n end",
+            "msg = \"😀\"; map(xs) do κεφ│άλαιο\n end",
+            "map(xs) do arg│",
+            "function f(arg│)\n end",
+            "function f(arg│::Int=1)\n end",
+            "function f(arg│...)\n end",
+            "f(arg│)=nothing",
+            "function f(; arg│=1)\n end",
+            "f(arg│=1)=nothing",
+            "g = function (arg│)\n end",
+            "g = (arg│, x) -> x",
+            "macro f(arg│)\n end",
+            "for arg│ in xs\n end",
+            "for a in ys, arg│ in xs\n end",
+            "for (arg│, b) ∈ xs\n end",
+            "for arg│ = xs\n end",
+            "for a=ys, arg│ in xs\n end",
+            "for a in ys, arg│ = xs\n end",
+            "[x for arg│ in xs]",
+            "(x for arg│ in xs)",
+            "let arg│\n end",
+            "let first = 1, (arg│, b) = xs\n end",
+            "try\n nothing\ncatch arg│\n end",
+            "function f()\n local arg│\nend",
+            "function f()\n local arg│::Int=1\nend",
+            "function f()\n local (arg│, b) = xs\nend",
+        ] {
+            assert!(at_declaration_marker(body).is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn declaration_names_keep_references_and_ambiguous_input() {
+        for body in [
+            "map(xs) do │\n end",
+            "map(xs) do a\n vis│\n end",
+            "map(xs) do a; vis│; end",
+            "map(xs) do a::Vis│\n end",
+            "function f(x=vis│)\n end",
+            "function f(x::Vis│)\n end",
+            "function f(x::Int=vis│)\n end",
+            "function f(; key=vis│)\n end",
+            "function f(visible = (x -> x))\n vis│ible\n end",
+            "f(vis│)",
+            "f(vis│",
+            "f(; vis│)",
+            "f(; key=vis│)",
+            "f(; vis│=1)",
+            "g = x -> vis│",
+            "macro fa│(x)\n end",
+            "function fa│(x)\n end",
+            "struct A\n vis│::Int\n end",
+            "for vis│\n end",
+            "for a in vis│\n end",
+            "for a=ys, b in vis│\n end",
+            "for a=vis│, b in xs\n end",
+            "for arg::Vis│ in xs\n end",
+            "for a in xs\n vis│\n end",
+            "[x for a in vis│]",
+            "[a for a in xs if vis│]",
+            "let x=vis│\n end",
+            "let arg; vis│; end",
+            "try\n nothing\ncatch ex\n vis│\n end",
+            "function f(existing)\n for outer ex│isting in xs\n end\n end",
+            "function f()\n local x=(vis│=1)\nend",
+            "function f()\n local x=vis│\nend",
+            "function f()\n vis│=1\nend",
+            "function f()\n (vis│, b)=xs\nend",
+            "xs[vis│]=1",
+            "vis│.field=1",
+        ] {
+            let names = labels(&at_declaration_marker(body));
+            assert!(
+                names.iter().any(|name| name == "visible_candidate"),
+                "{body}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_named_tuple_keys_are_not_reference_slots() {
+        for body in [
+            "(; name│=2)",
+            "(; prior, name│=2)",
+            "(name│=2,)",
+            "(name│=2, other=3)",
+            "f((; name│=2))",
+        ] {
+            assert!(at_declaration_marker(body).is_empty(), "{body}");
+        }
+        for body in [
+            "(; vis│)",
+            "(; name=│)",
+            "(; name=vis│)",
+            "(vis│=2)",
+            "(vis│=2, unnamed)",
+            "f(; vis│=2)",
+            "f(vis│=2, other=3)",
+            "x = :( (; vis│=2) )",
+            "quote\n (; vis│=2)\nend",
+        ] {
+            let names = labels(&at_declaration_marker(body));
+            assert!(
+                names.iter().any(|name| name == "visible_candidate"),
+                "{body}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn doc_fences_do_not_restore_outer_names_at_declarations() {
+        let fence =
+            |body: &str| format!("\"\"\"\n```julia\n{body}\n```\n\"\"\"\nf()=visible_candidate\n");
+        assert!(at_declaration_marker(&fence("map(xs) do arg│\nend")).is_empty());
+        assert!(at_declaration_marker(&fence("(; key│=2)")).is_empty());
+        let labels = labels(&at_declaration_marker(&fence("map(xs) do arg\n vis│\nend")));
+        assert!(labels.iter().any(|name| name == "arg"));
+        assert!(labels.iter().any(|name| name == "visible_candidate"));
+    }
+
     #[test]
     fn member_templates_are_scoped_to_the_exact_package_index() {
         let make_index = |last: &str| {
@@ -1799,6 +2061,7 @@ mod tests {
             src,
             offset,
             PositionEncoding::Utf16,
+            &LineIndex::new(src),
             None,
         )
     }
@@ -1910,6 +2173,21 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn ordinary_completions_do_not_fall_back_inside_import_alias_destination() {
+        for statement in [
+            "import Base as ou",
+            "using .LocalTool: bell as ou",
+            "import Base as ",
+        ] {
+            let src = format!("outer_visible = 1\n{statement}");
+            assert!(completions_bare(&src, statement).is_empty(), "{statement}");
+        }
+        let src = "outer_visible = 1\nimport Base as renamed\nou";
+        let items = completions_bare(src, "\nou");
+        assert!(labels(&items).iter().any(|label| label == "outer_visible"));
     }
 
     #[test]
