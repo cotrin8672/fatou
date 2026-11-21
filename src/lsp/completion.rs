@@ -300,7 +300,7 @@ pub(crate) enum CompletionTrigger {
     Path,
 }
 
-/// Slash is advertised only for static paths. Do not open generic completion
+/// Slash and quote trigger completion only for static paths. Do not open generic completion
 /// for division, comments, strings in other calls, or interpolations.
 pub(crate) fn completion_for_path_trigger(
     snapshot: &Analysis,
@@ -397,12 +397,17 @@ fn completion_via_db_impl(
                 Ok(Some(items)) => items,
                 _ => {
                     let model = SemanticModel::build(&parsed.cst);
+                    let path_context = paths::context_at(&parsed.cst, offset);
+                    let path_syntax = path_context.is_some();
                     let from_path = salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                        let context = paths::context_at(&parsed.cst, offset)?;
+                        let context = path_context?;
                         paths::complete(context, snapshot, &model, path, text, offset, encoding)
                     }));
                     match from_path {
                         Ok(Some(items)) => items,
+                        // A cancelled semantic query must not turn a recognized
+                        // path slot into a menu of unrelated symbols.
+                        Err(_) if path_syntax => Vec::new(),
                         _ => completions_for(
                             &model,
                             &parsed.cst,

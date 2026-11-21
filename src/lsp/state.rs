@@ -707,7 +707,7 @@ impl GlobalState {
             .as_deref()
         {
             Some(" " | ":" | "," | ";") => CompletionTrigger::Punctuation,
-            Some("/") => CompletionTrigger::Path,
+            Some("/" | "\"") => CompletionTrigger::Path,
             _ => CompletionTrigger::Standard,
         };
         let uri = params.text_document_position.text_document.uri;

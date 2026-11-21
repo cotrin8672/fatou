@@ -14,6 +14,11 @@ Completion suggests names visible at the cursor and members of modules such as
 `Base` and `LinearAlgebra`. Hover over a name to read its documentation, or use
 signature help while writing a function call to see its parameters.
 
+In a static, relative `include("path")` string, Fatou completes Julia source
+files (`.jl`) and folders relative to the current file, not symbols or data
+files like `Project.toml`. Other file suffixes are still accepted when typed
+explicitly.
+
 Use your editor's navigation commands to follow the code:
 
   | Task                                   | Editor command              |

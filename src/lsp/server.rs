@@ -247,7 +247,7 @@ fn server_capabilities(encoding: PositionEncoding, pull_diagnostics: bool) -> Se
         completion_provider: Some(CompletionOptions {
             // Import, keyword and path punctuation is gated by the parsed context.
             trigger_characters: Some(
-                [".", "@", "\\", " ", ":", ",", ";", "/"]
+                [".", "@", "\\", " ", ":", ",", ";", "/", "\""]
                     .map(str::to_string)
                     .to_vec(),
             ),

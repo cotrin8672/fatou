@@ -1,4 +1,4 @@
-//! Filesystem candidates for confirmed Julia `include("literal")`.
+//! Julia source files and folders for a confirmed `include("literal")`.
 //! The edit stays inside one source path component; relative lookup follows the
 //! including document, not the process or workspace directory.
 use std::path::{Component, Path};
@@ -19,6 +19,7 @@ pub(super) struct IncludePath {
     callee: Loader,
     content_start: usize,
     content_end: usize,
+    unterminated: bool,
 }
 
 enum Loader {
@@ -50,12 +51,11 @@ pub(super) fn context_at(root: &SyntaxNode, offset: TextSize) -> Option<IncludeP
             return None;
         }
         let start = open.text_range().end();
-        let end = tokens
-            .find(|token| token.kind() == SyntaxKind::STRING_DELIM_CLOSE)
-            .map_or_else(
-                || literal.syntax().text_range().end(),
-                |token| token.text_range().start(),
-            );
+        let close = tokens.find(|token| token.kind() == SyntaxKind::STRING_DELIM_CLOSE);
+        let end = close.as_ref().map_or_else(
+            || literal.syntax().text_range().end(),
+            |token| token.text_range().start(),
+        );
         if offset < start || offset > end {
             return None;
         }
@@ -63,6 +63,7 @@ pub(super) fn context_at(root: &SyntaxNode, offset: TextSize) -> Option<IncludeP
             callee,
             content_start: start.into(),
             content_end: end.into(),
+            unterminated: close.is_none(),
         })
     })
 }
@@ -234,6 +235,13 @@ pub(super) fn complete(
         return None;
     }
     let raw = text.get(context.content_start..context.content_end)?;
+    // An unmatched ordinary quote can consume all subsequent source lines
+    // as string content during editing. Do not replace any of those lines.
+    let raw = if context.unterminated {
+        raw.split(['\r', '\n']).next().unwrap_or_default()
+    } else {
+        raw
+    };
     let cursor = usize::from(offset).checked_sub(context.content_start)?;
     let items = complete_literal(raw, cursor, path.parent()?, |byte| {
         text.line_index()
@@ -291,7 +299,13 @@ fn complete_literal(
             continue;
         };
         let directory = kind.is_dir();
-        if !directory && (!kind.is_file() || following_slash.is_some()) {
+        // Julia can evaluate files with other suffixes when named explicitly.
+        // But this picker is for source files, not Project.toml or data files.
+        let julia_source = Path::new(&label)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jl"));
+        if !directory && (!kind.is_file() || !julia_source || following_slash.is_some()) {
             continue;
         }
         let escaped = escape_component(&label);
@@ -372,8 +386,12 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("solver.jl"), "").unwrap();
         std::fs::write(dir.path().join("solver.data"), "").unwrap();
+        std::fs::write(dir.path().join("main.jl"), "").unwrap();
+        std::fs::write(dir.path().join("main.toml"), "").unwrap();
+        std::fs::write(dir.path().join("Project.toml"), "").unwrap();
+        std::fs::create_dir(dir.path().join("main_parts")).unwrap();
         std::fs::write(dir.path().join("with$dollar.jl"), "").unwrap();
-        std::fs::write(dir.path().join(".hidden"), "").unwrap();
+        std::fs::write(dir.path().join(".hidden.jl"), "").unwrap();
         std::fs::write(dir.path().join("sub/model.jl"), "").unwrap();
         let items = |raw: &str, cursor| {
             complete_literal(raw, cursor, dir.path(), |byte| {
@@ -383,9 +401,14 @@ mod tests {
         };
         let labels =
             |items: &[CompletionItem]| items.iter().map(|i| i.label.clone()).collect::<Vec<_>>();
-        assert_eq!(labels(&items("sol", 3)), ["solver.data", "solver.jl"]);
-        assert!(!labels(&items("", 0)).contains(&".hidden".to_string()));
-        assert_eq!(labels(&items(".h", 2)), [".hidden"]);
+        assert_eq!(labels(&items("sol", 3)), ["solver.jl"]);
+        assert_eq!(labels(&items("main", 4)), ["main.jl", "main_parts"]);
+        assert!(
+            !labels(&items("", 0))
+                .iter()
+                .any(|name| name.ends_with(".toml") || name == ".hidden.jl")
+        );
+        assert_eq!(labels(&items(".h", 2)), [".hidden.jl"]);
         assert_eq!(labels(&items("./sub/mo", 8)), ["model.jl"]);
         assert_eq!(labels(&items("suF/tail.jl", 2)), ["sub", "suffix"]);
         let first = &items("suF/tail.jl", 2)[0];

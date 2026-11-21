@@ -2406,7 +2406,7 @@ fn serves_completion_and_resolve() {
             );
             assert_eq!(
                 result["capabilities"]["completionProvider"]["triggerCharacters"],
-                serde_json::json!([".", "@", "\\", " ", ":", ",", ";", "/"]),
+                serde_json::json!([".", "@", "\\", " ", ":", ",", ";", "/", "\""]),
             );
         }
         other => panic!("expected an InitializeResult, got {other:?}"),
@@ -3849,6 +3849,93 @@ fn recv_response(client: &Connection, id: RequestId) -> lsp_server::Response {
             other => panic!("unexpected message: {other:?}"),
         }
     }
+}
+
+#[test]
+fn static_include_completes_only_julia_files_and_directories() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new("fatou-lsp-include-source-only");
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || fatou::lsp::serve(&server).unwrap());
+    initialize_with_root(&client, &file_uri(&dir.path));
+    let src = dir.path.join("src");
+    std::fs::create_dir_all(src.join("main_parts")).unwrap();
+    for rel in ["main.jl", "main.toml", "main.data", "Project.toml"] {
+        std::fs::write(src.join(rel), "").unwrap();
+    }
+    std::fs::write(dir.path.join("main_wrong_root.jl"), "").unwrap();
+    let regular = serde_json::json!({"triggerKind": 1});
+    let quote = serde_json::json!({"triggerKind": 2, "triggerCharacter": "\""});
+    let expected = ["main.jl", "main_parts"];
+    for (i, (body, context, expected)) in [
+        ("include(\"main│\")", &regular, expected.as_slice()),
+        ("include(\"main│", &regular, expected.as_slice()),
+        (
+            "include(\"main│\nfunction after_cursor()\nend\n",
+            &regular,
+            expected.as_slice(),
+        ),
+        ("include(\"ma│in.jl\")", &regular, expected.as_slice()),
+        ("include(\"│\")", &quote, expected.as_slice()),
+        ("include(\"absent│\")", &regular, &[]),
+        ("println(\"│\")", &quote, &[]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let uri = file_uri(&src.join(format!("caller-{i}.jl")));
+        let mut source = format!("function main()\n    nothing\nend\n{body}");
+        let offset = source.find('│').unwrap();
+        source.remove(offset);
+        let position = LineIndex::new(&source).byte_to_position(offset, PositionEncoding::Utf16);
+        open_document(&client, &uri, &source);
+        let id = RequestId::from(i as i32 + 20);
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: id.clone(),
+                method: "textDocument/completion".into(),
+                params: serde_json::json!({
+                    "textDocument": {"uri": uri}, "position": position, "context": context,
+                }),
+            }))
+            .unwrap();
+        let response = recv_response(&client, id);
+        let items =
+            serde_json::from_value::<Vec<CompletionItem>>(response.result().unwrap()).unwrap();
+        let labels = items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>();
+        assert_eq!(labels, expected, "{body}");
+        if let Some(item) = items.first() {
+            assert_eq!(item.kind, Some(lsp_types::CompletionItemKind::FILE));
+            let start = lsp_types::Position::new(3, 9);
+            let end = lsp_types::Position::new(3, [13, 13, 13, 16, 9][i]);
+            assert_eq!(
+                item.text_edit,
+                Some(lsp_types::CompletionTextEdit::Edit(
+                    lsp_types::TextEdit::new(lsp_types::Range::new(start, end), "main.jl".into(),)
+                )),
+                "{body}"
+            );
+        }
+    }
+    let id = RequestId::from(99);
+    client
+        .sender
+        .send(Message::Request(Request {
+            id: id.clone(),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    assert!(recv_response(&client, id).result().is_some());
+    client
+        .sender
+        .send(Message::Notification(Notification {
+            method: "exit".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    server_thread.join().unwrap();
 }
 
 #[test]
