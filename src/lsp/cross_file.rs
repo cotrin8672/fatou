@@ -43,7 +43,7 @@ pub(crate) fn workspace_symbol_at(
 ) -> Option<OccurrenceKey> {
     let workspace = snapshot.workspace_member(path);
     Resolver::new(model, snapshot)
-        .with_workspace(workspace)
+        .with_workspace_at(workspace, Some(path))
         .workspace_symbol_at(offset)
 }
 

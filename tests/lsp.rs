@@ -6240,6 +6240,84 @@ fn poll_definition(
     }
 }
 
+#[test]
+fn definition_crosses_static_includes_from_the_named_package_entry() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new("fatou-lsp-package-entry-definition");
+    let depot = TempDir::new("fatou-lsp-package-entry-empty-depot");
+    let _guard = EnvGuard::set(&[
+        ("JULIA_PROJECT", dir.path.to_str().unwrap()),
+        ("JULIA_DEPOT_PATH", depot.path.to_str().unwrap()),
+        ("JULIA_BINDIR", ""),
+        ("PATH", ""),
+        ("HOME", depot.path.to_str().unwrap()),
+    ]);
+    let entry = dir.path.join("src/Harness.jl");
+    let helper = dir.path.join("src/util/helpers.jl");
+    let sibling = dir.path.join("src/caller.jl");
+    let nested = dir.path.join("src/nested.jl");
+    let entry_text = concat!(
+        "module Harness\n",
+        "include(\"util/helpers.jl\")\n",
+        "include(\"caller.jl\")\n",
+        "helper(2)\n",
+        "module Nested\n",
+        "include(\"nested.jl\")\n",
+        "helper(3)\n",
+        "end\n",
+        "end\n",
+    );
+    write_file(
+        &dir.path.join("Project.toml"),
+        "name = \"Harness\"\nuuid = \"aaaaaaaa-bbbb-cccc-dddd-000000000001\"\n",
+    );
+    write_file(&entry, entry_text);
+    write_file(&helper, "helper(x) = x + 1\n");
+    write_file(&sibling, "caller(x) = helper(x)\n");
+    write_file(&nested, "helper(x) = x + 2\n");
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || fatou::lsp::serve(&server).unwrap());
+    initialize_with_root(&client, &file_uri(&dir.path));
+    let entry_uri = file_uri(&entry);
+    let helper_uri = file_uri(&helper);
+    let sibling_uri = file_uri(&sibling);
+    let nested_uri = file_uri(&nested);
+    // Definitions must use the current target buffer, not on-disk coordinates.
+    open_document(&client, &helper_uri, "\n\nhelper(x) = x + 1\n");
+    open_document(&client, &entry_uri, entry_text);
+    open_document(&client, &sibling_uri, "caller(x) = helper(x)\n");
+    for (uri, position, target, line) in [
+        (&entry_uri, Position::new(3, 2), &helper_uri, 2),
+        (&sibling_uri, Position::new(0, 13), &helper_uri, 2),
+        (&entry_uri, Position::new(6, 2), &nested_uri, 0),
+    ] {
+        let loc = poll_definition(&client, uri, position, Duration::from_secs(10));
+        assert_eq!(&loc.uri, target);
+        assert_eq!(
+            loc.range,
+            Range::new(Position::new(line, 0), Position::new(line, 6))
+        );
+    }
+    let id = RequestId::from(9200);
+    client
+        .sender
+        .send(Message::Request(Request {
+            id: id.clone(),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    assert!(recv_response(&client, id).result().is_some());
+    client
+        .sender
+        .send(Message::Notification(Notification {
+            method: "exit".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    server_thread.join().unwrap();
+}
+
 /// Go-to-definition and hover on a `[deps]` name in an open `Project.toml`:
 /// the jump lands on the dependency's entry file, the hover reports what the
 /// environment resolved it to. Both ride the same route, so one initialized

@@ -511,7 +511,7 @@ fn free_read_locations<P: PackageSource>(
     encoding: PositionEncoding,
 ) -> Vec<Location> {
     match Resolver::new(model, packages)
-        .with_workspace(workspace.clone())
+        .with_workspace_at(workspace.clone(), super::uri::to_path(uri).as_deref())
         .resolve(name, offset, ns)
     {
         Resolution::Binding(bid) => binding_locations(model, uri, bid, line_index, encoding),

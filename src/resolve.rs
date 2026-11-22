@@ -335,6 +335,7 @@ struct WorkspaceCtx {
     /// `src/incremental.rs`). The file's top-level globals and free reads
     /// resolve against this module.
     host: ModulePath,
+    entry: bool,
 }
 
 impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
@@ -351,7 +352,40 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     /// (tier 2). Chain onto [`new`](Self::new) at a call site that knows the
     /// file's path, via [`PackageSource::workspace_member`].
     pub fn with_workspace(mut self, workspace: Option<(Arc<PackageIndex>, ModulePath)>) -> Self {
-        self.workspace = workspace.map(|(pkg, host)| WorkspaceCtx { pkg, host });
+        self.workspace = workspace.map(|(pkg, host)| WorkspaceCtx {
+            pkg,
+            host,
+            entry: false,
+        });
+        self
+    }
+
+    /// The package entry file's named wrapper is already represented by the
+    /// index root. Identity is based on the file path, not a same-name module
+    /// in an included file.
+    pub(crate) fn with_workspace_at(
+        self,
+        workspace: Option<(Arc<PackageIndex>, ModulePath)>,
+        path: Option<&std::path::Path>,
+    ) -> Self {
+        let is_entry = workspace
+            .as_ref()
+            .zip(path)
+            .is_some_and(|((pkg, host), path)| {
+                host.is_empty()
+                    && self.packages.package_root(&pkg.name).is_some_and(|root| {
+                        crate::incremental::normalize_path(path)
+                            == crate::incremental::normalize_path(&root.join(&pkg.root.loc.file))
+                    })
+            });
+        self.with_workspace(workspace)
+            .with_workspace_entry(is_entry)
+    }
+
+    pub(crate) fn with_workspace_entry(mut self, entry: bool) -> Self {
+        if let Some(workspace) = &mut self.workspace {
+            workspace.entry = entry;
+        }
         self
     }
 
@@ -371,7 +405,14 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     /// issued, at `scope` resolves against in the package's module tree.
     fn full_module_path(&self, workspace: &WorkspaceCtx, scope: ScopeId) -> ModulePath {
         let mut path = workspace.host.clone();
-        path.extend(self.model.enclosing_module_path(scope));
+        let lexical = self.model.enclosing_module_path(scope);
+        let wrapper = usize::from(
+            workspace.entry
+                && lexical
+                    .first()
+                    .is_some_and(|name| name == workspace.pkg.name.as_str()),
+        );
+        path.extend(lexical.into_iter().skip(wrapper));
         path
     }
 

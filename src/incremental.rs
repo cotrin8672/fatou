@@ -1180,7 +1180,7 @@ pub fn file_workspace_occurrences(
     let model = semantic_model(db, file);
     let packages = DbPackages(db);
     let map = Resolver::new(model, &packages)
-        .with_workspace(workspace_member_of(db, file))
+        .with_workspace_at(workspace_member_of(db, file), file.path(db).as_deref())
         .workspace_occurrences();
     WorkspaceOccurrences(map)
 }
@@ -1277,6 +1277,7 @@ fn context_workspace_occurrences(
     WorkspaceOccurrences(
         Resolver::new(model, &packages)
             .with_workspace(workspace)
+            .with_workspace_entry(file == entry)
             .workspace_occurrences(),
     )
 }
