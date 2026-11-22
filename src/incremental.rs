@@ -3128,19 +3128,31 @@ impl Analysis {
         let Some(input) = LibrarySyntaxInput::try_get(db) else {
             return self.library_package(name);
         };
-        let scoped = &input.data(db).scoped;
-        if scoped.owners.is_empty() || self.2.is_none() {
+        let data = input.data(db);
+        let scoped = &data.scoped;
+        let Some(context) = self.2.as_ref().filter(|_| !scoped.owners.is_empty()) else {
             return self.library_package(name);
-        }
-        if let Some(env) = self
-            .2
-            .as_ref()
-            .and_then(|context| context.source.path())
-            .and_then(|path| scoped.owners.get(path))
-            && let Some(pin) = env.pins.get(owner)
-            && (owner == name || pin.deps.contains(name))
+        };
+        if let Some(path) = context.source.path()
+            && let Some(env) = scoped.owners.get(path)
         {
-            return self.library_package_in_environment(name);
+            if matches!(
+                &context.source,
+                crate::parse_context::EditionSource::Project { .. }
+            ) && data.packages.get(owner).is_some_and(|package| {
+                matches!(&package.source,
+                        crate::parse_context::EditionSource::Project { path: project, .. }
+                        if project == path)
+            }) {
+                return self.library_package(name);
+            }
+            if env
+                .pins
+                .get(owner)
+                .is_some_and(|pin| owner == name || pin.deps.contains(name))
+            {
+                return self.library_package_in_environment(name);
+            }
         }
         scoped.system.get(name).map(|(pkg, _)| Arc::clone(pkg))
     }
@@ -3311,6 +3323,14 @@ impl PackageSource for Analysis {
 
     fn package(&self, name: &str) -> Option<Arc<PackageIndex>> {
         self.library_package(name)
+    }
+
+    fn environment_package(&self, name: &str) -> Option<Arc<PackageIndex>> {
+        self.library_package_in_environment(name)
+    }
+
+    fn dependency_package(&self, owner: &str, name: &str) -> Option<Arc<PackageIndex>> {
+        self.library_dependency_package(owner, name)
     }
 
     fn package_root(&self, name: &str) -> Option<PathBuf> {
