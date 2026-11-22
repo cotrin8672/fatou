@@ -53,6 +53,8 @@ use crate::text::{LineIndex, PositionEncoding, TextBuffer};
 use super::cross_file;
 use super::uri::from_path;
 
+mod script_includes;
+
 /// The definition sites of the symbol at `position` in `text`, re-parsing it.
 /// Pure and unit-testable; `uri` is the requesting document (so an intra-file
 /// result points back at it) and `packages` supplies the library plus its
@@ -129,11 +131,18 @@ pub(crate) fn definition_via_db(
             Some((snapshot, file)),
         ))
     }));
-    match cached {
+    let locations = match cached {
         Ok(Some(locations)) => locations,
         // Cache miss (`Ok(None)`) or a racing write (`Err`): re-parse from text.
         Ok(None) | Err(_) => compute_definition(uri, text, position, encoding, snapshot),
+    };
+    if !locations.is_empty() {
+        return locations;
     }
+    salsa::Cancelled::catch(AssertUnwindSafe(|| {
+        script_includes::locations(snapshot, path, text, offset, encoding)
+    }))
+    .unwrap_or_default()
 }
 
 /// Whether the workspace symbol `key` names a plain (unqualified) function of
