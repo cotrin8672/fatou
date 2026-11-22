@@ -760,6 +760,26 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                         add_unique_member(&mut result, origin)?;
                     }
                 }
+                // Standard modules open Core and Base; baremodule still opens
+                // Core, but not Base. Consider only this explicit re-export,
+                // and reject conflicting binding identities across open modules.
+                let systems: &[&str] = if module.bare {
+                    &["Core"]
+                } else {
+                    &["Base", "Core"]
+                };
+                for system in systems {
+                    if path.first().is_some_and(|head| head == *system) {
+                        continue;
+                    }
+                    let provider = [SmolStr::new(system)];
+                    if let Some(opened) = self.indexed_module_at(&provider)
+                        && module_exports(&opened, name)
+                    {
+                        let origin = self.member_origin(&provider, name, visiting)?;
+                        add_unique_member(&mut result, origin)?;
+                    }
+                }
             }
             result
         })();

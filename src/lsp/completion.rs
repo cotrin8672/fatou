@@ -3012,6 +3012,40 @@ mod tests {
     }
 
     #[test]
+    fn qualified_members_reexport_only_proven_implicit_system_bindings() {
+        let mut base = module("Base", &["base_fn", "unlisted", "contested", "unknown"]);
+        for name in ["base_fn", "unlisted", "contested"] {
+            base.functions.push(func(name));
+        }
+        let mut core = module("Core", &["core_fn"]);
+        core.functions.push(func("core_fn"));
+        let exported = ["base_fn", "core_fn", "unknown", "contested"];
+        let regular = module("Regular", &exported);
+        let mut bare = module("Bare", &exported);
+        bare.bare = true;
+        let mut other = module("Other", &["contested"]);
+        other.functions.push(func("contested"));
+        let mut conflict = module("Conflict", &["contested"]);
+        conflict.usings.push(crate::index::ModuleUsing {
+            leading_dots: 0,
+            components: vec!["Other".into()],
+        });
+        let lib = library(
+            vec![base, core, regular, bare, other, conflict]
+                .into_iter()
+                .map(package)
+                .collect(),
+        );
+        let labels_at = |name: &str| {
+            let src = format!("{name}.");
+            labels(&completions_at(&src, &src, &lib))
+        };
+        assert_eq!(labels_at("Regular"), ["base_fn", "core_fn", "contested"]);
+        assert_eq!(labels_at("Bare"), ["core_fn"]);
+        assert!(labels_at("Conflict").is_empty());
+    }
+
+    #[test]
     fn member_context_lists_defined_names_and_submodules() {
         let mut root = module("A", &[]);
         root.functions.push(func("foo"));
