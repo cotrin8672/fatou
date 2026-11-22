@@ -1795,19 +1795,19 @@ fn append_imported_members<P: PackageSource>(
     macro_member: bool,
     items: &mut Vec<CompletionItem>,
 ) {
-    if module.import_bindings.is_empty() && (module.usings.is_empty() || module.exports.is_empty())
-    {
+    if module.import_bindings.is_empty() && module.exports.is_empty() {
         return;
     }
-    let mut visited: std::collections::HashSet<String> =
-        items.iter().map(|item| item.label.clone()).collect();
+    let mut visited: std::collections::HashSet<&str> =
+        items.iter().map(|item| item.label.as_str()).collect();
+    let mut imported = Vec::new();
     for label in module
         .import_bindings
         .iter()
         .map(|import| &import.local)
         .chain(module.exports.iter().map(|export| &export.name))
     {
-        if label.starts_with('@') != macro_member || !visited.insert(label.clone()) {
+        if label.starts_with('@') != macro_member || !visited.insert(label.as_str()) {
             continue;
         }
         let Some(origin) = resolver.qualified_member_origin(path, label) else {
@@ -1831,8 +1831,9 @@ fn append_imported_members<P: PackageSource>(
             }
         };
         item.label.clone_from(label);
-        items.push(item);
+        imported.push(item);
     }
+    items.extend(imported);
 }
 
 /// Keep candidate templates only after resolving the receiver in its actual
