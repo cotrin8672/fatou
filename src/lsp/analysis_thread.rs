@@ -119,7 +119,7 @@ pub(crate) enum LibraryMessage {
     },
     Syntax {
         generation: u64,
-        variants: Vec<(String, ParseOptions, Arc<PackageIndex>)>,
+        variants: Vec<(String, PathBuf, ParseOptions, Arc<PackageIndex>)>,
     },
 }
 

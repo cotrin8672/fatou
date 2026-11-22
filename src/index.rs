@@ -15,7 +15,7 @@ pub mod harvest;
 pub mod model;
 pub mod typeexpr;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -110,6 +110,34 @@ pub struct LibrarySyntax {
     /// Project and manifest paths both identify an environment. Name masking
     /// keeps the library's existing first-environment precedence.
     pub environments: BTreeMap<PathBuf, BTreeMap<String, crate::parse_context::EditionSource>>,
+    /// The selected dependency roots retained across independent environments.
+    /// The legacy name-keyed view is kept for workspace-wide operations; a
+    /// document-scoped resolver must not inherit its first-folder masking.
+    #[doc(hidden)]
+    pub scoped: ScopedLibrary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ScopedLibrary {
+    pub(crate) owners: BTreeMap<PathBuf, Arc<ScopedEnvironment>>,
+    pub(crate) variants:
+        BTreeMap<(String, PathBuf, crate::parser::ParseOptions), Arc<PackageIndex>>,
+    pub(crate) system: BTreeMap<String, (Arc<PackageIndex>, Option<PathBuf>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopedEnvironment {
+    pub(crate) project: PathBuf,
+    pub(crate) direct_deps: BTreeMap<String, crate::environment::Uuid>,
+    pub(crate) pins: BTreeMap<String, ScopedPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopedPin {
+    pub(crate) uuid: crate::environment::Uuid,
+    pub(crate) syntax: PackageSyntax,
+    pub(crate) deps: BTreeSet<String>,
 }
 
 /// The module names a package's own source files may `using`/`import`: its
@@ -125,6 +153,19 @@ impl PackageSyntax {
             "Core" => "boot.jl".to_string(),
             _ => format!("src/{name}.jl"),
         }))
+    }
+}
+
+impl ScopedLibrary {
+    fn keep_system(
+        &mut self,
+        packages: &BTreeMap<String, Arc<PackageIndex>>,
+        roots: &BTreeMap<String, PathBuf>,
+    ) {
+        self.system = packages
+            .iter()
+            .map(|(name, index)| (name.clone(), (Arc::clone(index), roots.get(name).cloned())))
+            .collect();
     }
 }
 
@@ -433,6 +474,7 @@ fn project_files(envs: &[Environment]) -> BTreeMap<String, PathBuf> {
 pub fn harvest_libraries(envs: &[Environment]) -> HarvestedLibrary {
     let install = envs.iter().find_map(|env| env.install.as_ref());
     let mut lib = build_system_library(install);
+    lib.syntax.scoped.keep_system(&lib.packages, &lib.roots);
     // Names claimed by an earlier environment's manifest: a later environment
     // pinning the same package (possibly at another version) is skipped. Within
     // one environment a manifest package still overwrites a same-named system
@@ -478,7 +520,7 @@ pub fn harvest_libraries(envs: &[Environment]) -> HarvestedLibrary {
     lib.declared_deps = declared_deps(envs);
     lib.project_files = projects;
     lib.deps = dep_meta(envs);
-    install_syntax(envs, &mut lib);
+    install_syntax(envs, &mut lib, None);
     lib
 }
 
@@ -513,6 +555,7 @@ pub(crate) fn harvest_libraries_parallel_inner(
 
     let install = envs.iter().find_map(|env| env.install.as_ref());
     let mut lib = build_system_library_cached(install, cache, pool);
+    lib.syntax.scoped.keep_system(&lib.packages, &lib.roots);
 
     // Registered packages with a resolved source, deduped by name with the first
     // environment winning — the same claim rule as `harvest_libraries`.
@@ -564,13 +607,13 @@ pub(crate) fn harvest_libraries_parallel_inner(
     lib.declared_deps = declared_deps(envs);
     lib.project_files = projects;
     lib.deps = dep_meta(envs);
-    install_syntax(envs, &mut lib);
+    install_syntax(envs, &mut lib, cache);
     lib
 }
 
 /// Track syntax for every resolved pin. Only the checkout selected by name
 /// contributes symbols to the library.
-fn install_syntax(envs: &[Environment], lib: &mut HarvestedLibrary) {
+fn install_syntax(envs: &[Environment], lib: &mut HarvestedLibrary, cache: Option<&IndexCache>) {
     use crate::incremental::normalize_path;
     use crate::parse_context::{
         ContextCatalog, EditionSource, SourceContext, SourceRole, dependency_edition_source,
@@ -594,6 +637,11 @@ fn install_syntax(envs: &[Environment], lib: &mut HarvestedLibrary) {
         let project = normalize_path(&env.project_file);
         let manifest = env.manifest_file.as_deref().map(normalize_path);
         let mut sources = BTreeMap::new();
+        let mut scope = ScopedEnvironment {
+            project: project.clone(),
+            direct_deps: env.direct_deps.clone(),
+            pins: BTreeMap::new(),
+        };
         for package in &env.packages {
             let Some(root) = &package.source else {
                 continue;
@@ -604,6 +652,42 @@ fn install_syntax(envs: &[Environment], lib: &mut HarvestedLibrary) {
                 .map(|root| normalize_path(root))
                 == Some(normalize_path(root));
             let source = dependency_edition_source(package, root, manifest.as_deref());
+            let options = ParseOptions {
+                syntax_edition: package.syntax_edition,
+            };
+            if package.kind != crate::environment::PackageKind::Stdlib {
+                let normalized = normalize_path(root);
+                let key = (package.name.clone(), normalized.clone(), options);
+                lib.syntax.scoped.variants.entry(key).or_insert_with(|| {
+                    if indexed
+                        && !lib.workspaces.contains(&package.name)
+                        && lib
+                            .syntax
+                            .packages
+                            .get(&package.name)
+                            .is_none_or(|primary| primary.options == options)
+                    {
+                        Arc::clone(&lib.packages[&package.name])
+                    } else {
+                        harvest_package_cached(&package.name, root, package, cache)
+                    }
+                });
+                let candidate = ScopedPin {
+                    uuid: package.uuid,
+                    syntax: PackageSyntax {
+                        root: normalized,
+                        source: source.clone(),
+                        options,
+                    },
+                    deps: package.deps.iter().cloned().collect(),
+                };
+                // A direct project UUID chooses among same-name pins.
+                if env.direct_deps.get(&package.name) == Some(&package.uuid) {
+                    scope.pins.insert(package.name.clone(), candidate);
+                } else {
+                    scope.pins.entry(package.name.clone()).or_insert(candidate);
+                }
+            }
             unindexed_roots.extend(package.extension_entries(root).map(|entry| SourceContext {
                 entry,
                 source: source.clone(),
@@ -621,9 +705,6 @@ fn install_syntax(envs: &[Environment], lib: &mut HarvestedLibrary) {
                 }
                 continue;
             }
-            let options = ParseOptions {
-                syntax_edition: package.syntax_edition,
-            };
             sources.insert(package.name.clone(), source.clone());
             if !lib.syntax.packages.contains_key(&package.name) {
                 lib.syntax.variants.insert(
@@ -683,8 +764,18 @@ fn install_syntax(envs: &[Environment], lib: &mut HarvestedLibrary) {
                 sources.insert(dev.name, source);
             }
         }
+        let scope = Arc::new(scope);
+        lib.syntax
+            .scoped
+            .owners
+            .insert(project.clone(), Arc::clone(&scope));
         lib.syntax.environments.insert(project, sources.clone());
         if let Some(manifest) = manifest {
+            lib.syntax
+                .scoped
+                .owners
+                .entry(manifest.clone())
+                .or_insert(scope);
             lib.syntax.environments.insert(manifest, sources);
         }
     }

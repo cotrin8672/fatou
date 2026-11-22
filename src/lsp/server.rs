@@ -682,7 +682,7 @@ fn spawn_workspace_harvester(
                                         Arc::new(crate::index::harvest_package_with_options(
                                             &root, &name, options,
                                         ));
-                                    (name, options, index)
+                                    (name, root, options, index)
                                 })
                                 .collect();
                             if library_tx

@@ -846,6 +846,27 @@ pub fn project_declared_deps(
     Some(Arc::new(project.declared_dep_names()))
 }
 
+/// Importable project UUIDs, independent of formatting and unrelated TOML.
+#[salsa::tracked(returns(ref))]
+fn project_import_ids(
+    db: &dyn IncrementalDb,
+    file: SourceFile,
+) -> Option<BTreeMap<String, crate::environment::Uuid>> {
+    let path = file
+        .path(db)
+        .as_deref()
+        .unwrap_or_else(|| Path::new("Project.toml"));
+    let project = crate::environment::parse_project_text(path, file.text(db)).ok()?;
+    Some(
+        project
+            .weakdeps
+            .into_iter()
+            .chain(project.deps)
+            .filter_map(|(name, uuid)| Some((name.into_inner(), uuid.into_inner().parse().ok()?)))
+            .collect(),
+    )
+}
+
 /// One unresolvable static `include("literal")` site: the decoded `path` written
 /// in `from` whose target is not a package member (the file does not exist or
 /// was not reached). Range-free — the include call's span is recovered from a
@@ -1773,6 +1794,7 @@ impl IncrementalDatabase {
                     .map(|context| &context.source),
             )
             .filter_map(|source| source.path())
+            .chain(data.scoped.owners.keys().map(PathBuf::as_path))
             .collect();
         for path in metadata {
             self.seed_disk_file(path);
@@ -1789,18 +1811,38 @@ impl IncrementalDatabase {
         options: ParseOptions,
         index: Arc<PackageIndex>,
     ) {
-        self.install_syntax_variants([(name, options, index)]);
+        let Some(root) = LibrarySyntaxInput::get(self)
+            .data(self)
+            .packages
+            .get(&name)
+            .map(|package| package.root.clone())
+        else {
+            return;
+        };
+        self.install_syntax_variants([(name, root, options, index)]);
     }
 
     pub(crate) fn install_syntax_variants(
         &mut self,
-        variants: impl IntoIterator<Item = (String, ParseOptions, Arc<PackageIndex>)>,
+        variants: impl IntoIterator<Item = (String, PathBuf, ParseOptions, Arc<PackageIndex>)>,
     ) {
         let input = LibrarySyntaxInput::get(self);
         let mut data = (**input.data(self)).clone();
-        for (name, options, index) in variants {
-            if data.packages.contains_key(&name) {
-                data.variants.insert((name, options), index);
+        for (name, root, options, index) in variants {
+            if data
+                .packages
+                .get(&name)
+                .is_some_and(|package| package.root == root)
+            {
+                data.variants
+                    .insert((name.clone(), options), Arc::clone(&index));
+            }
+            if data.scoped.owners.values().any(|env| {
+                env.pins
+                    .get(&name)
+                    .is_some_and(|pin| pin.syntax.root == root)
+            }) {
+                data.scoped.variants.insert((name, root, options), index);
             }
         }
         data.rebuild_memberships();
@@ -1868,9 +1910,25 @@ impl IncrementalDatabase {
                 }
             }
         }
-        work.into_iter()
+        let mut work: BTreeSet<_> = work
+            .into_iter()
             .map(|((name, options), root)| (name, root, options))
-            .collect()
+            .collect();
+        for env in data.scoped.owners.values() {
+            for (name, pin) in &env.pins {
+                let selected = select_edition_source(self, &pin.syntax.source);
+                if selected.certain
+                    && !data.scoped.variants.contains_key(&(
+                        name.clone(),
+                        pin.syntax.root.clone(),
+                        selected.options,
+                    ))
+                {
+                    work.insert((name.clone(), pin.syntax.root.clone(), selected.options));
+                }
+            }
+        }
+        work.into_iter().collect()
     }
 
     /// Install loading contexts without replacing authoritative live text.
@@ -2607,6 +2665,8 @@ pub struct Analysis(
     Option<SourceContext>,
 );
 
+type ScopedLibraryResult = (Arc<PackageIndex>, Option<PathBuf>);
+
 impl Analysis {
     /// Capture a read's editions before dispatch, including documents still
     /// queued for their first analysis and therefore lacking a Salsa input.
@@ -2961,7 +3021,85 @@ impl Analysis {
 
     /// The harvested index for package `name`, if present.
     pub fn library_package(&self, name: &str) -> Option<Arc<PackageIndex>> {
+        if let Some(scoped) = self.scoped_library_lookup(name) {
+            return scoped.map(|(index, _)| index);
+        }
         library_package_for_context(&self.0, name, self.2.as_ref())
+    }
+
+    /// Outer None denotes a legacy/manual index without environment facts.
+    /// A known missing pin must not use the merged first-workspace index.
+    fn scoped_library_lookup(&self, name: &str) -> Option<Option<ScopedLibraryResult>> {
+        use crate::parse_context::EditionSource;
+        let db = &self.0;
+        let context = self.2.as_ref()?;
+        let data = LibrarySyntaxInput::try_get(db)?.data(db);
+        let scoped = &data.scoped;
+        if scoped.owners.is_empty() {
+            return None;
+        }
+        if let Some(env) = context
+            .source
+            .path()
+            .and_then(|path| scoped.owners.get(path))
+        {
+            if let EditionSource::Project { path, .. } = &context.source
+                && let Some(workspace) = data.packages.get(name)
+                && matches!(&workspace.source, EditionSource::Project { path: owner, .. } if owner == path)
+            {
+                return Some(
+                    library_package_for_context(db, name, Some(context))
+                        .map(|index| (index, Some(workspace.root.clone()))),
+                );
+            }
+
+            if let Some(pin) = env.pins.get(name) {
+                let visible = match &context.source {
+                    EditionSource::Project { .. } => {
+                        let metadata = SyntaxContexts::try_get(db);
+                        let imports = if metadata
+                            .is_some_and(|input| input.unavailable(db).contains(&env.project))
+                        {
+                            None
+                        } else {
+                            metadata
+                                .and_then(|input| input.metadata(db).get(&env.project))
+                                .map_or(Some(&env.direct_deps), |file| {
+                                    project_import_ids(db, *file).as_ref()
+                                })
+                        };
+                        imports.and_then(|ids| ids.get(name)) == Some(&pin.uuid)
+                    }
+                    EditionSource::Manifest { name: owner, .. } => {
+                        env.pins.get(owner).is_some_and(|owner_pin| {
+                            (owner == name && owner_pin.syntax.entry(name) == context.entry)
+                                || owner_pin.deps.contains(name)
+                        })
+                    }
+                    EditionSource::Fixed(_) => false,
+                };
+                if visible {
+                    let selection = select_edition_source(db, &pin.syntax.source);
+                    return Some(
+                        selection
+                            .certain
+                            .then(|| {
+                                scoped
+                                    .variants
+                                    .get(&(
+                                        name.to_owned(),
+                                        pin.syntax.root.clone(),
+                                        selection.options,
+                                    ))
+                                    .map(|index| (Arc::clone(index), Some(pin.syntax.root.clone())))
+                            })
+                            .flatten(),
+                    );
+                }
+            }
+        }
+        // Stdlib is available via the separate Julia stdlib load path.
+        Some(scoped.system.get(name).cloned())
     }
 
     /// Exact environment membership for optional auto-import edits: a direct
@@ -2975,6 +3113,22 @@ impl Analysis {
     ) -> Option<Arc<PackageIndex>> {
         let input = LibrarySyntaxInput::try_get(&self.0)?;
         let data = input.data(&self.0);
+        if let Some(env) = data.scoped.owners.get(project) {
+            let pin = env.pins.get(name)?;
+            if pin.uuid != uuid {
+                return None;
+            }
+            let selected = select_edition_source(&self.0, &pin.syntax.source);
+            return selected
+                .certain
+                .then(|| {
+                    data.scoped
+                        .variants
+                        .get(&(name.to_owned(), pin.syntax.root.clone(), selected.options))
+                        .cloned()
+                })
+                .flatten();
+        }
         let source = data.environments.get(project)?.get(name)?;
         match source {
             crate::parse_context::EditionSource::Manifest {
@@ -2991,6 +3145,9 @@ impl Analysis {
     /// The absolute source root of package `name`, if the live server has
     /// located the depot and harvested it.
     pub fn package_root(&self, name: &str) -> Option<PathBuf> {
+        if let Some(scoped) = self.scoped_library_lookup(name) {
+            return scoped.and_then(|(_, root)| root);
+        }
         self.0.package_root(name)
     }
 
@@ -3125,6 +3282,94 @@ impl PackageSource for Analysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_symbols_follow_the_requesting_project_and_pinned_root() {
+        use crate::environment::{EnvContext, resolve};
+        use crate::parse_context::{EditionSource, SourceRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "f40b7862-c9d5-4cbf-b942-c5d1e1530915";
+        let extra = "6a71b75c-3ba3-4d40-b6b7-82c2ef293641";
+        let setup = |folder: &str, member: &str, with_extra: bool| {
+            let root = dir.path().join(folder);
+            let project = root.join("Project.toml");
+            std::fs::create_dir_all(root.join("widget/src")).unwrap();
+            std::fs::write(
+                root.join("widget/src/Widget.jl"),
+                format!("module Widget\n{member}() = nothing\nend\n"),
+            )
+            .unwrap();
+            let mut deps = format!("[deps]\nWidget = '{uuid}'\n");
+            let mut pins = format!(
+                "manifest_format = '2.0'\n[[deps.Widget]]\nuuid = '{uuid}'\npath = 'widget'\n"
+            );
+            if with_extra {
+                std::fs::create_dir_all(root.join("extra/src")).unwrap();
+                std::fs::write(root.join("extra/src/Extra.jl"), "module Extra\nend\n").unwrap();
+                deps.push_str(&format!("Extra = '{extra}'\n"));
+                pins.push_str(&format!(
+                    "[[deps.Extra]]\nuuid = '{extra}'\npath = 'extra'\n"
+                ));
+            }
+            std::fs::write(&project, deps).unwrap();
+            std::fs::write(root.join("Manifest.toml"), pins).unwrap();
+            let ctx = EnvContext {
+                workspace_root: root.clone(),
+                julia_project: Some("@.".into()),
+                julia_depot_path: Some(String::new()),
+                home: None,
+                julia_bindir: None,
+                path: None,
+            };
+            let source = SourceContext {
+                entry: normalize_path(&root.join("script.jl")),
+                source: EditionSource::Project {
+                    path: normalize_path(&project),
+                    role: SourceRole::Script,
+                },
+            };
+            (resolve(&ctx).unwrap().unwrap(), source)
+        };
+        let (left, left_source) = setup("left", "only_left", false);
+        let (right, right_source) = setup("right", "only_right", true);
+        let lib = crate::index::harvest_libraries(&[left, right]);
+        let mut db = IncrementalDatabase::new();
+        db.set_library_syntax(lib.syntax);
+        {
+            let snap = db.snapshot();
+            let l = snap.with_context(left_source.clone(), ParseOptions::default());
+            let r = snap.with_context(right_source, ParseOptions::default());
+            let members = |view: &Analysis| {
+                let pkg = view.library_package("Widget").unwrap();
+                pkg.root
+                    .functions
+                    .iter()
+                    .map(|function| function.name.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(members(&l), ["only_left"]);
+            assert_eq!(members(&r), ["only_right"]);
+            assert_eq!(
+                l.package_root("Widget"),
+                Some(normalize_path(&dir.path().join("left/widget")))
+            );
+            assert_eq!(
+                r.package_root("Widget"),
+                Some(normalize_path(&dir.path().join("right/widget")))
+            );
+            assert!(l.library_package("Extra").is_none());
+            assert!(r.library_package("Extra").is_some());
+        }
+        db.upsert_file(&dir.path().join("left/Project.toml"), "[deps]\n");
+        let l = db
+            .snapshot()
+            .with_context(left_source, ParseOptions::default());
+        assert!(
+            l.library_package("Widget").is_none(),
+            "retained Manifest must not make a removed direct dep visible"
+        );
+    }
 
     #[test]
     fn equivalent_metadata_keeps_parses_and_switching_editions_reuses_each_view() {
