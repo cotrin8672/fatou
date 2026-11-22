@@ -28,7 +28,7 @@ use super::completion::{
     CompletionTrigger, completion_for_path_trigger, completion_for_punctuation_trigger,
     completion_via_db, resolve_completion,
 };
-use super::definition::definition_via_db;
+use super::definition::{OpenDefinitionBuffers, definition_with_open_buffers};
 use super::document_link::document_links_via_db;
 use super::folding::folding_ranges_via_db;
 use super::format::{format_edits_via_db, format_range_edits_via_db};
@@ -261,6 +261,7 @@ pub(crate) enum ReadJob {
         path: PathBuf,
         text: Arc<TextBuffer>,
         position: Position,
+        open: Arc<OpenDefinitionBuffers>,
         sender: ReadReply,
     },
     /// Go-to-definition in an open *project file*: a `[deps]` name resolves to
@@ -1202,9 +1203,12 @@ fn run_read_single(
             path,
             text,
             position,
+            open,
             sender,
         } => {
-            let locations = definition_via_db(&snapshot, &uri, &path, &text, position, encoding);
+            let locations = definition_with_open_buffers(
+                &snapshot, &uri, &path, &text, position, encoding, &open,
+            );
             let _ = sender.send(Message::Response(Response::new_ok(
                 id,
                 goto_response(locations),

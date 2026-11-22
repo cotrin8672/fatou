@@ -813,10 +813,20 @@ impl GlobalState {
             return;
         };
         let reply = self.read_reply(id.clone(), Some(&uri));
+        let open = self
+            .documents
+            .iter()
+            .filter(|(target, doc)| *target != &uri && doc.kind == DocumentKind::Julia)
+            .filter_map(|(uri, doc)| {
+                let path = crate::incremental::normalize_path(&uri::to_path(uri)?);
+                Some((path, Arc::clone(&doc.text)))
+            })
+            .collect();
         self.dispatch_read(ReadJob::Definition {
             id,
             path: path_for(&uri),
             position,
+            open: Arc::new(open),
             uri,
             text,
             sender: reply,

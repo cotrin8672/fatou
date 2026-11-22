@@ -36,6 +36,7 @@ pub(super) fn locations(
     text: &str,
     offset: TextSize,
     encoding: PositionEncoding,
+    open: &super::OpenDefinitionBuffers,
 ) -> Vec<Location> {
     // Package members already have dependency-aware include indexes. Keep
     // ordinary scripts and entry points separate from that resolution.
@@ -98,6 +99,8 @@ pub(super) fn locations(
         }
         let source = if member.path == path {
             Arc::from(text)
+        } else if let Some(buffer) = open.get(&member.path) {
+            buffer.text_arc()
         } else {
             match bounded_source(snapshot, &member.path) {
                 Ok(Some(source)) => source,

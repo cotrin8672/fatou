@@ -31,6 +31,7 @@
 //! their local definitions, and Julia-bearing fences use ordinary Julia
 //! navigation with ranges mapped back into the docstring source.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,6 +88,7 @@ pub fn compute_definition<P: PackageSource>(
 /// buffer for `path` still matches `text`; otherwise re-parse. A write racing the
 /// read trips `salsa::Cancelled`, which also falls back to a fresh parse. Mirrors
 /// [`hover_via_db`](super::hover::hover_via_db).
+#[cfg(test)]
 pub(crate) fn definition_via_db(
     snapshot: &Analysis,
     uri: &Uri,
@@ -94,6 +96,32 @@ pub(crate) fn definition_via_db(
     text: &TextBuffer,
     position: Position,
     encoding: PositionEncoding,
+) -> Vec<Location> {
+    definition_with_open_buffers(
+        snapshot,
+        uri,
+        path,
+        text,
+        position,
+        encoding,
+        &HashMap::new(),
+    )
+}
+
+pub(crate) type OpenDefinitionBuffers = HashMap<PathBuf, Arc<TextBuffer>>;
+
+/// Versioned source text from the main loop can be newer than the analysis
+/// queue's Salsa inputs. Do not return disk/old buffer coordinates as if they
+/// addressed the editor's current target. Rebuild a proven workspace symbol
+/// from the authoritative buffer; otherwise omit an unverified stale target.
+pub(crate) fn definition_with_open_buffers(
+    snapshot: &Analysis,
+    uri: &Uri,
+    path: &Path,
+    text: &TextBuffer,
+    position: Position,
+    encoding: PositionEncoding,
+    open: &OpenDefinitionBuffers,
 ) -> Vec<Location> {
     let line_index = text.line_index();
     let offset = TextSize::new(line_index.position_to_byte(position, encoding) as u32);
@@ -114,13 +142,15 @@ pub(crate) fn definition_via_db(
             // A non-empty cross-file result wins; an empty one (member set not
             // seeded yet) falls through to the intra-file answer.
             if !locations.is_empty() {
-                return Some(locations);
+                return Some(live_definition_targets(
+                    snapshot, uri, path, text, offset, encoding, open, locations, true,
+                ));
             }
         }
         let workspace = snapshot.workspace_member(path);
         // The inner `Vec` is the definition sites (a cursor on nothing definable
         // is legitimately empty); the outer `Option` distinguishes a cache miss.
-        Some(definition_for(
+        let locations = definition_for(
             model,
             snapshot,
             workspace,
@@ -129,20 +159,121 @@ pub(crate) fn definition_via_db(
             offset,
             encoding,
             Some((snapshot, file)),
+        );
+        Some(live_definition_targets(
+            snapshot, uri, path, text, offset, encoding, open, locations, false,
         ))
     }));
     let locations = match cached {
         Ok(Some(locations)) => locations,
-        // Cache miss (`Ok(None)`) or a racing write (`Err`): re-parse from text.
-        Ok(None) | Err(_) => compute_definition(uri, text, position, encoding, snapshot),
+        // Re-parse the live caller. A canceled snapshot must not bypass
+        // verification of another editor buffer's coordinate system.
+        Ok(None) | Err(_) => salsa::Cancelled::catch(AssertUnwindSafe(|| {
+            live_definition_targets(
+                snapshot,
+                uri,
+                path,
+                text,
+                offset,
+                encoding,
+                open,
+                compute_definition(uri, text, position, encoding, snapshot),
+                false,
+            )
+        }))
+        .unwrap_or_default(),
     };
     if !locations.is_empty() {
         return locations;
     }
     salsa::Cancelled::catch(AssertUnwindSafe(|| {
-        script_includes::locations(snapshot, path, text, offset, encoding)
+        script_includes::locations(snapshot, path, text, offset, encoding, open)
     }))
     .unwrap_or_default()
+}
+
+/// An occurrence bucket is already based on tracked buffers, while ordinary
+/// library locations use harvested disk spans. Compare against the right
+/// source, not merely a line number that might still be in bounds.
+#[allow(clippy::too_many_arguments)]
+fn live_definition_targets(
+    snapshot: &Analysis,
+    caller: &Uri,
+    path: &Path,
+    text: &TextBuffer,
+    offset: TextSize,
+    encoding: PositionEncoding,
+    open: &OpenDefinitionBuffers,
+    mut locations: Vec<Location>,
+    tracked: bool,
+) -> Vec<Location> {
+    let mut checked = HashMap::new();
+    let mut stale = HashMap::new();
+    locations.retain(|location| {
+        if &location.uri == caller || open.is_empty() {
+            return true;
+        }
+        *checked.entry(location.uri.clone()).or_insert_with(|| {
+            let Some(target) = super::uri::to_path(&location.uri).map(|path| normalize_path(&path))
+            else {
+                return true;
+            };
+            let Some(buffer) = open.get(&target) else {
+                return true;
+            };
+            let unchanged = if tracked {
+                snapshot
+                    .lookup_file(&target)
+                    .is_some_and(|file| snapshot.file_text(file) == buffer.text())
+            } else {
+                std::fs::read_to_string(&target).is_ok_and(|disk| disk == buffer.text())
+            };
+            if !unchanged {
+                stale.insert(location.uri.clone(), target);
+            }
+            unchanged
+        })
+    });
+    if stale.is_empty() {
+        return locations;
+    }
+    let caller_tree = parse_with_options(text, snapshot.options_for_path(path)).cst;
+    let caller_model = SemanticModel::build(&caller_tree);
+    let Some(symbol) = cross_file::workspace_symbol_at(snapshot, path, &caller_model, offset)
+    else {
+        return locations;
+    };
+    for (uri, target) in stale {
+        let Some((pkg, host)) = snapshot.workspace_member(&target) else {
+            continue;
+        };
+        if pkg.name != symbol.package {
+            continue;
+        }
+        let buffer = &open[&target];
+        let tree = parse_with_options(buffer, snapshot.options_for_path(&target)).cst;
+        let model = SemanticModel::build(&tree);
+        let by_symbol = Resolver::new(&model, snapshot)
+            .with_workspace_at(Some((pkg, host)), Some(&target))
+            .workspace_occurrences();
+        if let Some(records) = by_symbol.get(&symbol) {
+            locations.extend(
+                records
+                    .iter()
+                    .filter(|rec| rec.is_def || rec.access == Access::Write)
+                    .map(|rec| self_location(&uri, rec.range, &buffer.line_index(), encoding)),
+            );
+        }
+    }
+    locations.sort_by(|a, b| {
+        (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+            b.uri.as_str(),
+            b.range.start.line,
+            b.range.start.character,
+        ))
+    });
+    locations.dedup();
+    locations
 }
 
 /// Whether the workspace symbol `key` names a plain (unqualified) function of
@@ -1591,6 +1722,45 @@ mod tests {
             Utf16,
         );
         assert_eq!(locs.len(), 2, "{locs:?}");
+    }
+
+    #[test]
+    fn cross_file_definition_never_uses_queued_target_disk_coordinates() {
+        use crate::lsp::cross_file::test_support::{member_path, workspace_db};
+        use crate::text::PositionEncoding::Utf16;
+
+        let callee = "greet(a) = a\ngreet(a, b) = a\n";
+        let caller = "callit() = greet(2)\n";
+        let (db, _) = workspace_db(&["greet"], &[("a.jl", callee), ("b.jl", caller)]);
+        let path = member_path("b.jl");
+        let uri = from_path(&path).unwrap();
+        let target = member_path("a.jl");
+        let buffer = TextBuffer::new(caller.to_owned());
+        let snapshot = db.snapshot();
+        let jump = |target_text: &str| {
+            let open = HashMap::from([(
+                normalize_path(&target),
+                Arc::new(TextBuffer::new(target_text.to_owned())),
+            )]);
+            definition_with_open_buffers(
+                &snapshot,
+                &uri,
+                &path,
+                &buffer,
+                Position::new(0, 11),
+                Utf16,
+                &open,
+            )
+        };
+        let fresh = jump(&format!("\n\n{callee}"));
+        assert_eq!(
+            fresh
+                .iter()
+                .map(|loc| loc.range.start.line)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(jump("renamed(a) = a\n").is_empty());
     }
 
     /// The cross-file path is gated to functions: a rebound top-level variable
