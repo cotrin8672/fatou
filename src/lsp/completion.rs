@@ -2313,6 +2313,37 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_for_destructure_is_a_binder_before_its_separator_exists() {
+        for body in [
+            "for (j, ta│",
+            "for (j, ta│\nend",
+            "for (j, ta│)\nend",
+            "for (j, ta│sk) in enumerate(tasks)\nend",
+            "for (j, (i, ta│))\nend",
+            "for (j, (i, ta│)) = tasks\nend",
+            "for a in ys, (j, ta│",
+            "for a=ys, (j, ta│)",
+            "for (j, ta│) ∈ tasks\nend",
+            "[x for (j, ta│",
+        ] {
+            assert!(at_declaration_marker(body).is_empty(), "{body}");
+        }
+        for body in [
+            "for (j, val) in enumerate(vis│)\nend",
+            "for (j, val) in (1, vis│)\nend",
+            "for (j, val) ∈ (1, vis│)\nend",
+            "for (j, val) = (1, vis│)\nend",
+            "for a in ys, (j, val) in (1, vis│",
+            "for (j, val::Vis│)\nend",
+            "ordinary = (1, vis│",
+            "ordinary = (1, vis│)",
+        ] {
+            let names = labels(&at_declaration_marker(body));
+            assert!(names.iter().any(|name| name == "visible_candidate"), "{body}");
+        }
+    }
+
+    #[test]
     fn explicit_named_tuple_keys_are_not_reference_slots() {
         for body in [
             "(; name│=2)",

@@ -92,25 +92,44 @@ fn is_iteration_binding_name(name: SyntaxNode, range: TextRange) -> bool {
                             .first_child()
                             .is_some_and(|child| child.text_range().contains_range(range));
                 }
-                return clause
-                    .siblings_with_tokens(rowan::Direction::Next)
-                    .skip(1)
-                    .find(|element| {
-                        !element
-                            .as_token()
-                            .is_some_and(|token| is_trivia(token.kind()))
-                    })
-                    .and_then(|element| element.into_token())
-                    .is_some_and(|token| {
+                return match adjacent_nontrivia(&clause, rowan::Direction::Next) {
+                    Some(element) => element.into_token().is_some_and(|token| {
                         (token.kind() == SyntaxKind::IDENT && token.text() == "in")
                             || (token.kind().is_operator() && token.text() == "∈")
-                    });
+                    }),
+                    None => {
+                        // While typing `for (i, val`, the parser has already
+                        // formed a tuple binding pattern but cannot emit its
+                        // separator. Require a fresh clause so a trailing
+                        // iterable tuple (after `in`/ `∈`) stays a read. A lone
+                        // name without a separator remains ambiguous.
+                        clause.kind() == SyntaxKind::TUPLE_EXPR
+                            && adjacent_nontrivia(&clause, rowan::Direction::Prev).is_none_or(
+                                |element| {
+                                    matches!(element.kind(), SyntaxKind::COMMA | SyntaxKind::FOR_KW)
+                                },
+                            )
+                    }
+                };
             }
             _ if contains_pattern_child(&parent, &clause) => clause = parent,
             _ => return false,
         }
     }
     false
+}
+
+fn adjacent_nontrivia(
+    node: &SyntaxNode,
+    direction: rowan::Direction,
+) -> Option<crate::syntax::SyntaxElement> {
+    node.siblings_with_tokens(direction)
+        .skip(1)
+        .find(|element| {
+            !element
+                .as_token()
+                .is_some_and(|token| is_trivia(token.kind()))
+        })
 }
 
 /// A local assignment also creates a binding in the semantic model. Only an
