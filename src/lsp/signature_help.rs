@@ -473,6 +473,7 @@ mod tests {
             submodules: Vec::new(),
             usings: Vec::new(),
             imported_names: Vec::new(),
+            import_bindings: Vec::new(),
         }
     }
 

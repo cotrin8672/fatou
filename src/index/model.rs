@@ -99,6 +99,9 @@ pub struct ModuleIndex {
     /// as module globals. Excludes a `using X`'s export *surface*, which lives
     /// in [`usings`](Self::usings).
     pub imported_names: Vec<String>,
+    /// Statically named explicit import destinations and their source paths.
+    /// Unlike imported_names these preserve origins for qualified completion.
+    pub import_bindings: Vec<ModuleImport>,
 }
 
 /// One whole-module `using X.Y` clause harvested from a module's files. Mirrors
@@ -111,6 +114,15 @@ pub struct ModuleIndex {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleUsing {
     pub leading_dots: u32,
+    pub components: Vec<String>,
+}
+
+/// The origin of one binding, including any alias at the importing module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleImport {
+    pub local: String,
+    pub leading_dots: u32,
+    /// Target path including the last symbol or submodule.
     pub components: Vec<String>,
 }
 

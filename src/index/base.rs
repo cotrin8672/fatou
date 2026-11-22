@@ -303,6 +303,7 @@ fn merge_index(acc: &mut PackageIndex, other: PackageIndex) {
     root.consts.extend(other.root.consts);
     root.macros.extend(other.root.macros);
     root.submodules.extend(other.root.submodules);
+    root.import_bindings.extend(other.root.import_bindings);
     for group in other.root.functions {
         match root
             .functions
@@ -370,6 +371,7 @@ fn synthetic_index(name: &str, list: &str) -> PackageIndex {
             submodules: Vec::new(),
             usings: Vec::new(),
             imported_names: Vec::new(),
+            import_bindings: Vec::new(),
         },
         members: Vec::new(),
         member_modules: Default::default(),

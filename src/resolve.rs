@@ -213,6 +213,24 @@ pub struct Candidate {
     pub source: Source,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QualifiedMember {
+    Module(ModulePath),
+    Symbol {
+        module: ModulePath,
+        name: SmolStr,
+        kind: QualifiedMemberKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QualifiedMemberKind {
+    Function,
+    Type,
+    Const,
+    Macro,
+}
+
 /// The tier a [`Candidate`] came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -546,8 +564,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                         }
                         // A clause can import a function, type, or value rather
                         // than a module. Confirm the target before using it.
-                        self.indexed_module_at(&path)?;
-                        path
+                        self.canonical_module_path(&path)?
                     }
                     _ => return None,
                 }
@@ -565,29 +582,18 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                 module
             }
             Resolution::WorkspaceImport { .. } => {
-                // The index retains whole-module using paths, but other
-                // sibling imports record names only: don't guess their type.
                 let workspace = self.workspace.as_ref()?;
-                let host = module_at(
-                    &workspace.pkg.root,
-                    &self.full_module_path(workspace, scope),
-                )?;
-                let using = host.usings.iter().find(|using| {
-                    using.leading_dots == 0
-                        && using
-                            .components
-                            .last()
-                            .is_some_and(|name| name == head.as_str())
-                })?;
-                using.components.iter().map(SmolStr::new).collect()
+                let mut path = self.full_module_path(workspace, scope);
+                path.insert(0, SmolStr::new(&workspace.pkg.name));
+                path.push(head.clone());
+                self.canonical_module_path(&path)?
             }
             Resolution::Using { module, name } | Resolution::System { module, name } => {
                 let mut path: ModulePath = module.split('.').map(SmolStr::new).collect();
                 if module != name {
                     path.push(name);
                 }
-                self.indexed_module_at(&path)?;
-                path
+                self.canonical_module_path(&path)?
             }
             Resolution::Unresolved => {
                 if let Some(workspace) = &self.workspace {
@@ -608,7 +614,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             Resolution::Script { .. } | Resolution::Ambiguous => return None,
         };
         path.extend_from_slice(tail);
-        Some(path)
+        self.canonical_module_path(&path)
     }
 
     fn indexed_module_at(&self, path: &[SmolStr]) -> Option<ModuleIndexHandle> {
@@ -624,6 +630,141 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             pkg,
             rest: rest.to_vec(),
         })
+    }
+
+    /// Resolve aliases only when the destination is a statically indexed module.
+    /// The first segment is a lexical package name selected by the caller.
+    fn canonical_module_path(&self, path: &[SmolStr]) -> Option<ModulePath> {
+        if self.indexed_module_at(path).is_some() {
+            return Some(path.to_vec());
+        }
+        self.module_origin(path, &mut Vec::new())
+    }
+
+    fn module_origin(
+        &self,
+        path: &[SmolStr],
+        visiting: &mut Vec<(ModulePath, SmolStr)>,
+    ) -> Option<ModulePath> {
+        let (head, rest) = path.split_first()?;
+        let mut current = vec![head.clone()];
+        self.indexed_module_at(&current)?;
+        for name in rest {
+            match self.member_origin(&current, name, visiting)? {
+                QualifiedMember::Module(path) => current = path,
+                QualifiedMember::Symbol { .. } => return None,
+            }
+        }
+        Some(current)
+    }
+
+    /// Resolve a bound/re-exported qualified symbol to its actual provider.
+    /// Never infer a binding solely from an export declaration or textual alias.
+    pub(crate) fn qualified_member_origin(
+        &self,
+        module: &[SmolStr],
+        name: &str,
+    ) -> Option<QualifiedMember> {
+        self.member_origin(module, &SmolStr::new(name), &mut Vec::new())
+    }
+
+    fn member_origin(
+        &self,
+        path: &[SmolStr],
+        name: &SmolStr,
+        visiting: &mut Vec<(ModulePath, SmolStr)>,
+    ) -> Option<QualifiedMember> {
+        const MAX_CHAIN: usize = 24;
+        if visiting.len() >= MAX_CHAIN || visiting.iter().any(|(p, n)| p == path && n == name) {
+            return None;
+        }
+        let module = self.indexed_module_at(path)?;
+        if module
+            .submodules
+            .iter()
+            .any(|sub| sub.name == name.as_str())
+        {
+            let mut path = path.to_vec();
+            path.push(name.clone());
+            return Some(QualifiedMember::Module(path));
+        }
+        let kind = if name.starts_with('@') {
+            module
+                .macros
+                .iter()
+                .any(|m| m.name == name.as_str())
+                .then_some(QualifiedMemberKind::Macro)
+        } else if module.types.iter().any(|t| t.name == name.as_str()) {
+            Some(QualifiedMemberKind::Type)
+        } else if module.consts.iter().any(|c| c.name == name.as_str()) {
+            Some(QualifiedMemberKind::Const)
+        } else if module
+            .functions
+            .iter()
+            .any(|f| f.owner.is_none() && f.name == name.as_str())
+        {
+            Some(QualifiedMemberKind::Function)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Some(QualifiedMember::Symbol {
+                module: path.to_vec(),
+                name: name.clone(),
+                kind,
+            });
+        }
+        // An export can name a binding provided by a whole-module using. Do
+        // not flood qualified completion with every opened module's exports.
+        let reexported = module.exports.iter().any(|e| e.name == name.as_str());
+        let binding = module
+            .imported_names
+            .iter()
+            .filter(|n| *n == name.as_str())
+            .count();
+        if !reexported && binding == 0 {
+            return None;
+        }
+        visiting.push((path.to_vec(), name.clone()));
+        let result = (|| {
+            let mut result = None;
+            if binding != 0 {
+                let imports = module
+                    .import_bindings
+                    .iter()
+                    .filter(|i| i.local == name.as_str());
+                // Unknown/dynamic declarations with the same alias cannot
+                // make an otherwise provable duplicate safe.
+                if imports.clone().count() != binding {
+                    return None;
+                }
+                for import in imports {
+                    let target = import_target(path, import.leading_dots, &import.components)?;
+                    let origin = if target.len() == 1 {
+                        self.indexed_module_at(&target)?;
+                        QualifiedMember::Module(target)
+                    } else {
+                        let (last, parent) = target.split_last()?;
+                        let provider = self.module_origin(parent, visiting)?;
+                        self.member_origin(&provider, last, visiting)?
+                    };
+                    add_unique_member(&mut result, origin)?;
+                }
+            } else {
+                for using in &module.usings {
+                    let target = import_target(path, using.leading_dots, &using.components)?;
+                    let provider = self.module_origin(&target, visiting)?;
+                    let opened = self.indexed_module_at(&provider)?;
+                    if module_exports(&opened, name) {
+                        let origin = self.member_origin(&provider, name, visiting)?;
+                        add_unique_member(&mut result, origin)?;
+                    }
+                }
+            }
+            result
+        })();
+        visiting.pop();
+        result
     }
 
     /// Whether a fully qualified package path names a harvested symbol.
@@ -1208,6 +1349,34 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     }
 }
 
+fn import_target(path: &[SmolStr], dots: u32, components: &[String]) -> Option<ModulePath> {
+    if components.is_empty() {
+        return None;
+    }
+    let mut target = if dots == 0 {
+        vec![]
+    } else {
+        let keep = path.len().checked_sub(dots as usize - 1)?;
+        if keep == 0 {
+            return None;
+        }
+        path[..keep].to_vec()
+    };
+    target.extend(components.iter().map(SmolStr::new));
+    Some(target)
+}
+
+fn add_unique_member(slot: &mut Option<QualifiedMember>, member: QualifiedMember) -> Option<()> {
+    match slot {
+        Some(previous) if *previous != member => None,
+        Some(_) => Some(()),
+        None => {
+            *slot = Some(member);
+            Some(())
+        }
+    }
+}
+
 /// Resolve a full module path returned by [`Resolution::Using`] without
 /// depending on which file contains the `using` clause.
 pub(crate) fn resolve_module<P: PackageSource + ?Sized>(
@@ -1431,6 +1600,7 @@ mod tests {
                 submodules,
                 usings: Vec::new(),
                 imported_names: Vec::new(),
+                import_bindings: Vec::new(),
             },
             members: Vec::new(),
             member_modules: Default::default(),
@@ -1459,6 +1629,7 @@ mod tests {
             submodules: Vec::new(),
             usings: Vec::new(),
             imported_names: Vec::new(),
+            import_bindings: Vec::new(),
         }
     }
 

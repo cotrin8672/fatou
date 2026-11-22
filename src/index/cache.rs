@@ -31,7 +31,7 @@ use super::model::PackageIndex;
 /// a [`PackageIndex`] field change, or corrected harvesting semantics). Recorded
 /// in every entry header and baked into the cache path, so mismatched entries
 /// are ignored rather than mis-decoded.
-const CACHE_FORMAT: u32 = 10;
+const CACHE_FORMAT: u32 = 11;
 
 /// The build identity stamped into every entry: `fatou@<version>`. Two builds at
 /// the same [`CACHE_FORMAT`] can still harvest different shapes (the harvester
@@ -276,6 +276,7 @@ mod tests {
                 submodules: Vec::new(),
                 usings: Vec::new(),
                 imported_names: Vec::new(),
+                import_bindings: Vec::new(),
             },
             members: vec![PathBuf::from(format!("src/{name}.jl"))],
             member_modules: Default::default(),

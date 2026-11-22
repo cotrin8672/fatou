@@ -320,6 +320,7 @@ pub(crate) struct ImportClause {
     /// The clause ends in an interpolation (`import $A`, `import A.$B`), so
     /// the name it binds is unknowable.
     unbindable: bool,
+    dynamic_path: bool,
 }
 
 impl ImportClause {
@@ -351,6 +352,11 @@ impl ImportClause {
                 .map(|(name, _)| name.clone())
                 .collect(),
         }
+    }
+
+    /// A missing or interpolated path is not proof of a binding origin.
+    pub(crate) fn static_path(&self) -> Option<ModulePath> {
+        (!self.unbindable && !self.dynamic_path && !self.components.is_empty()).then(|| self.path())
     }
 
     /// The clause as an explicit import item (`using X: a as b`).
@@ -425,6 +431,7 @@ fn import_path_parts(path: &SyntaxNode, clause: &mut ImportClause) {
                 }
                 SyntaxKind::INTERPOLATION => {
                     clause.unbindable = true;
+                    clause.dynamic_path = true;
                     seen_name = true;
                 }
                 _ => {}
@@ -482,6 +489,7 @@ pub(crate) fn collect_import_clauses(
                     alias: None,
                     range: n.text_range(),
                     unbindable: false,
+                    dynamic_path: false,
                 };
                 let path = if n.kind() == SyntaxKind::IMPORT_ALIAS {
                     // `IMPORT_PATH … as alias`: the alias is the last bare

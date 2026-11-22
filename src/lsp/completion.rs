@@ -50,8 +50,8 @@ use crate::parse_context::{EditionSource, SourceRole};
 use crate::parser::parse;
 use crate::parser::{KEYWORDS, parse_with_options};
 use crate::resolve::{
-    Candidate, ModulePath, Namespace, PackageSource, Resolution, Resolver, Source,
-    has_unresolvable_using, resolve_submodule,
+    Candidate, ModulePath, Namespace, PackageSource, QualifiedMember, QualifiedMemberKind,
+    Resolution, Resolver, Source, has_unresolvable_using, resolve_submodule,
 };
 use crate::semantic::{BindingId, BindingKind, SemanticModel};
 use crate::syntax::{SyntaxKind, SyntaxNode};
@@ -1780,8 +1780,59 @@ fn member_completions<P: PackageSource>(
     let Some(module) = resolve_submodule(&pkg.root, &tail) else {
         return Vec::new();
     };
-    let resolved: Vec<String> = resolved.iter().map(ToString::to_string).collect();
-    cached_member_items(&pkg, module, &resolved, macro_member)
+    let resolved_strings: Vec<String> = resolved.iter().map(ToString::to_string).collect();
+    let mut items = cached_member_items(&pkg, module, &resolved_strings, macro_member);
+    append_imported_members(&resolver, module, &resolved, macro_member, &mut items);
+    items
+}
+
+/// The provider package can change independently of this module's own index.
+/// Verify binding origins after, not inside, the defining-module template cache.
+fn append_imported_members<P: PackageSource>(
+    resolver: &Resolver<'_, P>,
+    module: &ModuleIndex,
+    path: &[smol_str::SmolStr],
+    macro_member: bool,
+    items: &mut Vec<CompletionItem>,
+) {
+    if module.import_bindings.is_empty() && (module.usings.is_empty() || module.exports.is_empty())
+    {
+        return;
+    }
+    let mut visited: std::collections::HashSet<String> =
+        items.iter().map(|item| item.label.clone()).collect();
+    for label in module
+        .import_bindings
+        .iter()
+        .map(|import| &import.local)
+        .chain(module.exports.iter().map(|export| &export.name))
+    {
+        if label.starts_with('@') != macro_member || !visited.insert(label.clone()) {
+            continue;
+        }
+        let Some(origin) = resolver.qualified_member_origin(path, label) else {
+            continue;
+        };
+        let mut item = match origin {
+            QualifiedMember::Module(_) => CompletionItem {
+                kind: Some(CompletionItemKind::MODULE),
+                ..Default::default()
+            },
+            QualifiedMember::Symbol { module, name, kind } => {
+                let kind = match kind {
+                    QualifiedMemberKind::Function | QualifiedMemberKind::Macro => {
+                        CompletionItemKind::FUNCTION
+                    }
+                    QualifiedMemberKind::Type => CompletionItemKind::CLASS,
+                    QualifiedMemberKind::Const => CompletionItemKind::CONSTANT,
+                };
+                let owner = module.iter().map(ToString::to_string).collect::<Vec<_>>();
+                member_item(&name, kind, &owner)
+            }
+        };
+        item.label.clone_from(label);
+        items.push(item);
+    }
 }
 
 /// Keep candidate templates only after resolving the receiver in its actual
@@ -2058,6 +2109,7 @@ mod tests {
             submodules: Vec::new(),
             usings: Vec::new(),
             imported_names: Vec::new(),
+            import_bindings: Vec::new(),
         }
     }
 
@@ -2890,6 +2942,73 @@ mod tests {
         let source = "import Library as Alias\nAlias.";
         let names = labels(&completions_at(source, "Alias.", &lib));
         assert_eq!(names, vec!["correct_member"]);
+    }
+
+    #[test]
+    fn qualified_members_resolve_explicit_imports_reexports_and_nested_aliases() {
+        fn harvested(name: &str, body: &str) -> Arc<PackageIndex> {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("src");
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(
+                path.join(format!("{name}.jl")),
+                format!("module {name}\n{body}\nend\n"),
+            )
+            .unwrap();
+            Arc::new(crate::index::harvest_package_named(dir.path(), name))
+        }
+        let lib = library(vec![
+            harvested(
+                "DataAPI",
+                "export levels, Collision\nlevels(x) = x\nstruct Collision end\nmodule Tools\ninner(x) = x\nend",
+            ),
+            harvested("Different", "export Collision\nstruct Collision end"),
+            harvested(
+                "Facade",
+                "export levels, ReExport, ghost, Collision\nusing DataAPI: levels, ghost\nimport DataAPI: Tools as Alias\nimport DataAPI: levels as renamed\nusing DataAPI\nusing Different\nimport NoSuchPackage as MissingModule",
+            ),
+            harvested("Reexport", "export levels\nusing DataAPI"),
+            harvested(
+                "Ambiguous",
+                "import DataAPI: levels as shared\nimport Different: Collision as shared",
+            ),
+            harvested("CycleA", "import CycleB: rec"),
+            harvested("CycleB", "import CycleA: rec"),
+            harvested(
+                "LocalHost",
+                "module Child\nsubtool() = 1\nend\nusing .Child: subtool",
+            ),
+        ]);
+        let facade = completions_at("import Facade\nFacade.", "Facade.", &lib);
+        let names = labels(&facade);
+        for expected in ["levels", "renamed", "Alias"] {
+            assert!(names.iter().any(|n| n == expected), "{names:?}");
+        }
+        for invalid in ["ghost", "ReExport", "Collision", "MissingModule"] {
+            assert!(!names.iter().any(|n| n == invalid), "{names:?}");
+        }
+        let rename = item(&facade, "renamed");
+        assert_eq!(rename.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(rename.data.as_ref().unwrap()["module_path"][0], "DataAPI");
+        assert_eq!(rename.data.as_ref().unwrap()["name"], "levels");
+        assert_eq!(
+            labels(&completions_at("Facade.Alias.", "Facade.Alias.", &lib)),
+            ["inner"]
+        );
+        assert_eq!(
+            labels(&completions_at(
+                "import Facade.Alias as ToolsAlias\nToolsAlias.",
+                "ToolsAlias.",
+                &lib
+            )),
+            ["inner"]
+        );
+        assert!(labels(&completions_at("Reexport.", "Reexport.", &lib)).contains(&"levels".into()));
+        assert!(completions_at("Ambiguous.", "Ambiguous.", &lib).is_empty());
+        assert!(completions_at("CycleA.", "CycleA.", &lib).is_empty());
+        assert!(
+            labels(&completions_at("LocalHost.", "LocalHost.", &lib)).contains(&"subtool".into())
+        );
     }
 
     #[test]

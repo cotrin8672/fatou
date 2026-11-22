@@ -170,6 +170,7 @@ fn harvest_entry_with_base_includes(
         submodules: Vec::new(),
         usings: Vec::new(),
         imported_names: Vec::new(),
+        import_bindings: Vec::new(),
     };
 
     match std::fs::read_to_string(entry) {
@@ -242,6 +243,7 @@ pub fn harvest_tree(cst: &SyntaxNode) -> ModuleIndex {
         submodules: Vec::new(),
         usings: Vec::new(),
         imported_names: Vec::new(),
+        import_bindings: Vec::new(),
     };
     for child in cst.children() {
         harvester.walk_item(&child, Path::new(""), &mut root, false, None);
@@ -515,6 +517,7 @@ impl Harvester<'_> {
             submodules: Vec::new(),
             usings: Vec::new(),
             imported_names: Vec::new(),
+            import_bindings: Vec::new(),
         };
         self.module_path.push(name);
         let parent_groups = self.function_groups.take();
@@ -821,9 +824,28 @@ impl Harvester<'_> {
         let (before, after) = collect_import_clauses(node);
         match after {
             Some(items) => {
+                let base = match before.as_slice() {
+                    [base] => base.static_path(),
+                    _ => None,
+                };
                 for clause in &items {
                     if let Some((name, _)) = clause.binding_name() {
                         dest.imported_names.push(name.to_string());
+                        if let (Some(base), Some(item)) = (&base, clause.static_path())
+                            && item.leading_dots == 0
+                            && item.components.len() == 1
+                        {
+                            dest.import_bindings.push(super::model::ModuleImport {
+                                local: name.to_string(),
+                                leading_dots: base.leading_dots,
+                                components: base
+                                    .components
+                                    .iter()
+                                    .chain(&item.components)
+                                    .map(ToString::to_string)
+                                    .collect(),
+                            });
+                        }
                     }
                 }
             }
@@ -831,6 +853,17 @@ impl Harvester<'_> {
                 for clause in &before {
                     if let Some((name, _)) = clause.binding_name() {
                         dest.imported_names.push(name.to_string());
+                        if let Some(path) = clause.static_path() {
+                            dest.import_bindings.push(super::model::ModuleImport {
+                                local: name.to_string(),
+                                leading_dots: path.leading_dots,
+                                components: path
+                                    .components
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect(),
+                            });
+                        }
                     }
                     if is_using {
                         let path = clause.path();
@@ -1480,6 +1513,7 @@ mod tests {
             submodules: Vec::new(),
             usings: Vec::new(),
             imported_names: Vec::new(),
+            import_bindings: Vec::new(),
         };
         harvester.walk_text(text, Path::new("/pkg/src/Pkg.jl"), &mut root, true);
         root
