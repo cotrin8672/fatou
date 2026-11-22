@@ -195,3 +195,24 @@ fn script_can_follow_live_include_to_new_unsaved_file() {
     assert!(!target.exists());
     lsp.finish();
 }
+
+#[test]
+fn earlier_included_const_closure_only_blocks_later_same_module_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let helper = write(&root, "helper.jl", "helper(x) = x\n");
+    write(&root, "shadow.jl", "const include = _ -> nothing\n");
+    let mut lsp = Session::start(&root);
+    for (i, (text, line, jumps)) in [
+        ("module M\ninclude(\"shadow.jl\")\ninclude(\"helper.jl\")\nhelper(1)\nend\n",3,false),
+        ("module M\ninclude(\"helper.jl\")\ninclude(\"shadow.jl\")\nhelper(1)\nend\n",3,true),
+        ("module A\ninclude(\"shadow.jl\")\nend\nmodule B\ninclude(\"helper.jl\")\nhelper(1)\nend\n",5,true),
+    ].into_iter().enumerate() {
+        let caller = write(&root, &format!("probe{i}.jl"), text);
+        lsp.open(&caller, text);
+        let definition = lsp.definition(&caller, line, 2);
+        if jumps { assert_eq!(definition["uri"], uri(&helper)); }
+        else { assert_eq!(definition, Value::Null); }
+    }
+    lsp.finish();
+}

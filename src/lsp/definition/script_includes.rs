@@ -87,10 +87,21 @@ pub(super) fn locations(
     )];
     let mut seen = HashSet::new();
     let mut visited_hosts = BTreeMap::new();
+    let mut include_shadows: BTreeMap<ModulePath, Vec<TextSize>> = BTreeMap::new();
     let mut candidates = Vec::new();
     let mut bytes = 0usize;
 
     while let Some((member, prefix)) = pending.pop() {
+        // DFS visits the include edges in source order. Once an earlier file
+        // installed a replacement closure for this module's include, a
+        // subsequent call with the same name is not a proven graph edge.
+        if !prefix.is_empty()
+            && include_shadows
+                .get(&member.host)
+                .is_some_and(|shadow| shadow < &prefix)
+        {
+            continue;
+        }
         if !seen.insert((member.path.clone(), member.host.clone())) {
             continue;
         }
@@ -124,6 +135,19 @@ pub(super) fn locations(
             (&cst, &model)
         };
         for binding in model.bindings() {
+            if binding.kind == BindingKind::Const
+                && binding.name == "include"
+                && model.scope(binding.scope).kind.is_global()
+                && static_include_rebinding(tree, binding.def_range.start())
+            {
+                let host = join(&member.host, &model.enclosing_module_path(binding.scope));
+                let mut order = prefix.clone();
+                order.push(binding.def_range.start());
+                let earliest = include_shadows.entry(host).or_insert_with(|| order.clone());
+                if order < *earliest {
+                    *earliest = order;
+                }
+            }
             if member.path != path
                 && binding.kind == BindingKind::Function
                 && binding.name == ident.name
@@ -216,6 +240,39 @@ fn join(host: &[smol_str::SmolStr], suffix: &[smol_str::SmolStr]) -> ModulePath 
     host.iter().chain(suffix).cloned().collect()
 }
 
+/// Recognize only an unconditional top-level assignment of a new closure,
+/// not a declaration, a re-export, a conditional, or dynamic evaluation.
+fn static_include_rebinding(root: &SyntaxNode, offset: TextSize) -> bool {
+    let Some(token) = root.token_at_offset(offset).right_biased() else {
+        return false;
+    };
+    token
+        .parent_ancestors()
+        .find(|ancestor| ancestor.kind() == SyntaxKind::CONST_STMT)
+        .is_some_and(|declaration| {
+            declaration.children().any(|child| {
+                child.kind() == SyntaxKind::ASSIGNMENT_EXPR
+                    && child
+                        .children()
+                        .nth(1)
+                        .is_some_and(|rhs| rhs.kind() == SyntaxKind::ARROW_EXPR)
+            }) && declaration
+                .ancestors()
+                .skip(1)
+                .all(|ancestor| top_level_container(&ancestor))
+        })
+}
+
+fn top_level_container(ancestor: &SyntaxNode) -> bool {
+    match ancestor.kind() {
+        SyntaxKind::ROOT | SyntaxKind::BLOCK | SyntaxKind::BEGIN_EXPR => true,
+        SyntaxKind::MODULE_DEF => !ancestor
+            .first_token()
+            .is_some_and(|token| token.text() == "baremodule"),
+        _ => false,
+    }
+}
+
 fn static_includes(
     root: &SyntaxNode,
     model: &SemanticModel,
@@ -230,13 +287,7 @@ fn static_includes(
                 .syntax()
                 .ancestors()
                 .skip(1)
-                .all(|ancestor| match ancestor.kind() {
-                    SyntaxKind::ROOT | SyntaxKind::BLOCK | SyntaxKind::BEGIN_EXPR => true,
-                    SyntaxKind::MODULE_DEF => !ancestor
-                        .first_token()
-                        .is_some_and(|token| token.text() == "baremodule"),
-                    _ => false,
-                })
+                .all(|ancestor| top_level_container(&ancestor))
             {
                 return None;
             }
