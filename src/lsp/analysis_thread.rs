@@ -137,7 +137,7 @@ pub(crate) fn spawn_analysis_thread(
     encoding: PositionEncoding,
     push_diagnostics: bool,
     harvest: Sender<HarvestSignal>,
-    has_workspace: bool,
+    workspace_roots: Vec<PathBuf>,
     membership_generation: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<AnalyzeDone>();
@@ -147,7 +147,8 @@ pub(crate) fn spawn_analysis_thread(
             let mut worker = AnalysisWorker {
                 context_epoch: 0,
                 harvest,
-                full_harvest: has_workspace.then_some(0),
+                full_harvest: (!workspace_roots.is_empty()).then_some(0),
+                open_environments: OpenEnvironments::new(workspace_roots),
                 syntax_harvest: None,
                 harvest_generation: 0,
                 harvest_failed: false,
@@ -236,7 +237,60 @@ pub(crate) fn decide(
     }
 }
 
+/// Additional independent environments become relevant when the user
+/// opens a source file inside them. Do not recursively scan unopened projects.
+#[derive(Default)]
+struct OpenEnvironments {
+    workspace_roots: Vec<PathBuf>,
+    seen_directories: BTreeSet<PathBuf>,
+    indexed_projects: BTreeSet<PathBuf>,
+}
+
+impl OpenEnvironments {
+    fn new(workspace_roots: Vec<PathBuf>) -> Self {
+        let indexed_projects = workspace_roots
+            .iter()
+            .filter_map(|root| {
+                let ctx = crate::environment::EnvContext::from_process(root.clone());
+                crate::environment::discover_project(&ctx)
+                    .map(|path| crate::incremental::normalize_path(&path))
+            })
+            .collect();
+        Self {
+            workspace_roots,
+            indexed_projects,
+            ..Self::default()
+        }
+    }
+
+    fn new_anchor(&mut self, path: &Path, metadata_changed: bool) -> Option<PathBuf> {
+        let dir = path.parent()?;
+        if !self
+            .workspace_roots
+            .iter()
+            .any(|root| dir.starts_with(root))
+            || (!metadata_changed && !self.seen_directories.insert(dir.to_path_buf()))
+        {
+            return None;
+        }
+        let ctx = crate::environment::EnvContext::from_process(dir.to_path_buf());
+        let project = crate::environment::discover_project(&ctx)?;
+        let project = crate::incremental::normalize_path(&project);
+        let anchor = project.parent()?;
+        if !self
+            .workspace_roots
+            .iter()
+            .any(|root| anchor.starts_with(root))
+            || !self.indexed_projects.insert(project.clone())
+        {
+            return None;
+        }
+        Some(anchor.to_path_buf())
+    }
+}
+
 struct AnalysisWorker {
+    open_environments: OpenEnvironments,
     harvest: Sender<HarvestSignal>,
     /// Keep rewrites queued until both the disk resolve and any follow-up
     /// variants needed by live metadata have landed.
@@ -433,6 +487,7 @@ impl AnalysisWorker {
                 edition_changed,
             } => {
                 self.context_epoch = self.context_epoch.max(context_epoch);
+                self.consider_open_environment(&path, true);
                 self.on_project_text(&path, text);
                 if edition_changed {
                     self.on_edition_changed();
@@ -444,6 +499,7 @@ impl AnalysisWorker {
             } => {
                 let edition_changed = context_epoch > self.context_epoch;
                 self.context_epoch = self.context_epoch.max(context_epoch);
+                self.consider_open_environment(&path, true);
                 self.on_sync(&path);
                 if edition_changed {
                     self.on_edition_changed();
@@ -466,12 +522,25 @@ impl AnalysisWorker {
         }
     }
 
+    fn consider_open_environment(&mut self, path: &Path, metadata_changed: bool) {
+        if metadata_changed && !is_project_file(path) {
+            return;
+        }
+        if let Some(anchor) = self.open_environments.new_anchor(path, metadata_changed) {
+            self.request_full_harvest_with_anchor(Some(anchor));
+        }
+    }
+
     fn request_full_harvest(&mut self) {
+        self.request_full_harvest_with_anchor(None);
+    }
+
+    fn request_full_harvest_with_anchor(&mut self, anchor: Option<PathBuf>) {
         self.harvest_generation += 1;
         let generation = self.harvest_generation;
         if self
             .harvest
-            .send(HarvestSignal::Environment(generation))
+            .send(HarvestSignal::Environment { generation, anchor })
             .is_ok()
         {
             self.full_harvest = Some(generation);
@@ -691,6 +760,7 @@ impl AnalysisWorker {
     /// sees has to describe the transform from the last *analyzed* text, not
     /// from the last enqueued one.
     fn enqueue(&mut self, mut req: AnalysisRequest) {
+        self.consider_open_environment(&req.path, false);
         self.db.ensure_source_context(&req.path);
         self.scripts.update(
             &req.path,
@@ -947,6 +1017,7 @@ mod tests {
                 context_epoch: 0,
                 harvest: crossbeam_channel::unbounded().0,
                 full_harvest: None,
+                open_environments: OpenEnvironments::default(),
                 syntax_harvest: None,
                 harvest_generation: 0,
                 harvest_failed: false,
@@ -1016,6 +1087,7 @@ mod tests {
         let mut worker = AnalysisWorker {
             read_spawner: pool.spawner(),
             full_harvest: Some(1),
+            open_environments: OpenEnvironments::default(),
             ..AnalysisWorker::for_test()
         };
         let (out_tx, out_rx) = crossbeam_channel::unbounded();

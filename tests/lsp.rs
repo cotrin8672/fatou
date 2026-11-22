@@ -9266,6 +9266,15 @@ fn single_file_dependency_uses_the_active_manifest_edition() {
 /// watcher event is required for package-name and indexed-member completion.
 #[test]
 fn external_environment_changes_refresh_completion_without_client_events() {
+    assert_external_environment_refresh(false);
+}
+
+#[test]
+fn independently_opened_nested_project_refreshes_without_client_events() {
+    assert_external_environment_refresh(true);
+}
+
+fn assert_external_environment_refresh(nested: bool) {
     let _env = ENV_LOCK.lock().unwrap();
     let dir = TempDir::new("fatou-lsp-external-pkg");
     let depot = TempDir::new("fatou-lsp-external-depot");
@@ -9276,14 +9285,20 @@ fn external_environment_changes_refresh_completion_without_client_events() {
         ("PATH", ""),
         ("HOME", depot.path.to_str().unwrap()),
     ]);
-    let project = dir.path.join("Project.toml");
-    let manifest = dir.path.join("Manifest-v1.13.toml");
     let no_deps = "[deps]\n";
+    let project_dir = if nested {
+        write_file(&dir.path.join("Project.toml"), no_deps);
+        dir.path.join("nested")
+    } else {
+        dir.path.clone()
+    };
+    let project = project_dir.join("Project.toml");
+    let manifest = project_dir.join("Manifest-v1.13.toml");
     let uuid = "d58978e5-989f-55fb-8d15-ea34adc7bf54";
     write_file(&project, no_deps);
     for (name, member) in [("dep-one", "only_first"), ("dep-two-new", "only_second")] {
         write_file(
-            &dir.path.join(name).join("src/Dagger.jl"),
+            &project_dir.join(name).join("src/Dagger.jl"),
             &format!("module Dagger\nexport {member}\n{member}() = nothing\nend\n"),
         );
     }
@@ -9291,21 +9306,28 @@ fn external_environment_changes_refresh_completion_without_client_events() {
     let (server, client) = Connection::memory();
     let thread = std::thread::spawn(move || fatou::lsp::serve(&server).unwrap());
     initialize_with_work_done_progress(&client, &file_uri(&dir.path));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let message = client
-            .receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("initial index never finished");
-        if let Message::Notification(n) = message
-            && n.method == "$/progress"
-            && n.params["value"]["kind"] == "end"
-        {
-            break;
+    let wait_harvest = |token: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let message = client
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("environment index never finished");
+            if let Message::Notification(n) = message
+                && n.method == "$/progress"
+                && n.params["token"] == token
+                && n.params["value"]["kind"] == "end"
+            {
+                break;
+            }
         }
-    }
-    let uri = file_uri(&dir.path.join("experiment.jl"));
+    };
+    wait_harvest("fatou/harvest/0");
+    let uri = file_uri(&project_dir.join("experiment.jl"));
     open_document(&client, &uri, "using Dag\nusing Dagger\nDagger.\n");
+    if nested {
+        wait_harvest("fatou/harvest/1");
+    }
 
     let next_id = std::cell::Cell::new(101);
     let complete = |line, character| {

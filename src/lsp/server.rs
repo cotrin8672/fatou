@@ -378,7 +378,7 @@ fn main_loop(
     let (library_tx, library_rx) = crossbeam_channel::unbounded::<LibraryMessage>();
     let (harvest_tx, harvest_rx) = crossbeam_channel::unbounded::<HarvestSignal>();
     let (sync_tx, sync_rx) = crossbeam_channel::unbounded::<SyncMessage>();
-    let has_workspace = !workspace_roots.is_empty();
+    let environment_roots = workspace_roots.clone();
     let membership_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Resolve the environment and harvest its packages off the event loop: it
@@ -419,7 +419,7 @@ fn main_loop(
         // The per-edit push is the fallback for a client that cannot pull.
         !pull_diagnostics,
         harvest_tx,
-        has_workspace,
+        environment_roots,
         Arc::clone(&membership_generation),
     );
 
@@ -507,7 +507,10 @@ fn main_loop(
 /// Work the analysis thread sends to the harvester. Source re-indexing uses
 /// editions selected from the analysis database's live metadata.
 pub(crate) enum HarvestSignal {
-    Environment(u64),
+    Environment {
+        generation: u64,
+        anchor: Option<PathBuf>,
+    },
     Syntax {
         work: Vec<(String, PathBuf, crate::parser::ParseOptions)>,
         generation: u64,
@@ -526,10 +529,10 @@ pub(crate) enum HarvestSignal {
 /// (or without that folder's contribution), and the failure is reported as a
 /// diagnostic on the file that caused it.
 ///
-/// The root set is fixed for the session (`didChangeWorkspaceFolders` is not
-/// handled), so a folder never leaves and there is no per-folder teardown.
+/// Editor workspace folders are fixed for the session. Independently selected
+/// projects discovered in opened source directories can add a resolve anchor.
 fn spawn_workspace_harvester(
-    workspace_roots: Vec<PathBuf>,
+    mut workspace_roots: Vec<PathBuf>,
     library_tx: crossbeam_channel::Sender<LibraryMessage>,
     signal_rx: crossbeam_channel::Receiver<HarvestSignal>,
     progress_sender: Option<crossbeam_channel::Sender<Message>>,
@@ -662,12 +665,22 @@ fn spawn_workspace_harvester(
                         },
                     };
                     match signal {
-                        HarvestSignal::Environment(current) => {
-                            generation = current;
-                            // A full resolve supersedes older variant requests.
-                            while let Ok(queued) = signal_rx.try_recv() {
-                                if let HarvestSignal::Environment(newer) = queued {
+                        signal @ HarvestSignal::Environment { .. } => {
+                            // A full resolve supersedes older variant requests,
+                            // but each newly discovered project anchor survives
+                            // coalescing to the latest environment generation.
+                            for request in std::iter::once(signal).chain(signal_rx.try_iter()) {
+                                if let HarvestSignal::Environment {
+                                    generation: newer,
+                                    anchor,
+                                } = request
+                                {
                                     generation = newer;
+                                    if let Some(anchor) = anchor
+                                        && !workspace_roots.contains(&anchor)
+                                    {
+                                        workspace_roots.push(anchor);
+                                    }
                                 }
                             }
                             continue 'resolve;
