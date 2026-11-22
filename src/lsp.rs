@@ -56,6 +56,7 @@ mod documentation;
 #[cfg(test)]
 mod documentation_bench;
 mod environment_diagnostics;
+mod environment_watch;
 mod folding;
 mod format;
 mod graph_diagnostics;

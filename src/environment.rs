@@ -455,7 +455,7 @@ pub(crate) fn project_file_in(dir: &Path) -> Option<PathBuf> {
 
 /// The sibling manifest for a project directory, honoring name precedence and
 /// falling back to the highest version-specific `Manifest-vX.Y.toml`.
-fn find_manifest(project_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_manifest(project_dir: &Path) -> Option<PathBuf> {
     if let Some(path) = MANIFEST_NAMES
         .iter()
         .map(|name| project_dir.join(name))

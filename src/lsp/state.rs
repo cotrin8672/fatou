@@ -114,6 +114,8 @@ impl DocumentKind {
 
 /// Messages from the analysis thread back to the main loop.
 pub(crate) enum Outbound {
+    /// Disk changes detected by the index loader when the client sent no event.
+    EnvironmentFilesChanged(Vec<lsp_types::FileEvent>),
     /// Per-file parse diagnostics for `uri` at `version`; published only if still
     /// current (the open buffer is still at that version).
     Diagnostics {
@@ -698,14 +700,13 @@ impl GlobalState {
             return;
         };
         use super::completion::CompletionTrigger;
-        let trigger = match params
+        let trigger_character = params
             .context
             .filter(|context| {
                 context.trigger_kind == lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER
             })
-            .and_then(|context| context.trigger_character)
-            .as_deref()
-        {
+            .and_then(|context| context.trigger_character);
+        let trigger = match trigger_character.as_deref() {
             Some(" " | ":" | "," | ";") => CompletionTrigger::Punctuation,
             Some("/" | "\"") => CompletionTrigger::Path,
             _ => CompletionTrigger::Standard,
@@ -715,14 +716,19 @@ impl GlobalState {
             self.respond_ok(id, serde_json::Value::Null);
             return;
         };
+        let position = params.text_document_position.position;
+        let incomplete = trigger_character.as_deref() == Some(".")
+            && super::completion::starts_member_at_dot(&text, position, self.encoding);
         let reply = self.read_reply(id.clone(), Some(&uri));
         self.dispatch_read(ReadJob::Completion {
             id,
             path: path_for(&uri),
             text,
-            position: params.text_document_position.position,
+            position,
             trigger,
-            sender: reply.with_completion_data_defaults(self.completion_data_defaults),
+            sender: reply
+                .with_completion_data_defaults(self.completion_data_defaults)
+                .with_incomplete_completion(incomplete),
         });
     }
 
@@ -1519,6 +1525,9 @@ impl GlobalState {
 
     pub(crate) fn on_outbound(&mut self, outbound: Outbound) {
         match outbound {
+            Outbound::EnvironmentFilesChanged(changes) => {
+                self.on_watched_files(DidChangeWatchedFilesParams { changes });
+            }
             Outbound::Diagnostics {
                 context_epoch,
                 uri,

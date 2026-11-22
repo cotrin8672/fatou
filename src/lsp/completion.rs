@@ -1010,15 +1010,21 @@ fn completions_for<P: PackageSource>(
         Context::Member {
             receiver,
             macro_member,
-        } => member_completions(
-            model,
-            packages,
-            workspace,
-            &receiver,
-            offset,
-            receiver_start(text, offset, &receiver, macro_member),
-            macro_member,
-        ),
+        } => {
+            let mut items = member_completions(
+                model,
+                packages,
+                workspace,
+                &receiver,
+                offset,
+                receiver_start(text, offset, &receiver, macro_member),
+                macro_member,
+            );
+            if macro_member && !items.is_empty() {
+                qualified_macro_edits(&mut items, text, offset_bytes, lines, encoding);
+            }
+            items
+        }
         Context::Macro => candidate_items(
             model,
             Resolver::new(model, packages)
@@ -1215,6 +1221,25 @@ fn context_at(text: &str, offset: usize) -> Context {
     } else {
         Context::Value
     }
+}
+
+/// A fresh dot list covers values only. It cannot be used to locally filter
+/// the next macro name: typing `@` switches namespaces, even if the client
+/// coalesces the trigger with the first identifier characters.
+pub(super) fn starts_member_at_dot(
+    text: &TextBuffer,
+    position: Position,
+    encoding: PositionEncoding,
+) -> bool {
+    let offset = text.line_index().position_to_byte(position, encoding);
+    text[..offset].ends_with('.')
+        && matches!(
+            context_at(text, offset),
+            Context::Member {
+                macro_member: false,
+                ..
+            }
+        )
 }
 
 /// Split off the trailing identifier run of `prefix`, returning `(run, before)`.
@@ -1579,6 +1604,37 @@ fn heuristic_kind(name: &str, ns: Namespace) -> CompletionItemKind {
 }
 
 // --- member completion -----------------------------------------------------
+
+/// Keep the typed `@` outside the identifier edit. The label and lazy-resolve
+/// key still identify a macro, while clients can match and replace just its
+/// identifier (including any suffix to the right of the cursor).
+fn qualified_macro_edits(
+    items: &mut [CompletionItem],
+    text: &str,
+    offset: usize,
+    lines: &LineIndex,
+    encoding: PositionEncoding,
+) {
+    let (_, before_name) = take_ident_back(&text[..offset]);
+    let suffix_bytes: usize = text[offset..]
+        .chars()
+        .take_while(|&c| is_ident_char(c))
+        .map(char::len_utf8)
+        .sum();
+    let range = lsp_types::Range::new(
+        lines.byte_to_position(before_name.len(), encoding),
+        lines.byte_to_position(offset + suffix_bytes, encoding),
+    );
+    for item in items {
+        if let Some(name) = item.label.strip_prefix('@') {
+            item.filter_text = Some(name.to_string());
+            item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: name.to_string(),
+            }));
+        }
+    }
+}
 
 /// Every name defined in the library module named by `receiver`, or empty when
 /// the receiver does not resolve to a harvested module. `macro_member` (the
@@ -2666,17 +2722,36 @@ mod tests {
 
     #[test]
     fn macro_member_context_offers_only_macros() {
-        let mut root = module("A", &[]);
+        let mut root = module("Dagger", &[]);
         root.functions.push(func("plain"));
         root.macros.push(MacroDef {
-            name: "@mac".into(),
+            name: "@spawn".into(),
             params: Vec::new(),
             doc: None,
             loc: loc(),
         });
         let lib = library(vec![package(root)]);
-        let names = labels(&completions_at("A.@", "A.@", &lib));
-        assert_eq!(names, vec!["@mac".to_string()]);
+        for (src, needle, end) in [
+            ("λ = Dagger.@", "Dagger.@", 12),
+            ("λ = Dagger.@sp", "Dagger.@sp", 14),
+            ("λ = Dagger.@spaw(x)", "Dagger.@sp", 16),
+        ] {
+            let items = completions_at(src, needle, &lib);
+            assert_eq!(labels(&items), ["@spawn"], "{src}");
+            let spawn = &items[0];
+            assert_eq!(spawn.filter_text.as_deref(), Some("spawn"), "{src}");
+            let (new_text, range) = edit(spawn);
+            assert_eq!(new_text, "spawn", "{src}");
+            assert_eq!(range.start, Position::new(0, 12), "{src}");
+            assert_eq!(range.end, Position::new(0, end), "{src}");
+            assert_eq!(spawn.data.as_ref().unwrap()["name"], "@spawn", "{src}");
+        }
+        assert_eq!(
+            labels(&completions_at("Dagger.", "Dagger.", &lib)),
+            ["plain"]
+        );
+        let shadow = "function f(Dagger)\n    Dagger.@sp\nend";
+        assert!(completions_at(shadow, "Dagger.@sp", &lib).is_empty());
     }
 
     #[test]

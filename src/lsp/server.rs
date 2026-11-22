@@ -31,6 +31,7 @@ use super::analysis_thread::{LibraryMessage, SyncMessage, guard, spawn_analysis_
 use super::environment_diagnostics::{
     EnvironmentFindings, environment_diagnostics, resolve_failure_diagnostics,
 };
+use super::environment_watch::EnvironmentFiles;
 use super::progress::HarvestProgress;
 use super::read_jobs::ReadJob;
 use super::semantic_tokens::legend;
@@ -142,9 +143,8 @@ fn supports_inlay_hint_refresh(capabilities: &ClientCapabilities) -> bool {
 }
 
 /// Whether the client accepts a dynamic `workspace/didChangeWatchedFiles`
-/// registration. File watching has no static server capability: without this,
-/// the server never hears about external file events and relies on saves
-/// alone.
+/// registration. File watching has no static server capability. The server's
+/// metadata-only fallback does not require these notifications.
 fn supports_watched_files_registration(capabilities: &ClientCapabilities) -> bool {
     capabilities
         .workspace
@@ -570,7 +570,12 @@ fn spawn_workspace_harvester(
             // out.
             let mut published_env_files: HashSet<Uri> = HashSet::new();
             let mut generation = 0;
+            // Some editors do not register file watchers; even editors that do
+            // cannot be relied on for a project outside the workspace. Check
+            // only the selected environment files, off the LSP request path.
+            let poll = crossbeam_channel::tick(std::time::Duration::from_millis(500));
             'resolve: loop {
+                let mut metadata = EnvironmentFiles::scan(&workspace_roots);
                 // Report the full pass (initial resolve, and every re-resolve a
                 // `continue 'resolve` restarts) as one begin/report/end cycle.
                 progress.begin("Indexing Julia environment", "Resolving environment");
@@ -635,7 +640,24 @@ fn spawn_workspace_harvester(
                 }
                 progress.end(&format!("Indexed {indexed} packages"));
 
-                while let Ok(signal) = signal_rx.recv() {
+                loop {
+                    let signal = select! {
+                        recv(signal_rx) -> message => match message {
+                            Ok(signal) => signal,
+                            Err(_) => return,
+                        },
+                        recv(poll) -> _ => {
+                            let next = EnvironmentFiles::scan(&workspace_roots);
+                            let changes = metadata.changes_to(&next);
+                            metadata = next;
+                            if !changes.is_empty()
+                                && out_tx.send(Outbound::EnvironmentFilesChanged(changes)).is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        },
+                    };
                     match signal {
                         HarvestSignal::Environment(current) => {
                             generation = current;
@@ -673,7 +695,6 @@ fn spawn_workspace_harvester(
                         }
                     }
                 }
-                return; // The main loop is gone; stop harvesting.
             }
         });
     // A spawn failure is non-fatal: the server runs without a library index.

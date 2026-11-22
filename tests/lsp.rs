@@ -6080,6 +6080,124 @@ fn write_pkg_with_path_dep(prefix: &str) -> TempDir {
     root
 }
 
+#[test]
+fn completes_qualified_macros_and_values_from_an_included_dependency_file() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let root = write_pkg_with_path_dep("fatou-lsp-macrodep");
+    let pkg = root.path.join("MyPkg");
+    let depot = TempDir::new("fatou-lsp-macro-depot");
+    let _guard = EnvGuard::set(&[
+        ("JULIA_PROJECT", pkg.to_str().unwrap()),
+        ("JULIA_DEPOT_PATH", depot.path.to_str().unwrap()),
+        ("JULIA_BINDIR", ""),
+        ("PATH", ""),
+        ("HOME", depot.path.to_str().unwrap()),
+    ]);
+    write_file(
+        &root.path.join("Greetings/src/Greetings.jl"),
+        "module Greetings\nexport elastic_worker\ninclude(\"thunk.jl\")\nend\n",
+    );
+    let macro_file = root.path.join("Greetings/src/thunk.jl");
+    // Like Dagger.@spawn, the macro is not exported. Like
+    // ElasticClusterManager.elastic_worker, the value is defined by an include.
+    write_file(
+        &macro_file,
+        "macro spawn(exs...)\n    nothing\nend\nelastic_worker() = nothing\n",
+    );
+    let source = concat!(
+        "module MyPkg\n",
+        "using Greetings\n",
+        "import Greetings as Tasks\n",
+        "Greetings.elastic_worker()\n",
+        "Greetings.\n",
+        "Greetings.elastic_w\n",
+        "function worker()\n",
+        "    Greetings.elastic_w\n",
+        "    Tasks.elastic_w\n",
+        "end\n",
+        "Tasks.@\n",
+        "Tasks.@spaw(1)\n",
+        "end\n",
+    );
+    let path = pkg.join("src/MyPkg.jl");
+    write_file(&path, source);
+    let uri = file_uri(&path);
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || {
+        fatou::lsp::serve(&server).expect("server loop");
+    });
+    initialize_with_root(&client, &file_uri(&pkg));
+    open_document(&client, &uri, source);
+    // The library harvest is asynchronous; wait for any member of the loaded dependency.
+    let found = poll_definition(&client, &uri, Position::new(3, 13), Duration::from_secs(10));
+    assert_eq!(found.uri, file_uri(&macro_file));
+    let complete = |id, line: u32, col: u32, trigger: Option<&str>| {
+        let context = trigger.map_or_else(
+            || serde_json::json!({"triggerKind":1}),
+            |character| serde_json::json!({"triggerKind":2,"triggerCharacter":character}),
+        );
+        client.sender.send(Message::Request(Request {
+            id: RequestId::from(id),
+            method: "textDocument/completion".into(),
+            params: serde_json::json!({"textDocument":{"uri":uri},"position":{"line":line,"character":col},"context":context}),
+        })).unwrap();
+        let result = recv_response(&client, RequestId::from(id))
+            .result()
+            .unwrap();
+        match serde_json::from_value(result).unwrap() {
+            CompletionResponse::Array(items) => {
+                assert_ne!(trigger, Some("."));
+                items
+            }
+            CompletionResponse::List(list) => {
+                assert_eq!(list.is_incomplete, trigger == Some("."));
+                list.items
+            }
+        }
+    };
+    for (id, line, col, trigger) in [
+        (637, 4, 10, Some(".")),
+        (638, 5, 19, None),
+        (639, 7, 23, None),
+        (640, 8, 19, None),
+    ] {
+        let items = complete(id, line, col, trigger);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].label, "elastic_worker", "{items:?}");
+    }
+    for (id, line, col, end, trigger) in [(641, 10, 7, 7, Some("@")), (642, 11, 9, 11, None)] {
+        let items = complete(id, line, col, trigger);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let spawn = &items[0];
+        assert_eq!(spawn.label, "@spawn");
+        assert_eq!(spawn.filter_text.as_deref(), Some("spawn"));
+        assert_eq!(
+            spawn.text_edit,
+            Some(lsp_types::CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(line, 7), Position::new(line, end)),
+                new_text: "spawn".into(),
+            }))
+        );
+    }
+    client
+        .sender
+        .send(Message::Request(Request {
+            id: RequestId::from(643),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    let _ = recv_response(&client, RequestId::from(643));
+    client
+        .sender
+        .send(Message::Notification(Notification {
+            method: "exit".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    server_thread.join().unwrap();
+}
+
 /// Poll `textDocument/definition` at `position` until it answers something, or
 /// the deadline passes. The library index arrives with the harvest, well after
 /// the handshake, so the first request legitimately answers `null`.
@@ -9140,5 +9258,141 @@ fn single_file_dependency_uses_the_active_manifest_edition() {
         .is_empty()
     );
     drop(client);
+    thread.join().unwrap();
+}
+
+/// Pkg writes on disk outside the editor. Neither didSave nor a client
+/// watcher event is required for package-name and indexed-member completion.
+#[test]
+fn external_environment_changes_refresh_completion_without_client_events() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new("fatou-lsp-external-pkg");
+    let depot = TempDir::new("fatou-lsp-external-depot");
+    let _guard = EnvGuard::set(&[
+        ("JULIA_PROJECT", "@."),
+        ("JULIA_DEPOT_PATH", depot.path.to_str().unwrap()),
+        ("JULIA_BINDIR", ""),
+        ("PATH", ""),
+        ("HOME", depot.path.to_str().unwrap()),
+    ]);
+    let project = dir.path.join("Project.toml");
+    let manifest = dir.path.join("Manifest-v1.13.toml");
+    let no_deps = "[deps]\n";
+    let uuid = "d58978e5-989f-55fb-8d15-ea34adc7bf54";
+    write_file(&project, no_deps);
+    for (name, member) in [("dep-one", "only_first"), ("dep-two-new", "only_second")] {
+        write_file(
+            &dir.path.join(name).join("src/Dagger.jl"),
+            &format!("module Dagger\nexport {member}\n{member}() = nothing\nend\n"),
+        );
+    }
+
+    let (server, client) = Connection::memory();
+    let thread = std::thread::spawn(move || fatou::lsp::serve(&server).unwrap());
+    initialize_with_work_done_progress(&client, &file_uri(&dir.path));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let message = client
+            .receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("initial index never finished");
+        if let Message::Notification(n) = message
+            && n.method == "$/progress"
+            && n.params["value"]["kind"] == "end"
+        {
+            break;
+        }
+    }
+    let uri = file_uri(&dir.path.join("experiment.jl"));
+    open_document(&client, &uri, "using Dag\nusing Dagger\nDagger.\n");
+
+    let next_id = std::cell::Cell::new(101);
+    let complete = |line, character| {
+        let id = RequestId::from(next_id.get());
+        next_id.set(next_id.get() + 1);
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: id.clone(),
+                method: "textDocument/completion".into(),
+                params: serde_json::json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character},
+                    "context": {"triggerKind": 1},
+                }),
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let message = client
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("completion response");
+            if let Message::Response(response) = message
+                && response.id == id
+            {
+                return response
+                    .result()
+                    .and_then(|value| serde_json::from_value::<Vec<CompletionItem>>(value).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|item| item.label)
+                    .collect::<Vec<_>>();
+            }
+        }
+    };
+    let wait_for = |label, line, column, present| {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let labels = complete(line, column);
+            if labels.iter().any(|name| name == label) == present {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{label}: {labels:?}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    assert!(!complete(0, 9).iter().any(|item| item == "Dagger"));
+    let pin = |name| {
+        write_file(
+            &manifest,
+            &format!(
+                "manifest_format = '2.0'\njulia_version = '1.13.0'\n[[deps.Dagger]]\nuuid = '{uuid}'\npath = '{name}'\n"
+            ),
+        );
+    };
+    write_file(&project, &format!("{no_deps}Dagger = '{uuid}'\n"));
+    pin("dep-one");
+    wait_for("Dagger", 0, 9, true);
+    wait_for("only_first", 2, 7, true);
+
+    // Manifest-only change: the same direct dependency now resolves to a
+    // different installed source. The old member must not survive the swap.
+    pin("dep-two-new");
+    wait_for("only_second", 2, 7, true);
+    assert!(!complete(2, 7).iter().any(|item| item == "only_first"));
+
+    write_file(&project, no_deps);
+    fs::remove_file(manifest).unwrap();
+    wait_for("Dagger", 0, 9, false);
+    wait_for("only_second", 2, 7, false);
+
+    let id = RequestId::from(2);
+    client
+        .sender
+        .send(Message::Request(Request {
+            id: id.clone(),
+            method: "shutdown".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
+    assert!(recv_response(&client, id).result().is_some());
+    client
+        .sender
+        .send(Message::Notification(Notification {
+            method: "exit".into(),
+            params: serde_json::Value::Null,
+        }))
+        .unwrap();
     thread.join().unwrap();
 }

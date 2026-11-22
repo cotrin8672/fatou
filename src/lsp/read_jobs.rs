@@ -65,6 +65,7 @@ pub(crate) struct ReadReply {
     cancelled: Option<Arc<AtomicBool>>,
     membership_generation: Option<u64>,
     completion_data_defaults: bool,
+    incomplete_completion: bool,
 }
 
 impl ReadReply {
@@ -75,6 +76,7 @@ impl ReadReply {
             cancelled: None,
             membership_generation: None,
             completion_data_defaults: false,
+            incomplete_completion: false,
         }
     }
 
@@ -85,6 +87,11 @@ impl ReadReply {
 
     pub(crate) fn with_completion_data_defaults(mut self, supported: bool) -> Self {
         self.completion_data_defaults = supported;
+        self
+    }
+
+    pub(crate) fn with_incomplete_completion(mut self, incomplete: bool) -> Self {
+        self.incomplete_completion = incomplete;
         self
     }
 
@@ -101,11 +108,24 @@ impl ReadReply {
         } else {
             // Captured replies above stay arrays. Only the final wire response
             // (including any multi-context merge) may become a CompletionList.
-            if self.completion_data_defaults
-                && let Message::Response(response) = &mut message
+            if let Message::Response(response) = &mut message
                 && let Ok(value) = &mut response.response_result
             {
-                super::completion::compact_response(value);
+                if self.completion_data_defaults {
+                    super::completion::compact_response(value);
+                }
+                if self.incomplete_completion {
+                    // Compaction may already have created a list with defaults.
+                    // Multi-context replies are still merged before this step.
+                    if let Some(list) = value.as_object_mut() {
+                        list.insert("isIncomplete".into(), true.into());
+                    } else if value.is_array() {
+                        *value = serde_json::json!({
+                            "isIncomplete": true,
+                            "items": value.take(),
+                        });
+                    }
+                }
             }
             self.out_tx.send(Outbound::ReadReply {
                 message,
