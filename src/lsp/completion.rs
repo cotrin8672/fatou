@@ -510,7 +510,38 @@ pub(crate) fn completion_for_punctuation_trigger(
         add_completion_source_path(&mut items, path);
         items
     }))
-    .unwrap_or_default()
+    .unwrap_or_else(|_| {
+        import_package_root_without_snapshot(snapshot, path, text, offset, encoding)
+    })
+}
+
+/// Package-name completion requires only the source and declared dependencies.
+/// A library publication should not turn an otherwise valid first `using `
+/// request into an empty list. Do not guess at symbols or ordinary names when
+/// we cannot read the indexed environment.
+fn import_package_root_without_snapshot(
+    snapshot: &Analysis,
+    path: &Path,
+    text: &TextBuffer,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Vec<CompletionItem> {
+    let parsed = parse_with_options(text, snapshot.options_for_path(path));
+    let Some(context) = imports::context_at(&parsed.cst, text, offset) else {
+        return Vec::new();
+    };
+    if !context.package_root() || context.alias_destination() {
+        return Vec::new();
+    }
+    context.complete(
+        None,
+        &std::collections::BTreeMap::new(),
+        None,
+        imports::disk_project_names(snapshot, path),
+        offset,
+        &text.line_index(),
+        encoding,
+    )
 }
 
 fn import_from_tree(
@@ -1944,6 +1975,59 @@ mod tests {
     use crate::index::{
         ConstDef, FunctionGroup, MacroDef, Method, Param, TypeDef, TypeExpr, TypeKind,
     };
+
+    #[test]
+    fn snapshotless_import_completion_uses_selected_project_and_precise_context() {
+        use crate::incremental::IncrementalDatabase;
+        use crate::parse_context::{SourceContext, SourceRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Project.toml");
+        let file = dir.path().join("script.jl");
+        std::fs::write(
+            &project,
+            "[deps]\nGhostPkg = \"00000000-0000-0000-0000-000000000001\"\n",
+        )
+        .unwrap();
+        let db = IncrementalDatabase::default();
+        let snapshot = db.snapshot().with_context(
+            SourceContext {
+                entry: file.clone(),
+                source: EditionSource::Project {
+                    path: project,
+                    role: SourceRole::Script,
+                },
+            },
+            crate::parser::ParseOptions::default(),
+        );
+        let complete = |source: &str| {
+            let (before, after) = source.split_once('│').unwrap();
+            import_package_root_without_snapshot(
+                &snapshot,
+                &file,
+                &TextBuffer::new(format!("{before}{after}")),
+                TextSize::new(before.len() as u32),
+                PositionEncoding::Utf16,
+            )
+        };
+        let labels = complete("using │")
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Base", "Core", "GhostPkg", "Main"]);
+        let mut prefixed = complete("import Gh│Wrong, Base").into_iter();
+        assert_eq!(
+            prefixed.next().and_then(|item| item.text_edit),
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 7), Position::new(0, 14)),
+                new_text: "GhostPkg".into(),
+            }))
+        );
+        assert!(prefixed.next().is_none());
+        for source in ["# using │", "x = 1 │", "import Base as │", "using Base: │"] {
+            assert!(complete(source).is_empty(), "{source}");
+        }
+    }
 
     fn loc() -> DefLocation {
         DefLocation {

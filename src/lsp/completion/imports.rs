@@ -219,11 +219,6 @@ pub(super) fn context_at<'a>(
     };
     let prefix = &typed[prefix_start..];
     let start = clause_start + prefix_start;
-    let end = text[cursor..]
-        .char_indices()
-        .take_while(|(_, c)| is_ident_continue(*c))
-        .last()
-        .map_or(cursor, |(i, c)| cursor + i + c.len_utf8());
     let prefix_head = typed[..prefix_start].trim_start();
     let (parent, symbols) = if let Some(base_end) = base_end {
         if !prefix_head.is_empty() {
@@ -258,6 +253,17 @@ pub(super) fn context_at<'a>(
         let symbols = stmt.kind() == SyntaxKind::IMPORT_STMT && !parent.components.is_empty();
         (parent, symbols)
     };
+    // A selective import can be completed at the start of an existing
+    // macro token, too. Include that token's `@` and name in the edit and
+    // offer only macros, rather than inserting a second token before it.
+    let existing_macro = symbols && prefix.is_empty() && text[cursor..].starts_with('@');
+    let suffix_start = cursor + usize::from(existing_macro);
+    let end = text[suffix_start..]
+        .char_indices()
+        .take_while(|(_, c)| is_ident_continue(*c))
+        .last()
+        .map_or(suffix_start, |(i, c)| suffix_start + i + c.len_utf8());
+    let prefix = if existing_macro { "@" } else { prefix };
     Some(ImportContext {
         parent,
         symbols,
@@ -298,7 +304,31 @@ pub(super) fn project_names(snapshot: &Analysis, path: &Path) -> BTreeSet<String
             .ok()
             .and_then(|text| parse_project_str(&text))
     };
-    parsed.map_or_else(BTreeSet::new, |project| {
+    names_from_project(parsed)
+}
+
+/// During Salsa cancellation no tracked inputs can safely be read. Follow an
+/// already chosen project context, or discover the enclosing project directly.
+pub(super) fn disk_project_names(snapshot: &Analysis, path: &Path) -> BTreeSet<String> {
+    let selected = snapshot
+        .context()
+        .and_then(|context| match &context.source {
+            EditionSource::Project { path, .. } => Some(path.clone()),
+            _ => None,
+        });
+    let project = selected.or_else(|| {
+        let parent = path.parent().unwrap_or(path);
+        discover_project(&EnvContext::from_process(parent.to_path_buf()))
+    });
+    names_from_project(project.and_then(|project| {
+        std::fs::read_to_string(project)
+            .ok()
+            .and_then(|text| parse_project_str(&text))
+    }))
+}
+
+fn names_from_project(project: Option<crate::environment::ProjectFile>) -> BTreeSet<String> {
+    project.map_or_else(BTreeSet::new, |project| {
         let mut names = project.declared_dep_names();
         names.extend(project.name.map(|name| name.into_inner()));
         names
@@ -606,6 +636,33 @@ mod tests {
                 new_text: "FFTW".into(),
             }))
         );
+    }
+
+    #[test]
+    fn selective_import_replaces_macro_from_either_side_of_at_sign() {
+        let preamble = "module Fixture\nanswer = 1\nmacro shiny(x) end\nend\n";
+        for (source, start, end) in [
+            ("using .Fixture: │@shWrong", 16, 24),
+            ("using .Fixture: @sh│Wrong", 16, 24),
+            ("import .Fixture: │@shWrong", 17, 25),
+            ("import .Fixture.│@shWrong", 16, 24),
+            ("using .Fixture: │@", 16, 17),
+        ] {
+            let items = candidates(&format!("{preamble}{source}")).unwrap();
+            assert_eq!(items.len(), 1, "{source}: {items:?}");
+            assert_eq!(items[0].label, "@shiny");
+            assert_eq!(
+                items[0].text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit {
+                    range: Range::new(
+                        lsp_types::Position::new(4, start),
+                        lsp_types::Position::new(4, end)
+                    ),
+                    new_text: "@shiny".into(),
+                })),
+                "{source}"
+            );
+        }
     }
 
     #[test]
