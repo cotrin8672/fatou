@@ -10,7 +10,7 @@
 //!    are together exactly "does the name bind in this file?" — already answered
 //!    by the [`SemanticModel`];
 //! 3. **`using`'d exports** — the `export`ed names of a whole-module `using X`,
-//!    tried in source order (first `using` that exports the name wins);
+//!    with ambiguity reported when multiple imports provably expose different bindings;
 //! 4. **Base/Core implicit** — the names every (non-bare) module gets for free.
 //!
 //! [`Resolver::resolve`] walks the tiers and returns the first hit;
@@ -53,6 +53,8 @@ pub enum Namespace {
 /// nested `module` resolves against that module rather than the root, and two
 /// same-named symbols in different modules never conflate.
 pub type ModulePath = Vec<SmolStr>;
+
+type UsingProvider = (SmolStr, Arc<ModuleIndexHandle>);
 
 /// The key of a workspace symbol in the reverse-occurrence index: the dev
 /// package it belongs to, the module it lives in, its namespace, and its
@@ -165,7 +167,8 @@ pub fn module_at<'m>(root: &'m ModuleIndex, path: &[SmolStr]) -> Option<&'m Modu
 pub enum Resolution {
     /// A global supplied by an explicitly configured script program.
     Script { name: SmolStr },
-    /// The file participates in script contexts with different answers.
+    /// Different script contexts disagree, or multiple whole-module imports
+    /// provably expose different bindings under one name.
     Ambiguous,
     /// A binding in this file: a local, parameter, global, or explicit import.
     Binding(BindingId),
@@ -360,7 +363,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     }
 
     /// Resolve `name` (bare, without `@` even in [`Namespace::Macro`]) as read
-    /// at `offset`, walking the four tiers and returning the first hit.
+    /// at `offset`, walking the four tiers in order.
     pub fn resolve(&self, name: &str, offset: TextSize, namespace: Namespace) -> Resolution {
         self.resolve_at_scope(name, offset, namespace, self.model.scope_at(offset))
     }
@@ -464,45 +467,24 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                 }
             }
         }
-        // Tier 3: a whole-module `using`'s exports, in source order — this
-        // file's, then those a sibling file opened module-wide.
-        if script.is_none()
-            && let Some((module, _)) = self.using_export(&wanted, offset)
-        {
-            return Resolution::Using {
-                module,
-                name: wanted,
-            };
-        }
-        if let Some(module) = script_module {
-            for using in &module.usings {
-                if using.leading_dots != 0 {
-                    continue;
-                }
-                let Some((head, rest)) = using.components.split_first() else {
-                    continue;
+        // Tier 3: a whole-module `using` opens exports without binding them
+        // explicitly. Julia does not select the first of distinct bindings.
+        let module = if let Some(module) = script_module {
+            self.opened_export(&wanted, self.indexed_usings(&module.usings))
+        } else if script.is_none() {
+            self.opened_export(&wanted, self.visible_usings(scope))
+        } else {
+            Ok(None)
+        };
+        match module {
+            Err(()) => return Resolution::Ambiguous,
+            Ok(Some((module, _))) => {
+                return Resolution::Using {
+                    module,
+                    name: wanted,
                 };
-                let Some(pkg) = self.packages.package(head) else {
-                    continue;
-                };
-                let path: ModulePath = rest.iter().map(SmolStr::new).collect();
-                if module_at(&pkg.root, &path).is_some_and(|module| module_exports(module, &wanted))
-                {
-                    return Resolution::Using {
-                        module: using.components.join(".").into(),
-                        name: wanted,
-                    };
-                }
             }
-        }
-        if let Some(workspace) = &self.workspace
-            && script.is_none()
-            && let Some((module, _)) = self.workspace_using_export(workspace, &wanted, offset)
-        {
-            return Resolution::Using {
-                module,
-                name: wanted,
-            };
+            Ok(None) => {}
         }
         // Tier 4: Base/Core implicit.
         if let Some((module, _)) = self.system_export(&wanted) {
@@ -702,6 +684,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             .functions
             .iter()
             .any(|f| f.owner.is_none() && f.name == name.as_str())
+            && !module_imports(&module, name)
         {
             Some(QualifiedMemberKind::Function)
         } else {
@@ -910,47 +893,37 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             }
         }
 
-        // Tier 3: whole-module `using`'d exports, in source order — this file's,
-        // then those a sibling file opened module-wide.
+        // Track duplicates only among the whole-module imports. Explicit
+        // bindings and locals above them keep their existing precedence.
         let at = self.model.scope_at(offset);
-        for load in self.model.module_loads() {
-            let Some(module) = self.using_module(load, at) else {
+        let mut using_paths = HashSet::new();
+        let mut using_names = HashSet::new();
+        let mut checked = HashSet::new();
+        let mut ambiguous = HashSet::new();
+        for (path, module) in self.visible_usings(at) {
+            let display: SmolStr = path.rsplit('.').next().unwrap_or(&path).into();
+            if !using_paths.insert(path) {
                 continue;
-            };
-            let display = load.path.components.last().unwrap().clone();
+            }
             for name in exported_names(&module, namespace) {
                 if seen.insert(name.clone()) {
+                    using_names.insert(name.clone());
                     out.push(Candidate {
                         name,
                         source: Source::Using {
                             module: display.clone(),
                         },
                     });
+                } else if using_names.contains(&name)
+                    && checked.insert(name.clone())
+                    && self.opened_export(&name, self.visible_usings(at)).is_err()
+                {
+                    ambiguous.insert(name);
                 }
             }
         }
-        if let Some(workspace) = &self.workspace
-            && let Some(module) = module_at(
-                &workspace.pkg.root,
-                &self.full_module_path(workspace, self.model.scope_at(offset)),
-            )
-        {
-            for using in &module.usings {
-                let Some(target) = self.resolve_using(using) else {
-                    continue;
-                };
-                let display = SmolStr::new(using.components.last().unwrap());
-                for name in exported_names(&target, namespace) {
-                    if seen.insert(name.clone()) {
-                        out.push(Candidate {
-                            name,
-                            source: Source::Using {
-                                module: display.clone(),
-                            },
-                        });
-                    }
-                }
-            }
+        if !ambiguous.is_empty() {
+            out.retain(|candidate| !ambiguous.contains(&candidate.name));
         }
 
         // Tier 4: Base/Core implicit.
@@ -1204,48 +1177,106 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         None
     }
 
-    /// Tier 3: the first whole-module `using` visible at `offset` that exports
-    /// `wanted`, as `(full module path, target module)`.
-    fn using_export(
-        &self,
-        wanted: &SmolStr,
-        offset: TextSize,
-    ) -> Option<(SmolStr, Arc<ModuleIndexHandle>)> {
-        let at = self.model.scope_at(offset);
-        for load in self.model.module_loads() {
-            let Some(module) = self.using_module(load, at) else {
-                continue;
-            };
-            if module_exports(&module, wanted) {
-                return Some((load.path.components.join(".").into(), module));
-            }
-        }
-        None
+    /// All resolvable whole-module imports from the file and indexed siblings.
+    fn visible_usings(&self, scope: ScopeId) -> impl Iterator<Item = UsingProvider> + '_ {
+        let local = self.model.module_loads().iter().filter_map(move |load| {
+            let module = self.using_module(load, scope)?;
+            Some((load.path.components.join(".").into(), module))
+        });
+        let sibling = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| {
+                module_at(
+                    &workspace.pkg.root,
+                    &self.full_module_path(workspace, scope),
+                )
+            })
+            .into_iter()
+            .flat_map(|module| self.indexed_usings(&module.usings));
+        local.chain(sibling)
     }
 
-    /// Tier 3 across files: the first whole-module `using` opened in any file of
-    /// the module enclosing `offset` (harvested into its
-    /// [`usings`](ModuleIndex::usings)) that exports `wanted`, as `(full module
-    /// path, target module)`. Mirrors [`using_export`](Self::using_export) but
-    /// sources the clauses from the workspace index rather than this file's
-    /// model, so a sibling file's module-wide `using` resolves.
-    fn workspace_using_export(
+    fn indexed_usings<'b>(
+        &'b self,
+        usings: &'b [ModuleUsing],
+    ) -> impl Iterator<Item = UsingProvider> + 'b {
+        usings.iter().filter_map(|using| {
+            let module = self.resolve_using(using)?;
+            Some((using.components.join(".").into(), module))
+        })
+    }
+
+    /// Check binding identity only when distinct visible module paths both
+    /// claim this name. An export statement alone is not a binding, and two
+    /// independently assigned constants can be `===` at runtime.
+    fn opened_export(
         &self,
-        workspace: &WorkspaceCtx,
         wanted: &SmolStr,
-        offset: TextSize,
-    ) -> Option<(SmolStr, Arc<ModuleIndexHandle>)> {
-        let path = self.full_module_path(workspace, self.model.scope_at(offset));
-        let module = module_at(&workspace.pkg.root, &path)?;
-        for using in &module.usings {
-            let Some(target) = self.resolve_using(using) else {
+        providers: impl Iterator<Item = UsingProvider>,
+    ) -> Result<Option<UsingProvider>, ()> {
+        let mut exports = providers.filter(|(_, module)| module_exports(module, wanted));
+        let Some(first) = exports.next() else {
+            return Ok(None);
+        };
+        let mut checked = HashSet::new();
+        let mut identified = None;
+        let mut multiple = false;
+        for (path, module) in exports {
+            if path == first.0 || !checked.insert(path) {
                 continue;
-            };
-            if module_exports(&target, wanted) {
-                return Some((using.components.join(".").into(), target));
+            }
+            if !multiple {
+                identified = self.defined_export_origin(&first.1, wanted);
+                multiple = true;
+            }
+            if let Some(origin) = self.defined_export_origin(&module, wanted) {
+                if identified
+                    .as_ref()
+                    .is_some_and(|previous| previous != &origin)
+                {
+                    return Err(());
+                }
+                identified = Some(origin);
             }
         }
-        None
+        Ok(Some(first))
+    }
+
+    /// Identity that does not require evaluating arbitrary Julia expressions.
+    fn defined_export_origin(
+        &self,
+        module: &ModuleIndexHandle,
+        wanted: &SmolStr,
+    ) -> Option<QualifiedMember> {
+        if !module.pkg.diagnostics.is_empty() {
+            return None;
+        }
+        let mut path = vec![SmolStr::new(&module.pkg.name)];
+        path.extend_from_slice(&module.rest);
+        let origin = self.qualified_member_origin(&path, wanted)?;
+        match &origin {
+            QualifiedMember::Module(_) => Some(origin),
+            QualifiedMember::Symbol {
+                kind: QualifiedMemberKind::Const,
+                ..
+            } => None,
+            QualifiedMember::Symbol {
+                module,
+                name,
+                kind: QualifiedMemberKind::Function,
+            } => self
+                .indexed_module_at(module)?
+                .functions
+                .iter()
+                .any(|group| {
+                    group.owner.is_none()
+                        && group.name == name.as_str()
+                        && group.methods.iter().any(|method| !method.is_generated)
+                })
+                .then_some(origin),
+            QualifiedMember::Symbol { .. } => Some(origin),
+        }
     }
 
     /// The [`ModuleIndex`] a harvested whole-module `using` clause points at, or
@@ -1283,13 +1314,10 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         wanted: &SmolStr,
         offset: TextSize,
     ) -> Option<(SmolStr, Arc<ModuleIndexHandle>)> {
-        self.using_export(wanted, offset)
-            .or_else(|| {
-                self.workspace
-                    .as_ref()
-                    .and_then(|workspace| self.workspace_using_export(workspace, wanted, offset))
-            })
-            .or_else(|| {
+        match self.opened_export(wanted, self.visible_usings(self.model.scope_at(offset))) {
+            Ok(Some(provider)) => Some(provider),
+            Err(()) => None,
+            Ok(None) => {
                 let (module, pkg) = self.system_export(wanted)?;
                 Some((
                     module,
@@ -1298,7 +1326,8 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                         rest: Vec::new(),
                     }),
                 ))
-            })
+            }
+        }
     }
 
     /// The Base/Core module exporting `name` (tier 4), asked *independently of*
@@ -1708,6 +1737,105 @@ mod tests {
                 module: SmolStr::new("A"),
                 name: SmolStr::new("greet"),
             }
+        );
+    }
+
+    #[test]
+    fn using_distinguishes_conflicting_exports_from_proven_reexports() {
+        let lib = library(&[
+            harvested_package(
+                "A",
+                "export f, x\nf() = 1\nconst x = 1
+",
+            ),
+            harvested_package(
+                "B",
+                "export f, x\nf() = 2\nconst x = 1
+",
+            ),
+            harvested_package(
+                "Same",
+                "using A: f\nexport f
+",
+            ),
+            harvested_package(
+                "Extend",
+                "import A: f\nf(x) = x\nexport f
+",
+            ),
+            harvested_package(
+                "ConstAlias",
+                "import A\nconst f = A.f\nexport f
+",
+            ),
+        ]);
+        for src in ["using A, B\nf()", "using B, A\nf()", "using A, A, B\nf()"] {
+            assert_eq!(resolve(src, "f", &lib), Resolution::Ambiguous, "{src}");
+            let model = model_of(src);
+            let offset = after(src, "f");
+            let resolver = Resolver::new(&model, &lib);
+            assert!(
+                !resolver
+                    .visible(offset, Namespace::Value)
+                    .iter()
+                    .any(|c| c.name == "f"),
+                "{src}"
+            );
+        }
+        for src in [
+            "using A, Same\nf()",
+            "using Same, A\nf()",
+            "using A, Extend\nf()",
+            "using Extend, A\nf()",
+            "using A, ConstAlias\nf()",
+        ] {
+            assert!(
+                matches!(resolve(src, "f", &lib), Resolution::Using { .. }),
+                "{src}"
+            );
+            let model = model_of(src);
+            let offset = after(src, "f");
+            assert!(
+                Resolver::new(&model, &lib)
+                    .visible(offset, Namespace::Value)
+                    .iter()
+                    .any(|c| c.name == "f"),
+                "{src}"
+            );
+        }
+        assert!(matches!(
+            resolve("using A, B\nx", "x", &lib),
+            Resolution::Using { .. }
+        ));
+        assert!(matches!(
+            resolve("using A, B\nimport A: f\nf()", "f", &lib),
+            Resolution::Binding(_)
+        ));
+    }
+
+    #[test]
+    fn using_detects_conflicts_with_an_indexed_sibling_import() {
+        let a = harvested_package(
+            "A",
+            "export f\nf() = 1
+",
+        );
+        let b = harvested_package(
+            "B",
+            "export f\nf() = 2
+",
+        );
+        let ws = harvested_package(
+            "Root", "using B
+",
+        );
+        let lib = library(&[a, b]);
+        let src = "using A\nf()";
+        let model = model_of(src);
+        let resolver = Resolver::new(&model, &lib).with_workspace(Some((ws, vec![])));
+        assert_eq!(
+            resolver.resolve("f", after(src, "f"), Namespace::Value),
+            Resolution::Ambiguous
         );
     }
 
