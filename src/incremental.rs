@@ -3021,7 +3021,7 @@ impl Analysis {
 
     /// The harvested index for package `name`, if present.
     pub fn library_package(&self, name: &str) -> Option<Arc<PackageIndex>> {
-        if let Some(scoped) = self.scoped_library_lookup(name) {
+        if let Some(scoped) = self.scoped_library_lookup(name, false) {
             return scoped.map(|(index, _)| index);
         }
         library_package_for_context(&self.0, name, self.2.as_ref())
@@ -3029,7 +3029,11 @@ impl Analysis {
 
     /// Outer None denotes a legacy/manual index without environment facts.
     /// A known missing pin must not use the merged first-workspace index.
-    fn scoped_library_lookup(&self, name: &str) -> Option<Option<ScopedLibraryResult>> {
+    fn scoped_library_lookup(
+        &self,
+        name: &str,
+        allow_pinned: bool,
+    ) -> Option<Option<ScopedLibraryResult>> {
         use crate::parse_context::EditionSource;
         let db = &self.0;
         let context = self.2.as_ref()?;
@@ -3078,7 +3082,7 @@ impl Analysis {
                     }
                     EditionSource::Fixed(_) => false,
                 };
-                if visible {
+                if visible || allow_pinned {
                     let selection = select_edition_source(db, &pin.syntax.source);
                     return Some(
                         selection
@@ -3100,6 +3104,45 @@ impl Analysis {
         }
         // Stdlib is available via the separate Julia stdlib load path.
         Some(scoped.system.get(name).cloned())
+    }
+
+    /// Lookup within the selected environment after a resolver has already
+    /// proved the canonical origin of a member. This may name a transitive
+    /// pin, and must not be used to resolve a lexical top-level import.
+    pub(crate) fn library_package_in_environment(&self, name: &str) -> Option<Arc<PackageIndex>> {
+        if let Some(scoped) = self.scoped_library_lookup(name, true) {
+            return scoped.map(|(index, _)| index);
+        }
+        self.library_package(name)
+    }
+
+    /// Follow a package's own Manifest dependency edge inside the active
+    /// environment. Never fall back to another editor root while walking an
+    /// import or re-export from a pinned package.
+    pub(crate) fn library_dependency_package(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Option<Arc<PackageIndex>> {
+        let db = &self.0;
+        let Some(input) = LibrarySyntaxInput::try_get(db) else {
+            return self.library_package(name);
+        };
+        let scoped = &input.data(db).scoped;
+        if scoped.owners.is_empty() || self.2.is_none() {
+            return self.library_package(name);
+        }
+        if let Some(env) = self
+            .2
+            .as_ref()
+            .and_then(|context| context.source.path())
+            .and_then(|path| scoped.owners.get(path))
+            && let Some(pin) = env.pins.get(owner)
+            && (owner == name || pin.deps.contains(name))
+        {
+            return self.library_package_in_environment(name);
+        }
+        scoped.system.get(name).map(|(pkg, _)| Arc::clone(pkg))
     }
 
     /// Exact environment membership for optional auto-import edits: a direct
@@ -3145,7 +3188,7 @@ impl Analysis {
     /// The absolute source root of package `name`, if the live server has
     /// located the depot and harvested it.
     pub fn package_root(&self, name: &str) -> Option<PathBuf> {
-        if let Some(scoped) = self.scoped_library_lookup(name) {
+        if let Some(scoped) = self.scoped_library_lookup(name, false) {
             return scoped.and_then(|(_, root)| root);
         }
         self.0.package_root(name)
