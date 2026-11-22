@@ -979,7 +979,17 @@ fn completions_for<P: PackageSource>(
     }
 
     let context = context_at(text, offset_bytes);
-    match context {
+    let ordinary_name = matches!(
+        context,
+        Context::Value
+            | Context::Macro
+            | Context::Member {
+                macro_member: false,
+                ..
+            }
+    );
+    let bare_macro = matches!(context, Context::Macro);
+    let mut items = match context {
         // A sequence is an input method, not code, so it wins over the
         // identifier run it would otherwise look like. Where the backslash is
         // more likely the literal's own than an input sequence, nothing is
@@ -1041,11 +1051,16 @@ fn completions_for<P: PackageSource>(
                 if !site.explicit() {
                     items.extend(ordinary_value_items(model, packages, workspace, offset));
                 }
-                return items;
+                items
+            } else {
+                ordinary_value_items(model, packages, workspace, offset)
             }
-            ordinary_value_items(model, packages, workspace, offset)
         }
+    };
+    if ordinary_name && !items.is_empty() {
+        complete_identifier_suffix(&mut items, text, offset, root, lines, encoding, bare_macro);
     }
+    items
 }
 
 fn ordinary_value_items<P: PackageSource>(
@@ -1290,10 +1305,9 @@ fn scan_dotted(s: &str) -> Vec<String> {
     comps
 }
 
-/// Whether `c` can appear inside a Julia identifier. Approximate — good enough
-/// to delimit the completion context, not to lex.
+/// Match Julia's identifier continuation rules when scanning around a caret.
 fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '!'
+    crate::parser::is_ident_continue(c)
 }
 
 // --- LaTeX and emoji sequences ---------------------------------------------
@@ -1600,6 +1614,73 @@ fn heuristic_kind(name: &str, ns: Namespace) -> CompletionItemKind {
     match name.chars().next() {
         Some(c) if c.is_uppercase() => CompletionItemKind::CLASS,
         _ => CompletionItemKind::FUNCTION,
+    }
+}
+
+/// Only a mid-token completion needs to override the client's word edit. An
+/// explicit range avoids appending the old suffix in prefix-only clients.
+fn complete_identifier_suffix(
+    items: &mut [CompletionItem],
+    text: &str,
+    offset: TextSize,
+    root: &SyntaxNode,
+    lines: &LineIndex,
+    encoding: PositionEncoding,
+    macro_name: bool,
+) {
+    use crate::parser::{is_ident_continue, is_ident_start};
+
+    let at: usize = offset.into();
+    let tail = &text[at..];
+    if !tail.chars().next().is_some_and(is_ident_continue) {
+        return;
+    }
+
+    let mut suffix = tail.char_indices().peekable();
+    let mut end = at;
+    while let Some((relative, ch)) = suffix.next() {
+        // Julia lexes a trailing `!=` as an operator, not half an identifier.
+        if !is_ident_continue(ch) || ch == '!' && suffix.peek().is_some_and(|&(_, c)| c == '=') {
+            break;
+        }
+        end = at + relative + ch.len_utf8();
+    }
+    if end == at {
+        return;
+    }
+    let (prefix, before) = take_ident_back(&text[..at]);
+    if !prefix.chars().next().is_some_and(is_ident_start)
+        || string_context_at(root, offset) != StringContext::Code
+    {
+        return;
+    }
+    let range = lsp_types::Range::new(
+        lines.byte_to_position(before.len(), encoding),
+        lines.byte_to_position(end, encoding),
+    );
+    for item in items {
+        if item.text_edit.is_some() || item.insert_text.is_some() {
+            continue;
+        }
+        let label = if macro_name {
+            let Some(label) = item.label.strip_prefix('@') else {
+                continue;
+            };
+            label
+        } else {
+            &item.label
+        };
+        let mut chars = label.chars();
+        if !chars.next().is_some_and(is_ident_start) || !chars.all(is_ident_continue) {
+            continue;
+        }
+        if macro_name {
+            item.filter_text = Some(label.to_string());
+        }
+        item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+            range,
+            new_text: label.to_string(),
+        }));
     }
 }
 
@@ -1929,6 +2010,72 @@ mod tests {
         let line_index = LineIndex::new(src);
         let position = line_index.byte_to_position(offset, PositionEncoding::Utf16);
         compute_completions(src, position, PositionEncoding::Utf16, lib)
+    }
+
+    #[test]
+    fn mid_identifier_edits_replace_existing_suffix_without_touching_punctuation() {
+        let mut base = module("Base", &[]);
+        base.functions.push(func("sqrt"));
+        let lib = library(vec![package(base)]);
+        for (source, prefix, old, candidate, expected) in [
+            (
+                "detuning = 1\ndetuNIng != nothing",
+                "\ndet",
+                "detuNIng",
+                "detuning",
+                "detuning",
+            ),
+            ("f() = Base.sqrtt(2)", "Base.sq", "sqrtt", "sqrt", "sqrt"),
+            (
+                "λ = 1; text = \"🔬\"; Base.sqrtt!=2",
+                "Base.sq",
+                "sqrtt",
+                "sqrt",
+                "sqrt",
+            ),
+            (
+                "macro sparkle() end\n@spWRONG 1",
+                "@sp",
+                "spWRONG",
+                "@sparkle",
+                "sparkle",
+            ),
+        ] {
+            let items = completions_at(source, prefix, &lib);
+            let found = items.iter().find(|item| item.label == candidate).unwrap();
+            let at = source.rfind(old).unwrap();
+            let lines = LineIndex::new(source);
+            assert_eq!(
+                edit(found),
+                (
+                    expected,
+                    lsp_types::Range::new(
+                        lines.byte_to_position(at, PositionEncoding::Utf16),
+                        lines.byte_to_position(at + old.len(), PositionEncoding::Utf16),
+                    ),
+                ),
+                "{source}",
+            );
+        }
+        let items = completions_at("detuning = 1\ndet", "\ndet", &lib);
+        assert!(
+            items
+                .iter()
+                .find(|i| i.label == "detuning")
+                .unwrap()
+                .text_edit
+                .is_none()
+        );
+        let literal = "detuning = 1\nprint(\"detuNIng\")";
+        let items = completions_at(literal, "\"det", &lib);
+        assert!(
+            items
+                .iter()
+                .find(|i| i.label == "detuning")
+                .unwrap()
+                .text_edit
+                .is_none()
+        );
     }
 
     fn labels(items: &[CompletionItem]) -> Vec<String> {
@@ -2626,6 +2773,27 @@ mod tests {
         let source = "function f(Base)\n    Base.in\nend\nBase.ind";
         let names = labels(&completions_at(source, "Base.ind", &lib));
         assert_eq!(names, vec!["indexed_member"]);
+    }
+
+    #[test]
+    fn member_context_uses_julia_identifier_continuations() {
+        for (alias, member) in [("Tool′", "membre′"), ("Da\u{301}g", "me\u{301}lange")] {
+            let mut indexed = module("Library", &[]);
+            indexed.functions.push(func(member));
+            let lib = library(vec![package(indexed)]);
+            for suffix in ["", member] {
+                let site = format!("{alias}.{suffix}");
+                let source = format!("import Library as {alias}\n{site}");
+                assert_eq!(
+                    labels(&completions_at(&source, &site, &lib)),
+                    [member],
+                    "{source}"
+                );
+            }
+            let site = format!("{alias}.{member}");
+            let source = format!("import Library as {alias}\nlet {alias} = 1\n    {site}\nend");
+            assert!(completions_at(&source, &site, &lib).is_empty(), "{source}");
+        }
     }
 
     #[test]
