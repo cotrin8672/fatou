@@ -265,6 +265,19 @@ pub trait PackageSource {
 
     fn package(&self, name: &str) -> Option<Arc<PackageIndex>>;
 
+    /// A trusted path already resolved through a visible module may end at a
+    /// transitive provider in that same environment. Do not use this for a
+    /// name written by the user before proving how it is in scope.
+    fn environment_package(&self, name: &str) -> Option<Arc<PackageIndex>> {
+        self.package(name)
+    }
+
+    /// Verify that the importing package may load a target in its own
+    /// manifest context, even when the editor project cannot import it.
+    fn dependency_package(&self, _owner: &str, name: &str) -> Option<Arc<PackageIndex>> {
+        self.package(name)
+    }
+
     /// The absolute source root of package `name` (the directory its
     /// `DefLocation` paths are relative to), if known. Only the live server,
     /// which has located the depot on disk, can answer this; the plain harvest
@@ -506,6 +519,25 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         offset: TextSize,
         receiver_start: Option<TextSize>,
     ) -> Option<ModulePath> {
+        self.module_receiver_path_impl(written, offset, receiver_start, false)
+    }
+
+    pub(crate) fn indexed_module_receiver_path(
+        &self,
+        written: &[SmolStr],
+        offset: TextSize,
+        receiver_start: Option<TextSize>,
+    ) -> Option<ModulePath> {
+        self.module_receiver_path_impl(written, offset, receiver_start, true)
+    }
+
+    fn module_receiver_path_impl(
+        &self,
+        written: &[SmolStr],
+        offset: TextSize,
+        receiver_start: Option<TextSize>,
+        require_index: bool,
+    ) -> Option<ModulePath> {
         let (head, tail) = written.split_first()?;
         // A recorded occurrence has the actual scope of a read. In a let/for
         // initializer, that is outside the scope that binds the new variable,
@@ -546,7 +578,8 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                         }
                         // A clause can import a function, type, or value rather
                         // than a module. Confirm the target before using it.
-                        self.canonical_module_path(&path)?
+                        self.canonical_module_path(&path)?;
+                        path
                     }
                     _ => return None,
                 }
@@ -568,14 +601,16 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                 let mut path = self.full_module_path(workspace, scope);
                 path.insert(0, SmolStr::new(&workspace.pkg.name));
                 path.push(head.clone());
-                self.canonical_module_path(&path)?
+                self.canonical_module_path(&path)?;
+                path
             }
             Resolution::Using { module, name } | Resolution::System { module, name } => {
                 let mut path: ModulePath = module.split('.').map(SmolStr::new).collect();
                 if module != name {
                     path.push(name);
                 }
-                self.canonical_module_path(&path)?
+                self.canonical_module_path(&path)?;
+                path
             }
             Resolution::Unresolved => {
                 if let Some(workspace) = &self.workspace {
@@ -597,16 +632,29 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         };
         path.extend_from_slice(tail);
         self.canonical_module_path(&path)
+            .or_else(|| (!require_index).then_some(path))
     }
 
     fn indexed_module_at(&self, path: &[SmolStr]) -> Option<ModuleIndexHandle> {
+        self.module_index_with(path, |name| self.packages.package(name))
+    }
+
+    fn environment_module_at(&self, path: &[SmolStr]) -> Option<ModuleIndexHandle> {
+        self.module_index_with(path, |name| self.packages.environment_package(name))
+    }
+
+    fn module_index_with(
+        &self,
+        path: &[SmolStr],
+        lookup: impl FnOnce(&str) -> Option<Arc<PackageIndex>>,
+    ) -> Option<ModuleIndexHandle> {
         let (head, rest) = path.split_first()?;
         let pkg = self
             .workspace
             .as_ref()
             .filter(|workspace| workspace.pkg.name == head.as_str())
             .map(|workspace| workspace.pkg.clone())
-            .or_else(|| self.packages.package(head))?;
+            .or_else(|| lookup(head))?;
         module_at(&pkg.root, rest)?;
         Some(ModuleIndexHandle {
             pkg,
@@ -620,7 +668,18 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         if self.indexed_module_at(path).is_some() {
             return Some(path.to_vec());
         }
+        self.indexed_module_at(path.get(..1)?)?;
         self.module_origin(path, &mut Vec::new())
+    }
+
+    /// Follow imports from inside a package, not from the editor project's
+    /// direct-dependency view. Relative paths never leave the host package.
+    fn verify_import_root(&self, from: &[SmolStr], to: &[SmolStr]) -> Option<()> {
+        let (owner, target) = (from.first()?, to.first()?);
+        if owner != target {
+            self.packages.dependency_package(owner, target)?;
+        }
+        Some(())
     }
 
     fn module_origin(
@@ -630,7 +689,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     ) -> Option<ModulePath> {
         let (head, rest) = path.split_first()?;
         let mut current = vec![head.clone()];
-        self.indexed_module_at(&current)?;
+        self.environment_module_at(&current)?;
         for name in rest {
             match self.member_origin(&current, name, visiting)? {
                 QualifiedMember::Module(path) => current = path,
@@ -660,7 +719,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         if visiting.len() >= MAX_CHAIN || visiting.iter().any(|(p, n)| p == path && n == name) {
             return None;
         }
-        let module = self.indexed_module_at(path)?;
+        let module = self.environment_module_at(path)?;
         if module
             .submodules
             .iter()
@@ -723,8 +782,9 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                 }
                 for import in imports {
                     let target = import_target(path, import.leading_dots, &import.components)?;
+                    self.verify_import_root(path, &target)?;
                     let origin = if target.len() == 1 {
-                        self.indexed_module_at(&target)?;
+                        self.environment_module_at(&target)?;
                         QualifiedMember::Module(target)
                     } else {
                         let (last, parent) = target.split_last()?;
@@ -736,8 +796,9 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             } else {
                 for using in &module.usings {
                     let target = import_target(path, using.leading_dots, &using.components)?;
+                    self.verify_import_root(path, &target)?;
                     let provider = self.module_origin(&target, visiting)?;
-                    let opened = self.indexed_module_at(&provider)?;
+                    let opened = self.environment_module_at(&provider)?;
                     if module_exports(&opened, name) {
                         let origin = self.member_origin(&provider, name, visiting)?;
                         add_unique_member(&mut result, origin)?;
@@ -756,7 +817,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                         continue;
                     }
                     let provider = [SmolStr::new(system)];
-                    if let Some(opened) = self.indexed_module_at(&provider)
+                    if let Some(opened) = self.environment_module_at(&provider)
                         && module_exports(&opened, name)
                     {
                         let origin = self.member_origin(&provider, name, visiting)?;

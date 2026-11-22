@@ -899,7 +899,7 @@ fn auto_import_anchor<'a>(
 /// from the harvested library, keyed by the item's [`ResolveData`]. Returns the
 /// item unchanged when it carries no key or the symbol has no docs.
 pub(crate) fn resolve_completion(snapshot: &Analysis, item: CompletionItem) -> CompletionItem {
-    resolve_completion_with(&|name| snapshot.library_package(name), item)
+    resolve_completion_with(&|name| snapshot.environment_package(name), item)
 }
 
 /// The masking-order candidate set for `text` at `offset`, mapped to LSP items.
@@ -1763,7 +1763,8 @@ fn member_completions<P: PackageSource>(
 ) -> Vec<CompletionItem> {
     let written: ModulePath = receiver.iter().map(Into::into).collect();
     let resolver = Resolver::new(model, packages).with_workspace(workspace.clone());
-    let Some(resolved) = resolver.module_receiver_path(&written, offset, receiver_start) else {
+    let Some(resolved) = resolver.indexed_module_receiver_path(&written, offset, receiver_start)
+    else {
         return Vec::new();
     };
     let Some((head, tail)) = resolved.split_first() else {
@@ -1774,7 +1775,7 @@ fn member_completions<P: PackageSource>(
         .map(|(package, _)| package)
         .filter(|package| package.name == head.as_str())
         .cloned()
-        .or_else(|| packages.package(head));
+        .or_else(|| packages.environment_package(head));
     let Some(pkg) = pkg else { return Vec::new() };
     let tail: Vec<&str> = tail.iter().map(|part| part.as_str()).collect();
     let Some(module) = resolve_submodule(&pkg.root, &tail) else {
