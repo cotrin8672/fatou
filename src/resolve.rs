@@ -674,11 +674,15 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
 
         // Tiers 1 + 2: file bindings up the scope chain (stops at the first
         // global scope, like reads do).
-        let mut cursor = Some(self.model.scope_at(offset));
+        let completion_scope = self.model.completion_scope(offset);
+        let mut cursor = Some(completion_scope.id);
         while let Some(id) = cursor {
             let scope = self.model.scope(id);
+            let parameters_before = completion_scope.parameters_before(id);
             for &b in scope.bindings.iter().rev() {
-                if let Some(name) = namespaced_binding_name(self.model.binding(b), namespace)
+                let binding = self.model.binding(b);
+                if crate::semantic::CompletionScope::admits(binding, parameters_before)
+                    && let Some(name) = namespaced_binding_name(binding, namespace)
                     && seen.insert(name.clone())
                 {
                     out.push(Candidate {

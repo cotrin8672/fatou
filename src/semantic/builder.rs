@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::ast::{
@@ -598,6 +598,48 @@ struct Builder {
 }
 
 impl Builder {
+    /// Include the space immediately after the binding operator, including
+    /// the common completion request before any RHS token exists.
+    fn completion_rhs(
+        &mut self,
+        target: &SyntaxNode,
+        end: TextSize,
+        scope: ScopeId,
+        before: Option<TextSize>,
+    ) {
+        let mut sibling = target.next_sibling_or_token();
+        while let Some(element) = sibling {
+            let Some(token) = element.as_token() else {
+                break;
+            };
+            if matches!(token.text(), "=" | "in" | "∈") {
+                let start = token.text_range().end();
+                if start <= end {
+                    self.completion_region(TextRange::new(start, end), scope, before);
+                }
+                break;
+            }
+            if !matches!(
+                token.kind(),
+                SyntaxKind::WHITESPACE
+                    | SyntaxKind::NEWLINE
+                    | SyntaxKind::COMMENT
+                    | SyntaxKind::BLOCK_COMMENT
+            ) {
+                break;
+            }
+            sibling = token.next_sibling_or_token();
+        }
+    }
+
+    fn completion_region(&mut self, range: TextRange, scope: ScopeId, before: Option<TextSize>) {
+        self.model.completion_regions.push(super::CompletionRegion {
+            range,
+            scope,
+            parameters_before: before,
+        });
+    }
+
     fn push_scope(
         &mut self,
         kind: ScopeKind,
@@ -1971,6 +2013,9 @@ impl Builder {
                 if item.kind() == SyntaxKind::ASSIGNMENT_EXPR {
                     let mut parts = item.children();
                     let target = parts.next();
+                    if let Some(target) = &target {
+                        self.completion_rhs(target, item.text_range().end(), current, None);
+                    }
                     for rhs in parts {
                         self.walk_node(&rhs, current);
                     }
@@ -2007,7 +2052,16 @@ impl Builder {
         let mut i = 0;
         while i < clauses.len() {
             let target = &clauses[i];
-            if let Some(iterable) = clauses.get(i + 1) {
+            let iterable = clauses.get(i + 1);
+            self.completion_rhs(
+                target,
+                iterable
+                    .map_or(node.text_range(), SyntaxNode::text_range)
+                    .end(),
+                current,
+                None,
+            );
+            if let Some(iterable) = iterable {
                 self.walk_node(iterable, current);
             }
             let range = TextRange::new(target.text_range().start(), end);
@@ -2112,6 +2166,7 @@ impl Builder {
         }
         for child in &rest {
             if child.kind() != SyntaxKind::FOR_BINDING {
+                self.completion_region(child.text_range(), current, None);
                 self.declare_expression(child, current);
                 self.walk_node(child, current);
             }
@@ -2319,6 +2374,12 @@ impl Builder {
                 SyntaxKind::KEYWORD_ARG => {
                     let mut parts = child.children();
                     if let Some(pattern) = parts.next() {
+                        self.completion_rhs(
+                            &pattern,
+                            child.text_range().end(),
+                            scope,
+                            Some(child.text_range().start()),
+                        );
                         self.bind_param_pattern(&pattern, scope, kind);
                     }
                     for default in parts {

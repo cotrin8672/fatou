@@ -106,6 +106,39 @@ pub struct SemanticDoc {
     pub text: DocText,
 }
 
+/// A cursor region whose evaluation scope is not determined by containment
+/// in the textual ranges of bindings (for example, a generator's head).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionRegion {
+    range: TextRange,
+    scope: ScopeId,
+    /// A default expression sees earlier parameters, not its own parameter,
+    /// subsequent ones, or body-local declarations from the function scope.
+    parameters_before: Option<TextSize>,
+}
+
+pub(crate) struct CompletionScope {
+    limits: Vec<(ScopeId, TextSize)>,
+    pub(crate) id: ScopeId,
+}
+
+impl CompletionScope {
+    pub(crate) fn admits(binding: &Binding, parameters_before: Option<TextSize>) -> bool {
+        parameters_before.is_none_or(|limit| match binding.kind {
+            BindingKind::Param | BindingKind::KeywordParam => binding.def_range.start() < limit,
+            BindingKind::TypeParam => true,
+            _ => false,
+        })
+    }
+
+    pub(crate) fn parameters_before(&self, scope: ScopeId) -> Option<TextSize> {
+        self.limits
+            .iter()
+            .filter_map(|&(owner, before)| (owner == scope).then_some(before))
+            .min()
+    }
+}
+
 /// The semantic model of one file. Build with [`SemanticModel::build`]; in
 /// the language server, prefer the cached salsa query.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -118,6 +151,7 @@ pub struct SemanticModel {
     qualified_reads: Vec<QualifiedRead>,
     potential_import_reads: Vec<(ScopeId, SmolStr)>,
     documentation: Vec<SemanticDoc>,
+    completion_regions: Vec<CompletionRegion>,
 }
 
 impl SemanticModel {
@@ -215,6 +249,37 @@ impl SemanticModel {
             }
         }
         best
+    }
+
+    /// Scope at a completion cursor, accounting for expressions whose lookup
+    /// order is not their textual order. Keep genuinely nested scopes inside
+    /// the region, such as a lambda in an iterable or a default expression.
+    pub(crate) fn completion_scope(&self, offset: TextSize) -> CompletionScope {
+        let mut id = self.scope_at(offset);
+        let mut innermost: Option<&CompletionRegion> = None;
+        // Vec::new does not allocate for ordinary positions. For a nested
+        // default, both its signature and any enclosing signature can gate
+        // their own bindings.
+        let mut limits = Vec::new();
+        for region in &self.completion_regions {
+            if !region.range.contains_inclusive(offset) {
+                continue;
+            }
+            if innermost.is_none_or(|best| region.range.len() < best.range.len()) {
+                innermost = Some(region);
+            }
+            if let Some(before) = region.parameters_before {
+                limits.push((region.scope, before));
+            }
+        }
+        if let Some(region) = innermost
+            && (!region.range.contains_range(self.scope(id).range)
+                || !std::iter::successors(Some(id), |id| self.scope(*id).parent)
+                    .any(|id| id == region.scope))
+        {
+            id = region.scope;
+        }
+        CompletionScope { limits, id }
     }
 
     /// The bindings visible at `offset`, innermost first, shadowed names
