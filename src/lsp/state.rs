@@ -1497,6 +1497,7 @@ impl GlobalState {
             "**/Manifest.toml",
             "**/JuliaManifest.toml",
             "**/Manifest-v*.toml",
+            "**/JuliaManifest-v*.toml",
             "**/fatou.toml",
         ]
         .into_iter()

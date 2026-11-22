@@ -334,6 +334,7 @@ pub fn is_manifest_file(path: &Path) -> bool {
         MANIFEST_NAMES.contains(&name)
             || name
                 .strip_prefix("Manifest-v")
+                .or_else(|| name.strip_prefix("JuliaManifest-v"))
                 .and_then(|rest| rest.strip_suffix(".toml"))
                 .and_then(parse_version)
                 .is_some()
@@ -357,9 +358,9 @@ pub fn resolve(ctx: &EnvContext) -> Result<Option<Environment>, EnvironmentError
         .unwrap_or_default();
 
     let meta = parse_project(&project_file)?;
-    let (manifest_file, mut packages) = load_manifest(&project_dir, &depots)?;
-
     let install = locate_install(ctx, &depots);
+    let version = install.as_ref().map(|install| install.version.as_str());
+    let (manifest_file, mut packages) = load_manifest(&project_dir, &depots, version)?;
     if let Some(install) = &install {
         resolve_stdlib_sources(&mut packages, install);
     }
@@ -384,8 +385,9 @@ pub fn resolve(ctx: &EnvContext) -> Result<Option<Environment>, EnvironmentError
 pub(crate) fn load_manifest(
     project_dir: &Path,
     depots: &[PathBuf],
+    version: Option<&str>,
 ) -> Result<(Option<PathBuf>, Vec<Package>), EnvironmentError> {
-    let Some(path) = find_manifest(project_dir) else {
+    let Some(path) = find_manifest(project_dir, version) else {
         return Ok((None, Vec::new()));
     };
     let packages = parse_manifest(&path, project_dir, depots)?;
@@ -453,9 +455,21 @@ pub(crate) fn project_file_in(dir: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The sibling manifest for a project directory, honoring name precedence and
-/// falling back to the highest version-specific `Manifest-vX.Y.toml`.
-pub(crate) fn find_manifest(project_dir: &Path) -> Option<PathBuf> {
+/// The sibling manifest selected by the located Julia installation.
+/// Matching minor-version manifests take precedence over generic names,
+/// following Base's manifest_names. Never substitute a different minor when
+/// the runtime is known. For a source-only session with no known runtime,
+/// preserve the generic-first, highest-version fallback.
+pub(crate) fn find_manifest(project_dir: &Path, version: Option<&str>) -> Option<PathBuf> {
+    let version = version.and_then(parse_version);
+    if let Some((major, minor)) = version {
+        for prefix in ["JuliaManifest", "Manifest"] {
+            let path = project_dir.join(format!("{prefix}-v{major}.{minor}.toml"));
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
     if let Some(path) = MANIFEST_NAMES
         .iter()
         .map(|name| project_dir.join(name))
@@ -463,20 +477,24 @@ pub(crate) fn find_manifest(project_dir: &Path) -> Option<PathBuf> {
     {
         return Some(path);
     }
-    // Version-specific manifests (Julia 1.10.8+): pick the highest version.
+    if version.is_some() {
+        return None;
+    }
     std::fs::read_dir(project_dir)
         .ok()?
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
-            let version = name
-                .strip_prefix("Manifest-v")?
-                .strip_suffix(".toml")
-                .and_then(parse_version)?;
-            Some((version, entry.path()))
+            let (version, priority) = name
+                .strip_prefix("JuliaManifest-v")
+                .map(|name| (name, true))
+                .or_else(|| name.strip_prefix("Manifest-v").map(|name| (name, false)))?;
+            let version = parse_version(version.strip_suffix(".toml")?)?;
+            Some(((version, priority), entry.path()))
         })
-        .max_by_key(|(version, _)| *version)
+        .filter(|(_, path)| path.is_file())
+        .max_by_key(|(priority, _)| *priority)
         .map(|(_, path)| path)
 }
 
@@ -744,6 +762,10 @@ pub(crate) struct ProjectFile {
 }
 
 /// Locate only the project, without requiring a readable manifest or install.
+pub(crate) fn installed_version(ctx: &EnvContext) -> Option<String> {
+    locate_install(ctx, &depot_roots(ctx)).map(|install| install.version)
+}
+
 pub(crate) fn discover_project(ctx: &EnvContext) -> Option<PathBuf> {
     locate_project(ctx, &depot_roots(ctx)).map(|(path, _)| path)
 }
@@ -1097,7 +1119,8 @@ pub fn discover_julia_target(anchor: &Path) -> Option<VersionRange> {
         return Some(range);
     }
     let project_dir = project.parent()?;
-    let manifest = find_manifest(project_dir)?;
+    let version = installed_version(&EnvContext::from_process(anchor.to_path_buf()));
+    let manifest = find_manifest(project_dir, version.as_deref())?;
     read_toml(&manifest)
         .ok()
         .and_then(manifest_range_from_table)
@@ -1450,6 +1473,37 @@ projects = ["sub"]
                 "{name} does not steer resolution"
             );
         }
+    }
+
+    #[test]
+    fn runtime_version_chooses_matching_manifest_before_generic() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path();
+        let put = |name| std::fs::write(directory.join(name), "").unwrap();
+        put("Manifest-v1.14.toml");
+        assert_eq!(find_manifest(directory, Some("1.13")), None);
+        put("Manifest.toml");
+        assert_eq!(
+            find_manifest(directory, Some("1.13")),
+            Some(directory.join("Manifest.toml"))
+        );
+        put("Manifest-v1.13.toml");
+        assert_eq!(
+            find_manifest(directory, Some("1.13")),
+            Some(directory.join("Manifest-v1.13.toml"))
+        );
+        put("JuliaManifest-v1.13.toml");
+        assert_eq!(
+            find_manifest(directory, Some("1.13")),
+            Some(directory.join("JuliaManifest-v1.13.toml"))
+        );
+        assert!(is_manifest_file(
+            &directory.join("JuliaManifest-v1.13.toml")
+        ));
+        assert_eq!(
+            find_manifest(directory, None),
+            Some(directory.join("Manifest.toml"))
+        );
     }
 
     #[test]

@@ -6750,6 +6750,7 @@ fn registers_file_watchers_when_the_client_supports_it() {
         "**/Manifest.toml",
         "**/JuliaManifest.toml",
         "**/Manifest-v*.toml",
+        "**/JuliaManifest-v*.toml",
         "**/fatou.toml",
     ] {
         assert!(globs.contains(&expected), "missing {expected} in {globs:?}");

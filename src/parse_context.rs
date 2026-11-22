@@ -631,6 +631,7 @@ pub(crate) fn manifest_contexts(
         return (Vec::new(), BTreeMap::new());
     }
     let depots = environment::depot_roots(&ctx);
+    let version = environment::locate_install(&ctx, &depots).map(|install| install.version);
     let mut projects = BTreeMap::<PathBuf, Vec<&PathBuf>>::new();
     if let Some(project) = active_project {
         projects.insert(project.to_path_buf(), paths.iter().collect());
@@ -652,27 +653,27 @@ pub(crate) fn manifest_contexts(
         let Some(directory) = project.parent() else {
             continue;
         };
-        let (manifest, mut packages) = match environment::load_manifest(directory, &depots) {
-            Ok((Some(manifest), packages)) => (manifest, packages),
-            Ok((None, _)) => continue,
-            Err(error) => {
-                let path = match &error {
-                    EnvironmentError::Parse { path, .. } | EnvironmentError::Read { path, .. } => {
-                        path.clone()
+        let (manifest, mut packages) =
+            match environment::load_manifest(directory, &depots, version.as_deref()) {
+                Ok((Some(manifest), packages)) => (manifest, packages),
+                Ok((None, _)) => continue,
+                Err(error) => {
+                    let path = match &error {
+                        EnvironmentError::Parse { path, .. }
+                        | EnvironmentError::Read { path, .. } => path.clone(),
+                    };
+                    if let Some(issue) =
+                        EditionSelection::parse_error(&path, SyntaxEdition::OLDEST, error).issue
+                    {
+                        for target in targets {
+                            issues
+                                .entry(target.clone())
+                                .or_insert_with(|| issue.clone());
+                        }
                     }
-                };
-                if let Some(issue) =
-                    EditionSelection::parse_error(&path, SyntaxEdition::OLDEST, error).issue
-                {
-                    for target in targets {
-                        issues
-                            .entry(target.clone())
-                            .or_insert_with(|| issue.clone());
-                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         if packages
             .iter()
             .any(|package| package.kind == PackageKind::Stdlib)

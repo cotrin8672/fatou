@@ -23,11 +23,12 @@ struct Stamp {
 pub(super) struct EnvironmentFiles(BTreeMap<PathBuf, Stamp>);
 
 impl EnvironmentFiles {
-    pub(super) fn scan(roots: &[PathBuf]) -> Self {
+    pub(super) fn scan(roots: &[PathBuf], version: Option<&str>) -> Self {
         let mut paths = BTreeSet::new();
         for root in roots {
             if let Some(project) = discover_project(&EnvContext::from_process(root.clone())) {
-                if let Some(manifest) = project.parent().and_then(find_manifest) {
+                if let Some(manifest) = project.parent().and_then(|dir| find_manifest(dir, version))
+                {
                     paths.insert(manifest);
                 }
                 paths.insert(project);

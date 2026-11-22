@@ -574,8 +574,11 @@ fn spawn_workspace_harvester(
             // cannot be relied on for a project outside the workspace. Check
             // only the selected environment files, off the LSP request path.
             let poll = crossbeam_channel::tick(std::time::Duration::from_millis(500));
+            let version = crate::environment::installed_version(&EnvContext::from_process(
+                workspace_roots[0].clone(),
+            ));
             'resolve: loop {
-                let mut metadata = EnvironmentFiles::scan(&workspace_roots);
+                let mut metadata = EnvironmentFiles::scan(&workspace_roots, version.as_deref());
                 // Report the full pass (initial resolve, and every re-resolve a
                 // `continue 'resolve` restarts) as one begin/report/end cycle.
                 progress.begin("Indexing Julia environment", "Resolving environment");
@@ -647,7 +650,7 @@ fn spawn_workspace_harvester(
                             Err(_) => return,
                         },
                         recv(poll) -> _ => {
-                            let next = EnvironmentFiles::scan(&workspace_roots);
+                            let next = EnvironmentFiles::scan(&workspace_roots, version.as_deref());
                             let changes = metadata.changes_to(&next);
                             metadata = next;
                             if !changes.is_empty()
