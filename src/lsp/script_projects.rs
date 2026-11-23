@@ -222,13 +222,8 @@ impl ScriptProjects {
                 may_override_package_includes,
             },
         );
-        let entries: Vec<_> = self.configured_entries();
-        let script_changed = entries != self.entries;
-        if script_changed {
-            self.entries = entries;
-            self.entries_changed = true;
-        }
         let package_changed = (include_changed || newly_opened) && self.refresh_package_roots(db);
+        let script_changed = self.refresh_script_entries(db);
         if package_changed || script_changed || !self.entries.is_empty() || !self.sources.is_empty()
         {
             self.metadata = db.metadata_buffers();
@@ -238,11 +233,14 @@ impl ScriptProjects {
 
     pub fn metadata_changed(&mut self, db: &IncrementalDatabase) {
         self.refresh_package_roots(db);
+        self.refresh_script_entries(db);
         self.reload();
     }
 
     pub fn library_changed(&mut self, db: &IncrementalDatabase) {
-        if self.refresh_package_roots(db) {
+        let package_changed = self.refresh_package_roots(db);
+        let script_changed = self.refresh_script_entries(db);
+        if package_changed || script_changed {
             self.reload();
         }
     }
@@ -266,7 +264,7 @@ impl ScriptProjects {
             && self.refresh_package_roots(db);
         let mut script_changed = false;
         if closed.is_some() || self.sources.contains(&path) {
-            let entries = self.configured_entries();
+            let entries = self.script_entries(db);
             script_changed = entries != self.entries
                 || self.failed
                 || !self.sources.is_empty()
@@ -345,11 +343,36 @@ impl ScriptProjects {
         roots
     }
 
-    fn configured_entries(&self) -> Vec<PathBuf> {
+    fn refresh_script_entries(&mut self, db: &IncrementalDatabase) -> bool {
+        let entries = self.script_entries(db);
+        if entries == self.entries {
+            return false;
+        }
+        self.entries = entries;
+        self.entries_changed = true;
+        true
+    }
+
+    fn script_entries(&self, db: &IncrementalDatabase) -> Vec<PathBuf> {
         let mut seen = BTreeSet::new();
         self.documents
-            .values()
-            .flat_map(|doc| doc.entries.iter().cloned())
+            .iter()
+            .flat_map(|(path, doc)| {
+                // An ordinary script with a literal include needs the same live
+                // membership as a configured entry, without a new editor setting.
+                let inferred = doc.entries.is_empty()
+                    && may_contain_static_include(&doc.text)
+                    && db.package_contexts(path).next().is_none()
+                    && db.live_package_contexts(path).next().is_none()
+                    && nearest_project(path, &self.metadata).is_some_and(|project| {
+                        // The harvest may still be running. A named package's
+                        // src tree must not acquire a competing script owner.
+                        !workspace_package_entries(&project, &self.metadata)
+                            .iter()
+                            .any(|package| package.entry.parent().is_some_and(|src| path.starts_with(src)))
+                    });
+                doc.entries.iter().cloned().chain(inferred.then(|| path.clone()))
+            })
             .filter(|entry| seen.insert(entry.clone()))
             .collect()
     }

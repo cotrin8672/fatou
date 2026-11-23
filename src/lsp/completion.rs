@@ -369,11 +369,9 @@ fn completion_via_db_impl(
             &text.line_index(),
             Some((snapshot, file)),
         );
-        if let Some(workspace) = workspace {
-            append_auto_imports(
-                snapshot, file, path, model, &root, workspace, text, offset, encoding, &mut items,
-            );
-        }
+        append_auto_imports(
+            snapshot, file, path, model, &root, workspace, text, offset, encoding, &mut items,
+        );
         Some(items)
     }));
     let mut items = match cached {
@@ -645,9 +643,9 @@ fn syntax_only_completion(
     (!in_literal).then(|| latex_items(text, start, offset, encoding))
 }
 
-/// Conservative first version: only a statically verified bare value read in the package
-/// entry's root module. Editing an included file, quoted code or a declaration
-/// would require proving a different insertion scope and execution order.
+/// Offer a selective import only for a known direct dependency and unique
+/// loading context. For an included file, add the import to that same file
+/// and prove that it cannot displace a name in the known include closure.
 #[allow(clippy::too_many_arguments)]
 fn append_auto_imports(
     snapshot: &Analysis,
@@ -655,7 +653,7 @@ fn append_auto_imports(
     path: &Path,
     model: &SemanticModel,
     root: &SyntaxNode,
-    workspace: (Arc<PackageIndex>, ModulePath),
+    workspace: Option<(Arc<PackageIndex>, ModulePath)>,
     text: &TextBuffer,
     offset: TextSize,
     encoding: PositionEncoding,
@@ -667,54 +665,41 @@ fn append_auto_imports(
     let Some(context) = snapshot.context() else {
         return;
     };
-    let EditionSource::Project {
-        path: project,
-        role: SourceRole::Package,
-    } = &context.source
-    else {
+    let EditionSource::Project { path: project, role } = &context.source else {
         return;
     };
     let editions = snapshot.source_editions(file);
     if !matches!(editions.as_slice(), [(active, selected)] if active == context && selected.certain)
-    {
-        return;
-    }
-    let (package, host) = &workspace;
-    if crate::incremental::normalize_path(path) != context.entry
-        || !host.is_empty()
-        || package.root.bare
-        || package.members.len() != 1
-        || !package.diagnostics.is_empty()
         || !snapshot.parse_diagnostics(file).is_empty()
-        || model
-            .enclosing_module_path(model.scope_at(callee.start()))
-            .as_slice()
-            != [package.name.as_str()]
-        || root.descendants().any(|node| {
-            matches!(node.kind(), SyntaxKind::MACRO_CALL)
-                && model
-                    .scope(model.scope_at(node.text_range().start()))
-                    .kind
-                    .is_global()
-        })
-        || model
-            .idents()
-            .iter()
-            .any(|read| matches!(read.name.as_str(), "eval" | "include" | "include_string"))
-        || model.qualified_reads().iter().any(|read| {
-            read.path
-                .last()
-                .is_some_and(|name| matches!(name.as_str(), "eval" | "include" | "include_string"))
-        })
-        || has_unresolvable_using(model, snapshot, Some(&workspace))
-        || model
-            .module_loads()
-            .iter()
-            .any(|load| load.path.components.is_empty())
+        || has_unresolvable_using(model, snapshot, workspace.as_ref())
     {
         return;
     }
-    let Some((anchor, eol)) = auto_import_anchor(root, text, &package.name) else {
+    let path = crate::incremental::normalize_path(path);
+    let Some(project_dir) = project.parent() else {
+        return;
+    };
+    if !path.starts_with(project_dir) {
+        return;
+    }
+    let local_module = model.enclosing_module_path(model.scope_at(callee.start()));
+    let anchor = match (role, &workspace) {
+        (SourceRole::Package, Some((package, host)))
+            if !package.root.bare && package.diagnostics.is_empty() =>
+        {
+            if context.entry == path {
+                if !host.is_empty() || local_module.as_slice() != [package.name.as_str()] {
+                    return;
+                }
+            } else if crate::resolve::module_at(&package.root, host).is_none_or(|module| module.bare) {
+                return;
+            }
+            auto_import_anchor(root, text, &local_module)
+        }
+        (SourceRole::Script, None) => auto_import_anchor(root, text, &local_module),
+        _ => return,
+    };
+    let Some((anchor, eol)) = anchor else {
         return;
     };
     if TextSize::from(anchor as u32) >= callee.start() {
@@ -736,15 +721,7 @@ fn append_auto_imports(
             continue;
         };
         if !simple_import_name(&dep)
-            || dep == package.name
-            || model.module_loads().iter().any(|load| {
-                load.path.leading_dots == 0
-                    && load
-                        .path
-                        .components
-                        .first()
-                        .is_some_and(|name| name == dep.as_str())
-            })
+            || workspace.as_ref().is_some_and(|(pkg, _)| dep == pkg.name)
         {
             continue;
         }
@@ -759,8 +736,7 @@ fn append_auto_imports(
             let name = &export.name;
             if export.visibility != crate::index::Visibility::Exported
                 || !name.starts_with(prefix)
-                || name == prefix
-                || !simple_import_name(name)
+                || !simple_auto_import_symbol(name)
             {
                 continue;
             }
@@ -787,14 +763,96 @@ fn append_auto_imports(
                 .or_insert_with(|| Some((dep.clone(), kind)));
         }
     }
-    let resolver = Resolver::new(model, snapshot).with_workspace(Some(workspace));
+    if offers.values().all(Option::is_none)
+        || (*role == SourceRole::Script && snapshot.script_import_host_uncertain(&context.entry, project))
+    {
+        return;
+    }
+    let Some(graph) = snapshot.active_include_graph() else {
+        return;
+    };
+    if !graph.host_modules.contains_key(&path)
+        || !graph.cycles.is_empty()
+        || !graph.unresolved.is_empty()
+        || graph.reverse.values().any(|parents| parents.len() != 1)
+    {
+        return;
+    }
+    // Imports are module-global even when textually inserted in a member.
+    // Inspect the live closure, not only harvested (possibly stale) siblings.
+    // Over-approximate sibling names rather than overwrite a binding.
+    let mut occupied = std::collections::BTreeSet::new();
+    let mut loaded = std::collections::BTreeSet::new();
+    for member in &graph.nodes {
+        if !member.starts_with(project_dir) {
+            return;
+        }
+        let Some(input) = snapshot.lookup_file(member) else {
+            return;
+        };
+        if member != &path
+            && !matches!(
+                snapshot.source_editions(input).as_slice(),
+                [(active, selected)] if active == context && selected.certain
+            )
+        {
+            return;
+        }
+        let (tree, sem) = if member == &path {
+            (root.clone(), model)
+        } else {
+            (snapshot.parsed_tree(input), snapshot.semantic_model(input))
+        };
+        if !snapshot.parse_diagnostics(input).is_empty()
+            || !safe_auto_import_file(&tree, sem)
+            || has_unresolvable_using(sem, snapshot, None)
+        {
+            return;
+        }
+        occupied.extend(sem.bindings().iter().filter(|binding| {
+            sem.scope(binding.scope).kind.is_global() && binding.name.starts_with(prefix)
+        }).map(|binding| binding.name.clone()));
+        occupied.extend(sem.free_reads().filter(|read| {
+            !read.is_macro
+                && read.name.starts_with(prefix)
+                && (member != &path || read.range != callee)
+        }).map(|read| read.name.clone()));
+        occupied.extend(sem.exports().iter().filter(|export| export.name.starts_with(prefix)).map(|export| export.name.clone()));
+        occupied.extend(sem.potential_import_reads().iter().filter(|(_, name)| name.starts_with(prefix)).map(|(_, name)| name.clone()));
+        for load in sem.module_loads() {
+            if load.path.components.is_empty() {
+                return;
+            }
+            if load.path.leading_dots == 0 {
+                loaded.insert(load.path.components[0].clone());
+            }
+            if load.kind == crate::semantic::LoadKind::Using && load.items.is_none() {
+                let mut parts = load.path.components.iter();
+                let Some(package) = parts.next().and_then(|name| snapshot.package(name.as_str())) else {
+                    return;
+                };
+                let parts: Vec<_> = parts.map(|name| name.as_str()).collect();
+                let Some(module) = resolve_submodule(&package.root, &parts) else {
+                    return;
+                };
+                occupied.extend(module.exports.iter().filter(|export| {
+                    export.visibility == crate::index::Visibility::Exported
+                        && export.name.starts_with(prefix)
+                }).map(|export| export.name.as_str().into()));
+            }
+        }
+    }
+    let resolver = Resolver::new(model, snapshot).with_workspace_at(workspace, Some(&path));
     let range = super::documentation::lsp_range(callee, &text.line_index(), encoding);
     let at = text.line_index().byte_to_position(anchor, encoding);
     for (name, (dep, kind)) in offers
         .into_iter()
         .filter_map(|(name, offer)| Some((name, offer?)))
     {
-        if resolver.resolve(&name, callee.start(), Namespace::Value) != Resolution::Unresolved {
+        if occupied.contains(name.as_str())
+            || loaded.contains(dep.as_str())
+            || resolver.resolve(&name, callee.start(), Namespace::Value) != Resolution::Unresolved
+        {
             continue;
         }
         let mut item = member_item(&name, kind, std::slice::from_ref(&dep));
@@ -821,6 +879,12 @@ fn simple_import_name(name: &str) -> bool {
         && !KEYWORDS.contains(&name)
 }
 
+// A Julia mutating function's conventional trailing bang is an identifier
+// character, not an operator in a selective import such as `using Pkg: f!`.
+fn simple_auto_import_symbol(name: &str) -> bool {
+    simple_import_name(name.trim_end_matches('!'))
+}
+
 fn auto_import_site<'a>(
     model: &SemanticModel,
     root: &SyntaxNode,
@@ -830,7 +894,7 @@ fn auto_import_site<'a>(
     let offset_bytes = usize::from(offset);
     let (prefix, _) = take_ident_back(text.get(..offset_bytes)?);
     if prefix.len() < 3
-        || !simple_import_name(prefix)
+        || !simple_auto_import_symbol(prefix)
         || !matches!(context_at(text, offset_bytes), Context::Value)
     {
         return None;
@@ -871,27 +935,67 @@ fn auto_import_site<'a>(
     Some((prefix, name.text_range()))
 }
 
+/// Allow only literal includes that execute in top-level module scope.
+fn safe_auto_import_file(root: &SyntaxNode, model: &SemanticModel) -> bool {
+    use crate::ast::{AstNode, CallExpr};
+    if model.bindings().iter().any(|binding| {
+        binding.name == "include" && model.scope(binding.scope).kind.is_global()
+    }) || model.qualified_reads().iter().any(|read| {
+        read.path.last().is_some_and(|name| matches!(name.as_str(), "eval" | "include" | "include_string"))
+    }) || root.descendants().any(|node| {
+        node.kind() == SyntaxKind::MACRO_CALL
+            && model.scope(model.scope_at(node.text_range().start())).kind.is_global()
+    }) {
+        return false;
+    }
+    let literal_includes = root.descendants().filter_map(CallExpr::cast).filter(|call| {
+        crate::project::include_target(call).is_some()
+            && call.syntax().ancestors().skip(1).all(|node| {
+                matches!(node.kind(), SyntaxKind::ROOT | SyntaxKind::BLOCK | SyntaxKind::BEGIN_EXPR | SyntaxKind::MODULE_DEF)
+            })
+    }).count();
+    let mut bare_includes = 0;
+    for read in model.idents() {
+        match read.name.as_str() {
+            "eval" | "include_string" => return false,
+            "include" => bare_includes += 1,
+            _ => {}
+        }
+    }
+    bare_includes == literal_includes
+}
+
 fn auto_import_anchor<'a>(
     root: &SyntaxNode,
     text: &'a str,
-    expected: &str,
+    modules: &[smol_str::SmolStr],
 ) -> Option<(usize, &'a str)> {
-    let mut children = root.children();
-    let module = children.next()?;
-    if module.kind() != SyntaxKind::MODULE_DEF || children.next().is_some() {
-        return None;
-    }
-    let start = usize::from(module.text_range().start());
-    let header_end = start + text.get(start..)?.find('\n')?;
-    let mut header = text[start..header_end].split_whitespace();
-    if header.next()? != "module" || header.next()? != expected || header.next().is_some() {
-        return None;
-    }
-    let eol = if text.as_bytes().get(header_end.checked_sub(1)?) == Some(&b'\r') {
+    let eol = if text.find('\n').is_some_and(|end| text[..end].ends_with('\r')) {
         "\r\n"
     } else {
         "\n"
     };
+    let mut children = root.children();
+    let first = children.next()?;
+    if modules.is_empty() {
+        // Insert before the first statement, preserving shebangs and leading
+        // comments (trivia) and keeping the edit on a separate line.
+        let start = usize::from(first.text_range().start());
+        let line_start = text[..start].rfind('\n').map_or(0, |end| end + 1);
+        return text[line_start..start].trim().is_empty().then_some((line_start, eol));
+    }
+    let [expected] = modules else {
+        return None;
+    };
+    if first.kind() != SyntaxKind::MODULE_DEF || children.next().is_some() {
+        return None;
+    }
+    let start = usize::from(first.text_range().start());
+    let header_end = start + text.get(start..)?.find('\n')?;
+    let mut header = text[start..header_end].split_whitespace();
+    if header.next()? != "module" || header.next()? != expected.as_str() || header.next().is_some() {
+        return None;
+    }
     Some((header_end + 1, eol))
 }
 
@@ -2682,7 +2786,7 @@ mod tests {
             ),
             ("module Tester\ncalc|() = 3\nend", "direct"),
             (
-                "module Tester\ninclude(\"sibling.jl\")\nf() = calc|()\nend",
+                "module Tester\ninclude(\"missing.jl\")\nf() = calc|()\nend",
                 "direct",
             ),
             (

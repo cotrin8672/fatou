@@ -2997,6 +2997,45 @@ impl Analysis {
         project_graph(&self.0)
     }
 
+    /// Live include closure for this exact selected source context. Unlike
+    /// project_graph, a direct script entry need not be a package member.
+    pub(crate) fn active_include_graph(&self) -> Option<&ProjectGraph> {
+        let context = self.context()?;
+        let file = self.lookup_file(&context.entry)?;
+        Some(project_graph_with_options(&self.0, file, self.parse_options(file)))
+    }
+
+    /// Do not assume a loose buffer is an independent program when a known
+    /// entry in this environment could include it through a runtime path.
+    pub(crate) fn script_import_host_uncertain(&self, current: &Path, project: &Path) -> bool {
+        let db = &self.0;
+        let Some(input) = ScriptFiles::try_get(db) else {
+            return false;
+        };
+        if *input.pending(db) {
+            return true;
+        }
+        input.entries(db).iter().filter(|entry| entry.as_path() != current).any(|entry| {
+            let Some(file) = input.files(db).get(entry).copied().flatten() else {
+                return false;
+            };
+            if !self.source_editions(file).iter().any(|(context, _)| {
+                context.source.path().is_some_and(|path| path == project)
+            }) {
+                return false;
+            }
+            let model = self.semantic_model(file);
+            let mut effects = project::scripts::DefinitionEffects::default();
+            for node in self.parsed_tree(file).descendants() {
+                effects.observe(&node, model);
+                if effects.dynamic_include {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
     /// The on-disk path tracked for `file` (the reverse index tags each
     /// occurrence with its [`SourceFile`]; this turns that back into a path).
     pub fn file_path_of(&self, file: SourceFile) -> Option<PathBuf> {
