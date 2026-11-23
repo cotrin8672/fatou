@@ -1,0 +1,48 @@
+name: Publish Fatou v0.27.0 for Windows
+on:
+  push:
+    branches: [release/windows-v0.27.0]
+    paths: [.github/workflows/fork-windows-v0.27.0.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency: fatou-fork-v0.27.0
+jobs:
+  windows-x64:
+    if: github.repository == 'cotrin8672/fatou' && github.ref == 'refs/heads/release/windows-v0.27.0'
+    runs-on: windows-2025
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: 07f6f4a1340b200206a2967a00896636c4464b03
+          persist-credentials: false
+      - name: Build and test the pinned source on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((git rev-parse HEAD) -ne '07f6f4a1340b200206a2967a00896636c4464b03') { throw 'Release source mismatch' }
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup target add --toolchain 1.100.0 x86_64-pc-windows-msvc
+          cargo +1.100.0 build --locked --release --target x86_64-pc-windows-msvc -p fatou --bin fatou
+          cargo +1.100.0 test --locked --test auto_import_lsp
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/fatou.exe' -Destination dist
+          Copy-Item -LiteralPath LICENSE,README.md -Destination dist
+          Compress-Archive -Path dist/* -DestinationPath fatou-windows-x64.zip
+          Expand-Archive -LiteralPath fatou-windows-x64.zip -DestinationPath smoke
+          & './smoke/fatou.exe' --version
+          if ((Get-FileHash './smoke/fatou.exe').Hash -ne (Get-FileHash './dist/fatou.exe').Hash) { throw 'ZIP verification failed' }
+          Get-FileHash ./fatou-windows-x64.zip -Algorithm SHA256
+      - name: Publish the fork's latest Windows release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          gh release create v0.27.0 ./fatou-windows-x64.zip --repo cotrin8672/fatou --target 07f6f4a1340b200206a2967a00896636c4464b03 --latest --title 'Fatou v0.27.0 (Windows x64)' --notes 'Windows x64 build from the fork dev branch. Includes selective auto-import from direct dependencies in scripts and static include members. Install with: mise use -g github:cotrin8672/fatou'
+          gh release view v0.27.0 --repo cotrin8672/fatou --json tagName,isDraft,isPrerelease,assets,url
