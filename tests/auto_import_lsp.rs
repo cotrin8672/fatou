@@ -34,9 +34,8 @@ impl Session {
         let mut child = Command::new(env!("CARGO_BIN_EXE_fatou"))
             .args(["lsp", "--no-config"])
             .current_dir(root)
-            .env("JULIA_PROJECT", root)
+            .env("JULIA_PROJECT", "@.")
             .env("JULIA_DEPOT_PATH", root.join("depot"))
-            .env("JULIA_LOAD_PATH", "@:@stdlib")
             .env_remove("JULIA_BINDIR")
             .env("XDG_CACHE_HOME", root.join("cache"))
             .env("LOCALAPPDATA", root.join("cache"))
@@ -278,7 +277,7 @@ fn assert_edit(item: &Value, source: &str, anchor: Position, target: Position, e
 fn auto_import_real_stdio_named_and_unnamed_projects() {
     for package in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = std::path::absolute(tmp.path()).unwrap();
         dependencies(&root, package, false);
         let (file, sibling, source, anchor, target, eol) = if package {
             write(
@@ -338,7 +337,7 @@ fn auto_import_real_stdio_named_and_unnamed_projects() {
 #[test]
 fn auto_import_real_stdio_omits_ambiguous_and_missing_exports() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = std::path::absolute(tmp.path()).unwrap();
     dependencies(&root, false, true);
     let source = "start = 1\nf() = calc()\n";
     let file = write(&root, "run.jl", source);
