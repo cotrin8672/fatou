@@ -12,10 +12,11 @@
 //! — lives here so the two features cannot drift.
 
 use lsp_types::{Range, Uri};
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 
 use crate::incremental::{Analysis, SourceFile};
 use crate::resolve::{OccurrenceKey, OccurrenceRec, Resolver};
+use crate::syntax::{SyntaxKind, SyntaxNode};
 use crate::text::PositionEncoding;
 
 use super::uri::from_path;
@@ -29,6 +30,48 @@ pub(crate) struct CrossFileSite {
     pub uri: Uri,
     pub range: Range,
     pub is_def: bool,
+    pub rename_boundary: RenameBoundary,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RenameBoundary {
+    Unchanged,
+    SeparateOperator,
+    ParenthesizeInterpolation,
+    UnsupportedInterpolation,
+}
+
+/// Classify the original source after a name that will acquire trailing `!`.
+/// A bare string interpolation needs parentheses, not new literal whitespace.
+pub(crate) fn rename_boundary(
+    text: &str,
+    range: TextRange,
+    root: impl FnOnce() -> SyntaxNode,
+) -> RenameBoundary {
+    let bytes = text.as_bytes();
+    if bytes.get(usize::from(range.end())) != Some(&b'=') {
+        return RenameBoundary::Unchanged;
+    }
+    if usize::from(range.start()).checked_sub(1).and_then(|idx| bytes.get(idx)) != Some(&b'$') {
+        return RenameBoundary::SeparateOperator;
+    }
+    let is_bare_literal_interp = root().token_at_offset(range.start()).into_iter().any(|token| {
+        token.kind() == SyntaxKind::IDENT
+            && token.text_range() == range
+            && token.parent().is_some_and(|interp| {
+                interp.kind() == SyntaxKind::INTERPOLATION
+                    && interp.parent().is_some_and(|literal| {
+                        matches!(literal.kind(), SyntaxKind::STRING_LITERAL | SyntaxKind::CMD_LITERAL)
+                    })
+            })
+    });
+    if is_bare_literal_interp {
+        RenameBoundary::ParenthesizeInterpolation
+    } else {
+        // Prefixed literal bodies and nonliteral quote splices may have a
+        // different interpretation. Refuse rather than change source text.
+        RenameBoundary::UnsupportedInterpolation
+    }
 }
 
 /// The workspace top-level symbol at `offset` in the file at `path`, if the
@@ -70,6 +113,26 @@ pub(crate) fn gather_sites_where(
     encoding: PositionEncoding,
     keep: impl Fn(&OccurrenceRec) -> bool,
 ) -> Vec<CrossFileSite> {
+    gather_sites_impl(snapshot, symbol, encoding, keep, false)
+}
+
+/// Rename may need to separate a new trailing `!` from an adjacent `=`.
+pub(crate) fn gather_rename_sites(
+    snapshot: &Analysis,
+    symbol: &OccurrenceKey,
+    encoding: PositionEncoding,
+    check_equals: bool,
+) -> Vec<CrossFileSite> {
+    gather_sites_impl(snapshot, symbol, encoding, |_| true, check_equals)
+}
+
+fn gather_sites_impl(
+    snapshot: &Analysis,
+    symbol: &OccurrenceKey,
+    encoding: PositionEncoding,
+    keep: impl Fn(&OccurrenceRec) -> bool,
+    check_equals: bool,
+) -> Vec<CrossFileSite> {
     let bucket = snapshot.workspace_occurrence_sites(symbol);
 
     // Group by file so each file's text is line-indexed once (a single file
@@ -91,6 +154,7 @@ pub(crate) fn gather_sites_where(
             continue;
         };
         let line_index = snapshot.cross_file_line_index(file);
+        let buffer = check_equals.then(|| snapshot.file_text(file));
         for rec in recs {
             out.push(CrossFileSite {
                 uri: uri.clone(),
@@ -99,6 +163,9 @@ pub(crate) fn gather_sites_where(
                     end: line_index.byte_to_position(rec.range.end().into(), encoding),
                 },
                 is_def: rec.is_def,
+                rename_boundary: buffer.map_or(RenameBoundary::Unchanged, |text| {
+                    rename_boundary(text, rec.range, || snapshot.parsed_tree(file))
+                }),
             });
         }
     }

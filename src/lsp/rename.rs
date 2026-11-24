@@ -35,9 +35,10 @@ use crate::parser::parse;
 use crate::parser::{ParseOptions, parse_with_options};
 use crate::resolve::{OccurrenceKey, Resolver};
 use crate::semantic::{BindingId, SemanticModel};
+use crate::syntax::SyntaxNode;
 use crate::text::{LineIndex, PositionEncoding, TextBuffer};
 
-use super::cross_file;
+use super::cross_file::{self, RenameBoundary};
 
 /// The prepare-rename response for the symbol at `position` in `text`,
 /// re-parsing it. Pure and unit-testable. `Some(range)` marks the identifier
@@ -93,13 +94,15 @@ pub fn compute_rename_with_options(
     options: ParseOptions,
 ) -> Result<Option<WorkspaceEdit>, String> {
     validate_new_name(new_name)?;
-    let model = SemanticModel::build(&parse_with_options(text, options).cst);
+    let root = parse_with_options(text, options).cst;
+    let model = SemanticModel::build(&root);
     let line_index = LineIndex::new(text);
     let offset = TextSize::new(line_index.position_to_byte(position, encoding) as u32);
     Ok(rename_for(
         &model,
         uri,
-        &line_index,
+        (text, &line_index),
+        || root.clone(),
         offset,
         new_name,
         encoding,
@@ -189,7 +192,9 @@ pub(crate) fn rename_via_db(
             if !resolver.can_rename_workspace_symbol(&symbol) {
                 return Some(Ok(None));
             }
-            let edit = cross_file_rename(snapshot, &symbol, new_name, encoding);
+            let Some(edit) = cross_file_rename(snapshot, &symbol, new_name, encoding) else {
+                return Some(Ok(None));
+            };
             if edit
                 .changes
                 .as_ref()
@@ -202,7 +207,15 @@ pub(crate) fn rename_via_db(
                 });
             }
         }
-        let edit = rename_for(model, uri, &line_index, offset, new_name, encoding);
+        let edit = rename_for(
+            model,
+            uri,
+            (text.text(), &line_index),
+            || snapshot.parsed_tree(file),
+            offset,
+            new_name,
+            encoding,
+        );
         Some(
             if edit.is_some() && !local_bindings_agree(snapshot, file, model, offset) {
                 Err(RenameError::BindingConflict)
@@ -301,22 +314,22 @@ fn cross_file_rename(
     symbol: &crate::resolve::OccurrenceKey,
     new_name: &str,
     encoding: PositionEncoding,
-) -> WorkspaceEdit {
+) -> Option<WorkspaceEdit> {
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
-    for site in cross_file::gather_sites(snapshot, symbol, encoding) {
+    for site in cross_file::gather_rename_sites(snapshot, symbol, encoding, new_name.ends_with('!')) {
         changes.entry(site.uri).or_default().push(TextEdit {
             range: site.range,
-            new_text: new_name.to_string(),
+            new_text: rename_replacement(new_name, site.rename_boundary)?,
         });
     }
     for edits in changes.values_mut() {
         edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
         edits.dedup_by_key(|e| (e.range.start.line, e.range.start.character));
     }
-    WorkspaceEdit {
+    Some(WorkspaceEdit {
         changes: Some(changes),
         ..Default::default()
-    }
+    })
 }
 
 /// The range of the identifier token under the cursor at `offset`: an occurrence
@@ -362,19 +375,29 @@ fn prepare_for(
 fn rename_for(
     model: &SemanticModel,
     uri: &Uri,
-    line_index: &LineIndex,
+    source: (&str, &LineIndex),
+    root: impl Fn() -> SyntaxNode,
     offset: TextSize,
     new_name: &str,
     encoding: PositionEncoding,
 ) -> Option<WorkspaceEdit> {
+    let (text, line_index) = source;
     let (binding, _) = binding_and_range_at(model, offset)?;
+    let check_boundary = new_name.ends_with('!');
     let mut edits: Vec<TextEdit> = model
         .occurrences(binding)
-        .map(|o| TextEdit {
-            range: to_range(o.range, line_index, encoding),
-            new_text: new_name.to_string(),
+        .map(|o| {
+            let boundary = if check_boundary {
+                cross_file::rename_boundary(text, o.range, &root)
+            } else {
+                RenameBoundary::Unchanged
+            };
+            Some(TextEdit {
+                range: to_range(o.range, line_index, encoding),
+                new_text: rename_replacement(new_name, boundary)?,
+            })
         })
-        .collect();
+        .collect::<Option<_>>()?;
     edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
     // Belt and suspenders: a binding never reports the same site twice (the def
     // site is distinct from the reads), but a duplicate edit would be malformed.
@@ -387,12 +410,27 @@ fn rename_for(
     })
 }
 
+/// Keep `!` inside the identifier instead of creating an `!=` or `!==` operator.
+fn rename_replacement(name: &str, boundary: RenameBoundary) -> Option<String> {
+    Some(match boundary {
+        RenameBoundary::Unchanged => name.to_owned(),
+        RenameBoundary::SeparateOperator => format!("{name} "),
+        RenameBoundary::ParenthesizeInterpolation => format!("({name})"),
+        RenameBoundary::UnsupportedInterpolation => return None,
+    })
+}
+
 /// Accept the new name only if it is a legal Julia identifier: a leading letter
 /// or underscore, then letters, digits, underscores, or a trailing `!`. This is
 /// conservative (Julia also admits many Unicode symbols and `var"..."` names),
 /// but it rejects the mistakes a rename should not silently apply — empty names,
-/// leading digits, embedded whitespace, the `@` sigil.
+/// leading digits, embedded whitespace, the `@` sigil. Boolean literals are
+/// not bindings, and all-underscore names discard values instead of referring
+/// to a binding, so neither is a valid target for a semantic rename.
 fn validate_new_name(name: &str) -> Result<(), String> {
+    if matches!(name, "true" | "false") || name.bytes().all(|b| b == b'_') {
+        return Err(format!("`{name}` is not a valid identifier"));
+    }
     let mut chars = name.chars();
     let ok = match chars.next() {
         Some(c) if c == '_' || c.is_alphabetic() => {
@@ -478,6 +516,24 @@ mod tests {
     }
 
     #[test]
+    fn bang_rename_preserves_assignment_and_equality_operators() {
+        let edits = rename_edits("function f()\n    x|=1\n    x==1 && x == 1\nend", "x!");
+        assert_eq!(
+            edits.iter().map(|edit| edit.2.as_str()).collect::<Vec<_>>(),
+            ["x! ", "x! ", "x!"],
+        );
+    }
+
+    #[test]
+    fn bang_rename_parenthesizes_a_bare_string_interpolation() {
+        let edits = rename_edits("function f()\n    x|=1\n    \"$x=1\"\nend", "x!");
+        assert_eq!(
+            edits.iter().map(|edit| edit.2.as_str()).collect::<Vec<_>>(),
+            ["x! ", "(x!)"],
+        );
+    }
+
+    #[test]
     fn renames_from_the_definition_site() {
         // The cursor sits on the defining `x` itself, not a use.
         let edits = rename_edits("function f()\n    x| = 1\n    x\nend", "y");
@@ -559,7 +615,7 @@ mod tests {
     #[test]
     fn an_invalid_new_name_is_rejected() {
         let (src, position) = cursor("function f()\n    x| = 1\nend");
-        for bad in ["", "1x", "a b", "@m", "x-y"] {
+        for bad in ["", "1x", "a b", "@m", "x-y", "true", "false", "_", "__"] {
             let err = compute_rename(&doc_uri(), &src, position, bad, PositionEncoding::Utf16)
                 .expect_err(&format!("`{bad}` should be rejected"));
             assert!(err.contains(bad) || bad.is_empty());
@@ -567,6 +623,8 @@ mod tests {
         // A valid identifier with a trailing `!` and Unicode is accepted.
         assert!(validate_new_name("mutate!").is_ok());
         assert!(validate_new_name("δx").is_ok());
+        assert!(validate_new_name("where").is_ok());
+        assert!(validate_new_name("_gain").is_ok());
     }
 
     /// Cross-file rename rewrites a workspace symbol everywhere: the definition

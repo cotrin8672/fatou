@@ -200,6 +200,8 @@ fn is_broadcast_assign(kind: SyntaxKind) -> bool {
             | SyntaxKind::DOT_SLASH_SLASH_EQ
             | SyntaxKind::DOT_CARET_EQ
             | SyntaxKind::DOT_PERCENT_EQ
+            | SyntaxKind::DOT_AMP_EQ
+            | SyntaxKind::DOT_PIPE_EQ
             | SyntaxKind::DOT_SHL_EQ
             | SyntaxKind::DOT_SHR_EQ
             | SyntaxKind::DOT_USHR_EQ
