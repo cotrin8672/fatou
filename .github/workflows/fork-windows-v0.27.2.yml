@@ -5,7 +5,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-concurrency: fatou-fork-v0.27.2
+concurrency:
+  group: fatou-fork-v0.27.2
+  cancel-in-progress: true
 jobs:
   windows-x64:
     if: github.repository == 'cotrin8672/fatou' && github.ref == 'refs/heads/release/windows-v0.27.2'

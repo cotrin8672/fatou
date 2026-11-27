@@ -99,9 +99,8 @@ class Lsp {
   }
 }
 
-async function check(rootUri, title) {
+async function check(rootUri, title, uri = `${rootUri}/source%20folder/entry.jl`) {
   const lsp = new Lsp();
-  const uri = `${rootUri}/source%20folder/entry.jl`;
   try {
     await lsp.request('initialize', {
       processId: process.pid,
@@ -176,4 +175,8 @@ async function check(rootUri, title) {
 
 await check(`file://${host}/${encode(share.join('/'))}`, 'UNC authority');
 await check(`file:////${host}/${encode(share.join('/'))}`, 'UNC path');
+// vim.uri_from_fname in Neovim 0.11 does not normalize a backslash UNC filename
+// as it does a drive path; the UNC is percent-encoded after file://.
+const nvimUnc = `file://${encodeURIComponent(uncRoot)}`;
+await check(nvimUnc, 'UNC Neovim 0.11', `${nvimUnc}%5Csource%20folder%5Centry.jl`);
 await check(`file:///${drive.slice(0, 3)}${encode(drive.slice(3))}`.replace(/\/$/, ''), 'SMB mapped drive');

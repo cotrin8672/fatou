@@ -23,23 +23,37 @@ pub(crate) fn to_path(uri: &Uri) -> Option<PathBuf> {
         .authority()
         .filter(|authority| !authority.as_str().is_empty())
     {
+        // Older Neovim puts a backslash UNC filename, percent-encoded, in
+        // the authority slot. Accept that form without treating arbitrary
+        // percent-encoded authorities as network hosts.
+        if authority
+            .as_str()
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%5c%5c"))
+        {
+            let escaped = Uri::from_str(&format!("file:///{}", authority.as_str())).ok()?;
+            let part = escaped.path().as_estr().decode().into_string_lossy();
+            let joined = format!("{}{decoded}", part.strip_prefix('/')?).replace('/', "\\");
+            let mut components = joined.strip_prefix(r"\\")?.splitn(3, '\\');
+            let host = components.next()?;
+            let share = components.next()?;
+            if !valid_unc_host(host) || !valid_unc_share(share) {
+                return None;
+            }
+            return Some(PathBuf::from(joined));
+        }
         // A Windows file URI's authority is the UNC server, not disposable
         // metadata. Do not reinterpret URI credentials/ports as SMB paths.
         if authority.userinfo().is_some() || authority.port().is_some() {
             return None;
         }
         let host = authority.host().as_str();
-        if !host
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-            || host == "."
-            || host == ".."
-        {
+        if !valid_unc_host(host) {
             return None;
         }
         if !host.eq_ignore_ascii_case("localhost") || !has_windows_drive(&decoded) {
             let share = decoded.strip_prefix('/')?.split('/').next()?;
-            if share.is_empty() || share == "." || share == ".." || share.contains(['\\', ':']) {
+            if !valid_unc_share(share) {
                 return None;
             }
             return Some(PathBuf::from(format!(
@@ -49,6 +63,21 @@ pub(crate) fn to_path(uri: &Uri) -> Option<PathBuf> {
         }
     }
     Some(from_uri_path(&decoded))
+}
+
+#[cfg(windows)]
+fn valid_unc_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        && host != "."
+        && host != ".."
+}
+
+#[cfg(windows)]
+fn valid_unc_share(share: &str) -> bool {
+    !share.is_empty() && share != "." && share != ".." && !share.contains(['\\', ':', '\0'])
 }
 
 #[cfg(windows)]
@@ -217,6 +246,13 @@ mod tests {
         );
         let old_uri = Uri::from_str("file:////nixos/share/%E6%97%A5%20%23/probe.jl").unwrap();
         assert_eq!(to_path(&old_uri).as_ref(), Some(&path));
+        let neovim =
+            Uri::from_str("file://%5c%5cnixos%5cshare%5c%E6%97%A5%20%23%5cprobe.jl").unwrap();
+        assert_eq!(to_path(&neovim).as_ref(), Some(&path));
+        let neovim_mixed =
+            Uri::from_str("file://%5C%5Cnixos%5Cshare/%E6%97%A5%20%23/probe.jl").unwrap();
+        assert_eq!(to_path(&neovim_mixed).as_ref(), Some(&path));
+        assert!(to_path(&Uri::from_str("file://%5c%5c.%5cpipe%5cprobe.jl").unwrap()).is_none());
         for text in [
             "file:///Z:/dir/probe.jl",
             "file:///Z://dir/probe.jl",
