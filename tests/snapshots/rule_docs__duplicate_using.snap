@@ -1,0 +1,22 @@
+---
+source: tests/rule_docs.rs
+assertion_line: 19
+expression: render_rule_doc(rule.as_ref())
+---
+## `duplicate-using`
+
+Report an identical `using` entry repeated in the same module and file. Distinct modules, names, and aliases are not duplicates.
+
+The second `sin` repeats the original entry:
+
+```julia
+using Base: sin, sin
+```
+
+```text
+warning: duplicate-using
+ --> example.jl:1:18
+  |
+1 | using Base: sin, sin
+  |                  ^^^ duplicate using entry `sin`
+```

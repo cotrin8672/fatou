@@ -1,8 +1,50 @@
 # Opt-in Julia compiler snapshot inlay hints
 
 This is an experimental example; Fatou never launches Julia or loads your
-workspace to obtain a hint. Until an explicit import, Julia source gets no
-type hints from this provider. The existing Project TOML hints are unchanged.
+workspace to obtain a hint. Until an explicit compiler watch or import, Julia source gets no
+compiler type hints from this provider. The existing Project TOML hints are unchanged.
+
+## Ordinary Julia inlay hints (no execution)
+
+Enable your editor's standard LSP inlay hint UI. For example, in Neovim
+0.11+ the session-only command is `:lua vim.lsp.inlay_hint.enable(true)`.
+Julia buffers automatically show **static initializer types** such as
+`::Int`, `::Float64`, and selected standard `Vector{T}(undef, length(...))`
+constructors. The tooltip says these are static, not compiler results.
+Fatou omits unknown calls, later reassignments, and conditional or loop-local initializers
+rather than making a claim about an inferred type. These basic hints never
+launch Julia. Follow the next section for real Julia compiler inference.
+
+## Neovim: continuously show actual compiler hints
+
+1. Open the exact bundled `examples/compiler-inlay/fixture.jl` in Neovim
+   0.11+ with Fatou attached. Put Julia 1.13.4 on PATH.
+2. Run `:luafile /absolute/path/to/examples/compiler-inlay/nvim.lua`.
+   This is session-only and makes no configuration changes.
+3. Run `:FatouCompilerHintsWatch`. For the bundled fixture, choose
+   `callers` and the argument type `Tuple{}`; for your own code, enter
+   a function and concrete argument tuple (e.g. `MyModule.solve` and
+   `Tuple{Vector{Float64}}`). Confirm once if you trust the file.
+   No custom Julia file or JSON report is necessary. On each save, a fresh
+   Julia subprocess updates the actual compiler hints asynchronously.
+   Unsaved changes invalidate old hints; source is never executed on
+   keystrokes. Use `:FatouCompilerHintsClear` to stop the watch and clear
+   the results. One watch per Fatou client is supported.
+
+   The default driver **loads your saved source** in a local Julia process.
+   This can execute top-level code, macros or generated functions. Do not
+   approve untrusted source or a file that starts a simulation at top level.
+   For such simulations, place the reusable definitions in a library file.
+
+For advanced setup, `:FatouCompilerHintsWatch /path/to/my-driver.jl` uses
+your explicitly trusted driver, modeled on `watch-demo.jl`. It receives
+the absolute buffer filename as its only argument, runs in the nearest
+Julia project found by walking up from the buffer, and must emit exactly
+one snapshot on stdout. Keep logging on stderr. This supports setups
+such as closure specialization, where the driver may construct a closure
+but inspect rather than run its body.
+
+## Manual snapshot import
 
 1. With Julia 1.13.4, run the **trusted example**:
    ```sh

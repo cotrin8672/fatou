@@ -31,7 +31,7 @@ use super::model::PackageIndex;
 /// a [`PackageIndex`] field change, or corrected harvesting semantics). Recorded
 /// in every entry header and baked into the cache path, so mismatched entries
 /// are ignored rather than mis-decoded.
-const CACHE_FORMAT: u32 = 12;
+const CACHE_FORMAT: u32 = 13;
 
 /// The build identity stamped into every entry: `fatou@<version>`. Two builds at
 /// the same [`CACHE_FORMAT`] can still harvest different shapes (the harvester

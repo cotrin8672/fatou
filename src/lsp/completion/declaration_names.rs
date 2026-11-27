@@ -190,3 +190,101 @@ fn is_explicit_named_tuple_key(name: &SyntaxNode) -> bool {
         _ => false,
     }
 }
+
+pub(super) struct ComprehensionBinder {
+    pub(super) prefix: String,
+    pub(super) replace: TextRange,
+    pub(super) body: TextRange,
+}
+
+/// A simple name typed in the first iteration binder of a comprehension.
+/// The body appears before this binder textually but evaluates inside its scope.
+pub(super) fn comprehension_binder(
+    root: &SyntaxNode,
+    offset: TextSize,
+) -> Option<ComprehensionBinder> {
+    let token = root.token_at_offset(offset).left_biased()?;
+    let replace = token.text_range();
+    if token.kind() != SyntaxKind::IDENT || offset <= replace.start() || offset > replace.end() {
+        return None;
+    }
+    let name = token.parent()?;
+    let binding = name.parent()?;
+    let comprehension = binding.parent()?;
+    if name.kind() != SyntaxKind::NAME
+        || binding.kind() != SyntaxKind::FOR_BINDING
+        || binding.first_child().as_ref() != Some(&name)
+        || !matches!(
+            comprehension.kind(),
+            SyntaxKind::COMPREHENSION
+                | SyntaxKind::TYPED_COMPREHENSION
+                | SyntaxKind::BRACES_COMPREHENSION
+                | SyntaxKind::GENERATOR
+        )
+    {
+        return None;
+    }
+    let mut before = binding.siblings(rowan::Direction::Prev).skip(1);
+    let body = before.next()?;
+    if matches!(
+        body.kind(),
+        SyntaxKind::FOR_BINDING | SyntaxKind::COMPREHENSION_IF | SyntaxKind::ERROR
+    ) || comprehension.ancestors().skip(1).any(|node| {
+        matches!(
+            node.kind(),
+            SyntaxKind::QUOTE_EXPR | SyntaxKind::QUOTE_SYM | SyntaxKind::INTERPOLATION
+        )
+    }) {
+        return None;
+    }
+    Some(ComprehensionBinder {
+        prefix: token
+            .text()
+            .get(..usize::from(offset - replace.start()))?
+            .into(),
+        replace,
+        body: body.text_range(),
+    })
+}
+
+/// Avoid capturing a nested function, loop, unrelated macro AST or an
+/// assignment target. `@.` preserves the body reads and is the common broadcast form.
+pub(super) fn direct_comprehension_read(
+    root: &SyntaxNode,
+    read: TextRange,
+    body: TextRange,
+) -> bool {
+    use crate::ast::{AstNode, MacroCall};
+    let Some(token) = root.token_at_offset(read.start()).right_biased() else {
+        return false;
+    };
+    for node in token
+        .parent_ancestors()
+        .take_while(|node| body.contains_range(node.text_range()))
+    {
+        match node.kind() {
+            SyntaxKind::FUNCTION_DEF
+            | SyntaxKind::ARROW_EXPR
+            | SyntaxKind::DO_EXPR
+            | SyntaxKind::LET_EXPR
+            | SyntaxKind::FOR_EXPR
+            | SyntaxKind::COMPREHENSION
+            | SyntaxKind::TYPED_COMPREHENSION
+            | SyntaxKind::BRACES_COMPREHENSION
+            | SyntaxKind::GENERATOR
+            | SyntaxKind::QUOTE_EXPR
+            | SyntaxKind::QUOTE_SYM
+            | SyntaxKind::INTERPOLATION => return false,
+            SyntaxKind::MACRO_CALL => {
+                if !MacroCall::cast(node)
+                    .and_then(|call| call.name())
+                    .is_some_and(|name| name.syntax().text().to_string() == "@.")
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}

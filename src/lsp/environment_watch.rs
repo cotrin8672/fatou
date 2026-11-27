@@ -8,9 +8,12 @@ use std::time::SystemTime;
 
 use lsp_types::{FileChangeType, FileEvent};
 
-use crate::environment::{EnvContext, discover_project, find_manifest};
+use crate::environment::{
+    EnvContext, ManifestSelectionFields, discover_project, manifest_for_project_with,
+    read_manifest_selection_fields,
+};
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Stamp {
     len: u64,
     modified: Option<SystemTime>,
@@ -20,34 +23,62 @@ struct Stamp {
 /// Snapshot the selection as well as the stamps: creating or removing a
 /// higher-priority Project/Manifest can change the selected paths.
 #[derive(Default)]
-pub(super) struct EnvironmentFiles(BTreeMap<PathBuf, Stamp>);
+pub(super) struct EnvironmentFiles {
+    watched: BTreeMap<PathBuf, Stamp>,
+    project_cache: BTreeMap<PathBuf, (Stamp, ManifestSelectionFields)>,
+}
 
 impl EnvironmentFiles {
-    pub(super) fn scan(roots: &[PathBuf], version: Option<&str>) -> Self {
+    pub(super) fn scan(roots: &[PathBuf], version: Option<&str>, prior: Option<&Self>) -> Self {
         let mut paths = BTreeSet::new();
+        let mut project_cache = BTreeMap::new();
         for root in roots {
-            if let Some(project) = discover_project(&EnvContext::from_process(root.clone())) {
-                if let Some(manifest) = project.parent().and_then(|dir| find_manifest(dir, version))
+            let ctx = EnvContext::from_process(root.clone());
+            if let Some(project) = discover_project(&ctx) {
+                if let Some(manifest) =
+                    manifest_for_project_with(&project, version, ctx.home.as_deref(), |path| {
+                        if let Some((_, metadata)) = project_cache.get(path) {
+                            let metadata: &ManifestSelectionFields = metadata;
+                            return metadata.clone();
+                        }
+                        let Some(current) = stamp(path) else {
+                            return ManifestSelectionFields::default();
+                        };
+                        let metadata = prior
+                            .and_then(|prior| prior.project_cache.get(path))
+                            .filter(|(old, _)| *old == current)
+                            .map_or_else(
+                                || read_manifest_selection_fields(path),
+                                |(_, metadata)| metadata.clone(),
+                            );
+                        project_cache.insert(path.to_path_buf(), (current, metadata.clone()));
+                        metadata
+                    })
                 {
                     paths.insert(manifest);
                 }
                 paths.insert(project);
             }
         }
-        Self(
-            paths
+        Self {
+            watched: paths
                 .into_iter()
                 .filter_map(|path| Some((path.clone(), stamp(&path)?)))
                 .collect(),
-        )
+            project_cache,
+        }
     }
 
     pub(super) fn changes_to(&self, next: &Self) -> Vec<FileEvent> {
-        self.0
+        self.watched
             .keys()
-            .chain(next.0.keys().filter(|path| !self.0.contains_key(*path)))
+            .chain(
+                next.watched
+                    .keys()
+                    .filter(|path| !self.watched.contains_key(*path)),
+            )
             .filter_map(|path| {
-                let kind = match (self.0.get(path), next.0.get(path)) {
+                let kind = match (self.watched.get(path), next.watched.get(path)) {
                     (None, Some(_)) => FileChangeType::CREATED,
                     (Some(_), None) => FileChangeType::DELETED,
                     (Some(old), Some(new)) if old != new => FileChangeType::CHANGED,

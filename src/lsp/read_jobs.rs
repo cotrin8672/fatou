@@ -322,6 +322,13 @@ pub(crate) enum ReadJob {
         range: Range,
         sender: ReadReply,
     },
+    JuliaInlayHints {
+        id: RequestId,
+        path: PathBuf,
+        text: Arc<TextBuffer>,
+        range: Range,
+        sender: ReadReply,
+    },
     References {
         id: RequestId,
         uri: Uri,
@@ -469,6 +476,7 @@ impl ReadJob {
             | Self::ProjectDocumentLinks { sender, .. }
             | Self::ManifestDocumentLinks { sender, .. }
             | Self::ProjectInlayHints { sender, .. }
+            | Self::JuliaInlayHints { sender, .. }
             | Self::References { sender, .. }
             | Self::DocumentHighlight { sender, .. }
             | Self::PrepareRename { sender, .. }
@@ -527,6 +535,7 @@ impl ReadJob {
             | Self::FoldingRanges { path, text, .. }
             | Self::DocumentLinks { path, text, .. }
             | Self::SelectionRanges { path, text, .. }
+            | Self::JuliaInlayHints { path, text, .. }
             | Self::SemanticTokensFull { path, text, .. }
             | Self::SemanticTokensDelta { path, text, .. }
             | Self::Completion { path, text, .. }
@@ -568,6 +577,7 @@ impl ReadJob {
             ReadJob::ProjectDocumentLinks { id, sender, .. } => (id, sender),
             ReadJob::ManifestDocumentLinks { id, sender, .. } => (id, sender),
             ReadJob::ProjectInlayHints { id, sender, .. } => (id, sender),
+            ReadJob::JuliaInlayHints { id, sender, .. } => (id, sender),
             ReadJob::References { id, sender, .. } => (id, sender),
             ReadJob::DocumentHighlight { id, sender, .. } => (id, sender),
             ReadJob::PrepareRename { id, sender, .. } => (id, sender),
@@ -795,6 +805,14 @@ pub(crate) fn run_read(
             merge_definitions(&values)
         } else if matches!(job, ReadJob::Completion { .. }) {
             merge_completion_results(&values)
+        } else if matches!(job, ReadJob::JuliaInlayHints { .. }) {
+            let mut common = values[0].as_array().cloned().unwrap_or_default();
+            common.retain(|hint| {
+                values
+                    .iter()
+                    .all(|v| v.as_array().is_some_and(|a| a.contains(hint)))
+            });
+            serde_json::Value::Array(common)
         } else if let ReadJob::CompletionResolve { item, .. } = &job {
             let merged = merge_results(&values);
             if merged.is_null() {
@@ -1286,6 +1304,16 @@ fn run_read_single(
         } => {
             let links = manifest_document_links(&text, &path, encoding);
             let _ = sender.send(Message::Response(Response::new_ok(id, links)));
+        }
+        ReadJob::JuliaInlayHints {
+            id,
+            path,
+            text,
+            range,
+            sender,
+        } => {
+            let hints = super::static_inlay::hints_via_db(&snapshot, &path, &text, range, encoding);
+            let _ = sender.send(Message::Response(Response::new_ok(id, hints)));
         }
         ReadJob::ProjectInlayHints {
             updates,

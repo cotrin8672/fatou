@@ -11,7 +11,7 @@ authors = ["Johan Larsson <johan@jolars.co>"]
 
 [package]
 name = "fatou"
-version = "0.27.3"
+version = "0.27.4"
 edition.workspace = true
 rust-version.workspace = true
 readme = "README.md"

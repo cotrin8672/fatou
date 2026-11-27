@@ -24,6 +24,10 @@ function load_trusted!(mod::Module, path::AbstractString)
     end
     isvalid(text) && ncodeunits(text) <= MAX_SOURCE_BYTES ||
         throw(ArgumentError("source is not bounded UTF-8"))
+    # Neovim and LSP send LF even when the on-disk Windows buffer uses CRLF.
+    # Normalize before loading in Julia as well, so the reported text is still
+    # the exact input to include_string, never a post-hoc anchor rewrite.
+    text = replace(text, "\r\n" => "\n")
     before = Base.get_world_counter()
     Base.include_string(mod, text, file)
     LoadedSource(file, text, before, Base.get_world_counter())
@@ -70,6 +74,16 @@ function record(line, offset, sub, t, kind)
         inferredType=sprint(show, t), kind)
 end
 
+# Use Julia's identifier grammar to retain exact original source bytes.
+function identifier_span(line, start)
+    start <= ncodeunits(line) && Base.is_id_start_char(line[start]) || return nothing
+    stop = nextind(line, start)
+    while stop <= ncodeunits(line) && Base.is_id_char(line[stop])
+        stop = nextind(line, stop)
+    end
+    start:stop-1
+end
+
 function types_for(receipt::LoadedSource, f, sig::Type{<:Tuple})
     VERSION == v"1.13.4" ||
         throw(ArgumentError("this example is pinned to Julia 1.13.4 CodeInfo provenance"))
@@ -96,21 +110,31 @@ function types_for(receipt::LoadedSource, f, sig::Type{<:Tuple})
         line = lines[ln]
         parsed = Meta.parse(line; raise=false)
         parsed isa Expr && parsed.head === :(=) && parsed.args[1] === name || continue
-        span = match(r"^(\s*)([\p{L}_][\p{L}\p{N}_!]*)\s*=", line)
+        start = findfirst(c -> c != ' ' && c != '\t', line)
+        start === nothing && continue
+        span = identifier_span(line, start)
         span === nothing && continue
-        n = ncodeunits(span[1])
+        tail = lstrip(c -> c == ' ' || c == '\t', SubString(line, last(span)+1))
+        startswith(tail, "=") && !startswith(tail, "==") && !startswith(tail, "=>") || continue
         lattice = ci.ssavaluetypes[i]
         t = lattice isa Core.Const ? typeof(lattice.val) : lattice
         t isa Type || continue
-        push!(entries, record(line,offsets[ln], n+1:n+ncodeunits(span[2]), t, "assignment"))
+        push!(entries, record(line,offsets[ln], span, t, "assignment"))
     end
     # No duplicate hint next to a written return annotation, multiline or macro
     # signature. Establish file and definition line from the actual method.
     l = lines[Int(m.line)]
-    header = match(r"^\s*function ([\p{L}_][\p{L}\p{N}_!]*)\([^()]*\)\s*$", l)
-    if header !== nothing && Symbol(header[1]) === m.name && ret isa Type
-        i = findlast(==(')'), l)
-        push!(entries, record(l, offsets[m.line], i:i, ret, "return"))
+    header = match(r"^[ \t]*function[ \t]+", l)
+    if header !== nothing && ret isa Type
+        name_span = identifier_span(l, ncodeunits(header.match)+1)
+        if name_span !== nothing
+            spelling = String(collect(codeunits(l)[name_span]))
+            tail = SubString(l, last(name_span)+1)
+            if Meta.parse(spelling; raise=false) === m.name && occursin(r"^\([^()]*\)[ \t\r]*$", tail)
+                i = findlast(==(')'), l)
+                push!(entries, record(l, offsets[m.line], i:i, ret, "return"))
+            end
+        end
     end
     # Ambiguous same-source-position entries are never emitted.
     counts = Dict{Int,Int}()

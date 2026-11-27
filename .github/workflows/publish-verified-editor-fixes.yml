@@ -1,0 +1,38 @@
+name: Publish verified Fatou v0.27.4
+on:
+  push:
+    branches: [release/windows-v0.27.4]
+permissions:
+  actions: read
+  contents: write
+concurrency:
+  group: fatou-editor-release-0274
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'cotrin8672/fatou' && github.ref == 'refs/heads/release/windows-v0.27.4'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Promote the checked Windows artifact for this exact commit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $repo = 'cotrin8672/fatou'
+          $q = "repos/$repo/actions/workflows/verify-editor-fixes-windows.yml/runs?branch=verify%2Feditor-fixes-windows&head_sha=$env:GITHUB_SHA&status=success"
+          $runs = (gh api $q | ConvertFrom-Json).workflow_runs
+          $run = @($runs | Where-Object { $_.head_sha -eq $env:GITHUB_SHA -and $_.conclusion -eq 'success' }) | Select-Object -First 1
+          if (-not $run) { throw 'No successful verification run for this commit' }
+          gh run download "$($run.id)" --repo $repo --name fatou-editor-fixes-windows-x64 --dir verified
+          if ((Get-Content verified/commit.txt -Raw).Trim() -ne $env:GITHUB_SHA) { throw 'Artifact commit mismatch' }
+          $hash = (Get-Content verified/sha256.txt -Raw).Trim()
+          if ($hash -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash verified/fatou-windows-x64.zip -Algorithm SHA256).Hash -ne $hash) { throw 'Artifact hash mismatch' }
+          $existing = gh api "repos/$repo/git/matching-refs/tags/v0.27.4" --jq '.[] | select(.ref == "refs/tags/v0.27.4") | .object.sha'
+          if ($existing) { throw 'Tag already exists; refusing to replace it' }
+          Expand-Archive -LiteralPath verified/fatou-windows-x64.zip -DestinationPath unpacked
+          if ((& ./unpacked/fatou.exe --version) -ne 'fatou 0.27.4') { throw 'Unexpected artifact executable version' }
+          gh release create v0.27.4 verified/fatou-windows-x64.zip --repo $repo --target "$env:GITHUB_SHA" --latest --title 'Fatou v0.27.4 (Windows x64)' --notes 'Windows x64. Fixes Julia workspace manifest lookup, dependency module and macro completion, FFTW re-exports, comprehension binders, and duplicate using warnings. Includes normal static inlay hints and opt-in compiler inlay hints refreshed on save.'
+          gh release view v0.27.4 --repo $repo --json tagName,isDraft,isPrerelease,assets,url

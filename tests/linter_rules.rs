@@ -916,6 +916,28 @@ fn unused_import_counts_prefixed_string_macro_interpolation() {
     );
 }
 
+#[test]
+fn duplicate_using_flags_the_second_identical_entry() {
+    for source in [
+        "using Base: sin, sin\n",
+        "using Base: sin\nusing Base: cos, sin\n",
+        "using LinearAlgebra, LinearAlgebra\n",
+        "using LinearAlgebra\nusing LinearAlgebra\n",
+        "using Base: sin as wave, sin as wave\n",
+    ] {
+        assert_eq!(count("duplicate-using", source), 1, "{source}");
+    }
+    for source in [
+        "using Base: sin as wave, sin\n",
+        "using A: work\nusing B: work\n",
+        "using A\nusing .A\n",
+        "module A\nusing Base: sin\nend\nmodule B\nusing Base: sin\nend\n",
+        "if Sys.iswindows()\nusing Base: sin\nelse\nusing Base: sin\nend\n",
+    ] {
+        assert_eq!(count("duplicate-using", source), 0, "{source}");
+    }
+}
+
 // --- duplicate-argument ----------------------------------------------------
 
 #[test]

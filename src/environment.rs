@@ -362,7 +362,8 @@ pub fn resolve(ctx: &EnvContext) -> Result<Option<Environment>, EnvironmentError
     let meta = parse_project(&project_file)?;
     let install = locate_install(ctx, &depots);
     let version = install.as_ref().map(|install| install.version.as_str());
-    let (manifest_file, mut packages) = load_manifest(&project_dir, &depots, version)?;
+    let (manifest_file, mut packages) =
+        load_manifest(&project_file, &depots, version, ctx.home.as_deref())?;
     if let Some(install) = &install {
         resolve_stdlib_sources(&mut packages, install);
     }
@@ -385,14 +386,17 @@ pub fn resolve(ctx: &EnvContext) -> Result<Option<Environment>, EnvironmentError
 /// Resolve a manifest's pins without needing a valid owning project or an
 /// index of the installed packages.
 pub(crate) fn load_manifest(
-    project_dir: &Path,
+    project: &Path,
     depots: &[PathBuf],
     version: Option<&str>,
+    home: Option<&Path>,
 ) -> Result<(Option<PathBuf>, Vec<Package>), EnvironmentError> {
-    let Some(path) = find_manifest(project_dir, version) else {
+    let Some(path) = manifest_for_project(project, version, home) else {
         return Ok((None, Vec::new()));
     };
-    let packages = parse_manifest(&path, project_dir, depots)?;
+    // `path` entries belong to the selected manifest directory, not the
+    // child Project.toml whose [deps] picks the visible bindings.
+    let packages = parse_manifest(&path, path.parent().unwrap_or(Path::new("")), depots)?;
     Ok((Some(path), packages))
 }
 
@@ -458,6 +462,82 @@ pub(crate) fn project_file_in(dir: &Path) -> Option<PathBuf> {
         .iter()
         .map(|name| dir.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+#[derive(Clone, Default, Deserialize)]
+pub(crate) struct ManifestSelectionFields {
+    #[serde(default)]
+    workspace: WorkspaceMembership,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct WorkspaceMembership {
+    #[serde(default)]
+    projects: Vec<String>,
+}
+
+pub(crate) fn read_manifest_selection_fields(project: &Path) -> ManifestSelectionFields {
+    std::fs::read_to_string(project)
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn manifest_for_project(
+    project: &Path,
+    version: Option<&str>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    manifest_for_project_with(project, version, home, read_manifest_selection_fields)
+}
+
+/// Follow Julia Base's `base_project`/`project_file_manifest_path`: the
+/// nearest ancestor that explicitly lists the project can itself be a
+/// member, and its manifest takes precedence over the child's. If no
+/// workspace ancestor has one, the member can still have its own manifest.
+pub(crate) fn manifest_for_project_with(
+    project: &Path,
+    version: Option<&str>,
+    home: Option<&Path>,
+    mut fields: impl FnMut(&Path) -> ManifestSelectionFields,
+) -> Option<PathBuf> {
+    let project = std::path::absolute(project).ok()?;
+    let mut chain = vec![project.clone()];
+    let start = project.parent()?;
+    let home_boundary = home.filter(|home| start.starts_with(home));
+    if version
+        .and_then(parse_version)
+        .is_none_or(|version| version >= (1, 12))
+    {
+        let mut member = start.to_path_buf();
+        for directory in start.ancestors().skip(1) {
+            if home_boundary.is_some_and(|home| !directory.starts_with(home)) {
+                break;
+            }
+            let Some(candidate) = project_file_in(directory) else {
+                continue;
+            };
+            if fields(&candidate).workspace.projects.iter().any(|entry| {
+                let path = directory.join(entry);
+                if !path.is_dir() {
+                    return false;
+                }
+                if crate::incremental::normalize_path(&path) == member {
+                    return true;
+                }
+                std::fs::canonicalize(&path).is_ok_and(|dir| {
+                    std::fs::canonicalize(&member).is_ok_and(|member| member == dir)
+                })
+            }) {
+                chain.push(candidate);
+                member = directory.to_path_buf();
+            }
+        }
+    }
+    chain
+        .into_iter()
+        .rev()
+        .find_map(|project| find_manifest(project.parent()?, version))
 }
 
 /// The sibling manifest selected by the located Julia installation.
@@ -1141,9 +1221,9 @@ pub fn discover_julia_target(anchor: &Path) -> Option<VersionRange> {
     {
         return Some(range);
     }
-    let project_dir = project.parent()?;
-    let version = installed_version(&EnvContext::from_process(anchor.to_path_buf()));
-    let manifest = find_manifest(project_dir, version.as_deref())?;
+    let ctx = EnvContext::from_process(anchor.to_path_buf());
+    let version = installed_version(&ctx);
+    let manifest = manifest_for_project(&project, version.as_deref(), ctx.home.as_deref())?;
     read_toml(&manifest)
         .ok()
         .and_then(manifest_range_from_table)
@@ -1393,6 +1473,86 @@ projects = ["sub"]
         };
         let span = span.expect("a span for a mid-file syntax error");
         assert!(span.start >= text.find("uuid").unwrap(), "{span:?}");
+    }
+
+    #[test]
+    fn declared_nested_workspaces_use_root_manifest_and_member_deps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let group = root.join("group");
+        let member = group.join("member");
+        let unrelated = group.join("other");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(
+            root.join("Project.toml"),
+            "[workspace]\nprojects = [\"group\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            group.join("Project.toml"),
+            "[workspace]\nprojects = [\"member\"]\n",
+        )
+        .unwrap();
+        let id = "d58978e5-989f-55fb-8d15-ea34adc7bf54";
+        let project = member.join("Project.toml");
+        std::fs::write(&project, format!("[deps]\nDagger = \"{id}\"\n")).unwrap();
+        std::fs::write(unrelated.join("Project.toml"), "[deps]\n").unwrap();
+        let manifest = root.join("Manifest.toml");
+        std::fs::write(&manifest, format!(
+            "manifest_format = \"2.0\"\n[[deps.Dagger]]\nuuid = \"{id}\"\npath = \"vendor/Dagger\"\n"
+        )).unwrap();
+        let local = member.join("JuliaManifest.toml");
+        std::fs::write(&local, "manifest_format = \"2.0\"\n").unwrap();
+        let (selected, packages) = load_manifest(&project, &[], Some("1.13.4"), None).unwrap();
+        assert_eq!(selected, Some(manifest.clone()));
+        assert_eq!(packages[0].source, Some(root.join("vendor/Dagger")));
+        assert_eq!(
+            manifest_for_project(&project, Some("1.11.7"), None),
+            Some(local)
+        );
+        assert_eq!(
+            manifest_for_project(&unrelated.join("Project.toml"), Some("1.13.4"), None),
+            None
+        );
+        let versioned = root.join("Manifest-v1.13.toml");
+        std::fs::write(&versioned, "manifest_format = \"2.0\"\n").unwrap();
+        assert_eq!(
+            manifest_for_project(&project, Some("1.13.4"), None),
+            Some(versioned)
+        );
+        let ctx = EnvContext {
+            workspace_root: member,
+            julia_project: None,
+            julia_depot_path: Some(String::new()),
+            home: None,
+            julia_bindir: None,
+            path: None,
+        };
+        let env = resolve(&ctx).unwrap().unwrap();
+        assert_eq!(env.project_file, project);
+        assert_eq!(env.direct_deps["Dagger"].to_string(), id);
+    }
+
+    #[test]
+    fn workspace_falls_back_when_owner_has_no_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let member = root.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            root.join("Project.toml"),
+            "[workspace]\nprojects = [\"member\"]\n",
+        )
+        .unwrap();
+        let project = member.join("Project.toml");
+        std::fs::write(&project, "[deps]\n").unwrap();
+        let local = member.join("Manifest.toml");
+        std::fs::write(&local, "manifest_format = \"2.0\"\n").unwrap();
+        assert_eq!(
+            manifest_for_project(&project, Some("1.13.4"), None),
+            Some(local)
+        );
     }
 
     #[test]

@@ -80,6 +80,7 @@ mod semantic_tokens;
 mod server;
 mod signature_help;
 mod state;
+mod static_inlay;
 mod symbols;
 mod task_pool;
 mod type_hierarchy;

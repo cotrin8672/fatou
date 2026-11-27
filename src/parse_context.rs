@@ -650,30 +650,32 @@ pub(crate) fn manifest_contexts(
     let mut contexts = Vec::new();
     let mut issues = BTreeMap::new();
     for (project, targets) in projects {
-        let Some(directory) = project.parent() else {
-            continue;
-        };
-        let (manifest, mut packages) =
-            match environment::load_manifest(directory, &depots, version.as_deref()) {
-                Ok((Some(manifest), packages)) => (manifest, packages),
-                Ok((None, _)) => continue,
-                Err(error) => {
-                    let path = match &error {
-                        EnvironmentError::Parse { path, .. }
-                        | EnvironmentError::Read { path, .. } => path.clone(),
-                    };
-                    if let Some(issue) =
-                        EditionSelection::parse_error(&path, SyntaxEdition::OLDEST, error).issue
-                    {
-                        for target in targets {
-                            issues
-                                .entry(target.clone())
-                                .or_insert_with(|| issue.clone());
-                        }
+        let (manifest, mut packages) = match environment::load_manifest(
+            &project,
+            &depots,
+            version.as_deref(),
+            ctx.home.as_deref(),
+        ) {
+            Ok((Some(manifest), packages)) => (manifest, packages),
+            Ok((None, _)) => continue,
+            Err(error) => {
+                let path = match &error {
+                    EnvironmentError::Parse { path, .. } | EnvironmentError::Read { path, .. } => {
+                        path.clone()
                     }
-                    continue;
+                };
+                if let Some(issue) =
+                    EditionSelection::parse_error(&path, SyntaxEdition::OLDEST, error).issue
+                {
+                    for target in targets {
+                        issues
+                            .entry(target.clone())
+                            .or_insert_with(|| issue.clone());
+                    }
                 }
-            };
+                continue;
+            }
+        };
         if packages
             .iter()
             .any(|package| package.kind == PackageKind::Stdlib)

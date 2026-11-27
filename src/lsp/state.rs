@@ -703,7 +703,7 @@ impl GlobalState {
         };
         let uri = params.text_document.uri;
         let Some(text) = self.project_text(&uri) else {
-            let hints = self
+            let compiler = self
                 .compiler_hints
                 .as_ref()
                 .filter(|snapshot| {
@@ -712,9 +712,21 @@ impl GlobalState {
                             doc.kind == DocumentKind::Julia && doc.version == snapshot.version
                         })
                 })
-                .map(|snapshot| snapshot.in_range(params.range).collect::<Vec<_>>())
-                .unwrap_or_default();
-            self.respond_ok(id, serde_json::json!(hints));
+                .map(|snapshot| snapshot.in_range(params.range).collect::<Vec<_>>());
+            if let Some(hints) = compiler {
+                self.respond_ok(id, serde_json::json!(hints));
+            } else if let Some(text) = self.julia_text(&uri) {
+                let reply = self.read_reply(id.clone(), Some(&uri));
+                self.dispatch_read(ReadJob::JuliaInlayHints {
+                    id,
+                    path: path_for(&uri),
+                    text,
+                    range: params.range,
+                    sender: reply,
+                });
+            } else {
+                self.respond_ok(id, serde_json::json!([]));
+            }
             return;
         };
         let reply = self.read_reply(id.clone(), Some(&uri));
@@ -3256,27 +3268,17 @@ mod tests {
         }
     }
 
-    /// Inlay hints are a project file's alone, but unlike the other three a
-    /// Julia document answers an **empty list** rather than `null`: the
-    /// capability is advertised globally, and "this file has no hints" is the
-    /// honest answer, not "I do not do hints".
     #[test]
-    fn inlay_hints_answer_empty_for_a_julia_document() {
+    fn a_julia_buffer_reaches_the_read_pool_for_static_inlay_hints() {
         let (mut state, channels) = test_state_with_channels();
         let source = uri("file:///work/a.jl");
         did_open(&mut state, &source, "x = 1\n");
-        // Drain the analysis the open dispatched.
         let _ = analyses(&channels.sync);
-
         state.on_request(inlay_hint_request(1, &source));
-
-        match channels.client.try_recv().expect("a response") {
-            Message::Response(resp) => {
-                assert_eq!(resp.response_result.ok(), Some(serde_json::json!([])));
-            }
-            other => panic!("expected a response, got {other:?}"),
-        }
-        assert!(channels.read.try_recv().is_err(), "and no read job");
+        assert!(matches!(
+            channels.read.try_recv().unwrap(),
+            ReadJob::JuliaInlayHints { .. }
+        ));
     }
 
     #[test]

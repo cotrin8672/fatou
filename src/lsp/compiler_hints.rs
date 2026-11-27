@@ -8,6 +8,7 @@ use std::path::Path;
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip, Range, Uri};
 use serde::Deserialize;
 
+use crate::parser::{is_ident_continue, is_ident_start};
 use crate::text::{PositionEncoding, TextBuffer};
 
 pub(super) const TARGET: &str = "fatou/compilerHintsTarget";
@@ -140,8 +141,8 @@ impl ImportedHints {
                 HintKind::Assignment => {
                     let mut chars = hint.anchor.chars();
                     let after = after.trim_start_matches([' ', '\t']);
-                    if !chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
-                        || !chars.all(|c| c == '_' || c == '!' || c.is_alphanumeric())
+                    if !chars.next().is_some_and(is_ident_start)
+                        || !chars.all(is_ident_continue)
                         || !before.chars().all(|c| matches!(c, ' ' | '\t'))
                         || !after.starts_with('=')
                         || after.starts_with("==")
@@ -171,8 +172,9 @@ impl ImportedHints {
                 _ => "",
             };
             let position = lines.byte_to_position(hint.end_byte, encoding);
-            let mut compact: String = hint.inferred_type.chars().take(58).collect();
-            if compact.len() < hint.inferred_type.len() {
+            let mut chars = hint.inferred_type.chars();
+            let mut compact: String = chars.by_ref().take(58).collect();
+            if chars.next().is_some() {
                 compact.push('…');
             }
             let tooltip = format!(
@@ -256,6 +258,32 @@ mod tests {
             assert_eq!(hint.kind, Some(InlayHintKind::TYPE));
             assert!(hint.text_edits.is_none());
             assert!(matches! {&hint.label, InlayHintLabel::String(label) if label == "::Int64"});
+        }
+    }
+
+    #[test]
+    fn accepts_julia_combining_and_prime_names_without_extra_ellipsis() {
+        for anchor in ["ûₖ", "P̃ₖᵘ", "δ′"] {
+            let source = format!("{anchor} = 4\n");
+            let hints = json!([{
+                "startByte": 0, "endByte": anchor.len(), "anchor": anchor,
+                "inferredType": "型", "kind": "assignment"
+            }]);
+            let snapshot = ImportedHints::validate(
+                uri(),
+                7,
+                report(&source, hints),
+                &TextBuffer::from(source.as_str()),
+                PositionEncoding::Utf16,
+            )
+            .unwrap();
+            let range = Range::new(Position::new(0, 0), Position::new(1, 0));
+            let hint = snapshot.in_range(range).next().unwrap();
+            assert_eq!(
+                hint.position.character as usize,
+                anchor.encode_utf16().count()
+            );
+            assert!(matches!(&hint.label, InlayHintLabel::String(label) if label == "::型"));
         }
     }
 

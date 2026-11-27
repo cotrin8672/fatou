@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.27.4 (fork)
+
+- Resolve declared Julia workspace members through their shared manifest while keeping the member's own direct dependencies.
+- Complete project dependency module names, qualified macros and re-exported APIs such as FFTW's `fft`; add explicit imports on acceptance when needed.
+- At a simple comprehension binder, suggest unresolved names actually read in its element rather than unrelated outer variables.
+- Warn on exact repeated `using` entries without reporting them as invalid Julia.
+- Show conservative static type hints by default through the LSP, and refresh actual compiler types on save after an explicit per-buffer opt-in in Neovim.
+
 ## 0.27.3 (fork)
 
 - Improve Base completion during initialization and report incomplete startup lists.

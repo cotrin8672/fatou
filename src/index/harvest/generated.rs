@@ -17,8 +17,7 @@ use crate::syntax::{SyntaxKind, SyntaxNode};
 use super::{is_short_form_def, is_trivia, macro_args, node_name_text, signature_start};
 
 pub(super) struct GeneratedMethods {
-    pub(super) names: Vec<String>,
-    pub(super) signatures: Vec<(SyntaxNode, TextRange)>,
+    pub(super) signatures: Vec<(SyntaxNode, TextRange, Vec<String>)>,
 }
 
 pub(super) fn literal_eval_loop(node: &SyntaxNode) -> Option<GeneratedMethods> {
@@ -45,8 +44,16 @@ pub(super) fn literal_eval_loop(node: &SyntaxNode) -> Option<GeneratedMethods> {
         return None;
     }
 
+    let body = loop_expr.body()?;
+    let mut statements = body.syntax().children().peekable();
+    let alias = if statements.peek()?.kind() == SyntaxKind::ASSIGNMENT_EXPR {
+        let declaration = statements.next()?;
+        Some(symbol_prefix_alias(&declaration, variable.text())?)
+    } else {
+        None
+    };
     let mut signatures = Vec::new();
-    for statement in loop_expr.body()?.syntax().children() {
+    for statement in statements {
         let call = MacroCall::cast(statement)?;
         let path: Vec<_> = call
             .name()?
@@ -67,7 +74,12 @@ pub(super) fn literal_eval_loop(node: &SyntaxNode) -> Option<GeneratedMethods> {
             .syntax()
             .descendants()
             .filter_map(Interpolation::cast)
-            .any(|interpolation| !is_loop_name(&interpolation, variable.text()))
+            .any(|interpolation| {
+                !is_loop_name(&interpolation, variable.text())
+                    && alias
+                        .as_ref()
+                        .is_none_or(|(alias, _)| !is_loop_name(&interpolation, alias))
+            })
         {
             return None;
         }
@@ -75,15 +87,93 @@ pub(super) fn literal_eval_loop(node: &SyntaxNode) -> Option<GeneratedMethods> {
         let [target] = args.as_slice() else {
             return None;
         };
+        let mut add = |definition: &SyntaxNode| -> Option<()> {
+            let (signature, range, name) = method_template(definition)?;
+            let expanded = if name == variable.text() {
+                names.clone()
+            } else {
+                let (alias_name, prefix) = alias.as_ref()?;
+                if &name != alias_name {
+                    return None;
+                }
+                names.iter().map(|name| format!("{prefix}{name}")).collect()
+            };
+            signatures.push((signature, range, expanded));
+            Some(())
+        };
         if target.kind() == SyntaxKind::BEGIN_EXPR {
             for definition in body_of(target)?.children() {
-                signatures.push(method_template(&definition, variable.text())?);
+                add(&definition)?;
             }
         } else {
-            signatures.push(method_template(target, variable.text())?);
+            add(target)?;
         }
     }
-    Some(GeneratedMethods { names, signatures })
+    (!signatures.is_empty()).then_some(GeneratedMethods { signatures })
+}
+
+/// A single local alias derived from the literal loop value:
+/// `pf = Symbol("plan_", f)`. Reject computed strings, calls with side
+/// effects, extra assignments, shadowed constructors, and arbitrary eval.
+fn symbol_prefix_alias(decl: &SyntaxNode, variable: &str) -> Option<(String, String)> {
+    use crate::semantic::SemanticModel;
+    let mut sides = decl.children();
+    let lhs = sides.next()?;
+    let alias = node_name_text(&lhs)?;
+    if lhs.kind() != SyntaxKind::NAME || alias == variable {
+        return None;
+    }
+    let call = CallExpr::cast(sides.next()?)?;
+    if sides.next().is_some()
+        || !decl
+            .children_with_tokens()
+            .any(|token| token.kind() == SyntaxKind::EQ)
+    {
+        return None;
+    }
+    let Expr::Name(callee) = call.callee()? else {
+        return None;
+    };
+    let ident = callee.ident()?;
+    if ident.text() != "Symbol" {
+        return None;
+    }
+    let list = call.arg_list()?;
+    let mut args = list.args();
+    let value = args.next()?.expr()?;
+    let Expr::Name(value_name) = args.next()?.expr()? else {
+        return None;
+    };
+    if value_name.ident()?.text() != variable
+        || args.next().is_some()
+        || list.keyword_args().next().is_some()
+    {
+        return None;
+    }
+    let Expr::StringLiteral(_) = &value else {
+        return None;
+    };
+    let spelling = value.syntax().text().to_string();
+    let prefix = spelling.strip_prefix('"')?.strip_suffix('"')?;
+    if prefix.is_empty()
+        || prefix.len() > 32
+        || !prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || !prefix.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return None;
+    }
+    let root = decl.ancestors().last()?;
+    let model = SemanticModel::build(&root);
+    if !model
+        .idents()
+        .iter()
+        .any(|r| r.range == ident.syntax().text_range() && r.binding.is_none())
+    {
+        return None;
+    }
+    Some((alias, prefix.into()))
 }
 
 fn quoted_name(expr: Expr) -> Option<String> {
@@ -109,7 +199,7 @@ fn quoted_name(expr: Expr) -> Option<String> {
     }
 }
 
-fn method_template(node: &SyntaxNode, variable: &str) -> Option<(SyntaxNode, TextRange)> {
+fn method_template(node: &SyntaxNode) -> Option<(SyntaxNode, TextRange, String)> {
     let signature = if node.kind() == SyntaxKind::FUNCTION_DEF {
         signature_start(node)?
     } else if is_short_form_def(node) {
@@ -122,16 +212,23 @@ fn method_template(node: &SyntaxNode, variable: &str) -> Option<(SyntaxNode, Tex
     let Expr::Interpolation(name) = unparenthesized(call.callee()?)? else {
         return None;
     };
-    if !is_loop_name(&name, variable)
-        || signature
-            .descendants()
-            .filter_map(Interpolation::cast)
-            .count()
-            != 1
+    if signature
+        .descendants()
+        .filter_map(Interpolation::cast)
+        .count()
+        != 1
     {
         return None;
     }
-    Some((signature, name.syntax().text_range()))
+    let ident = if let Some(ident) = name.ident() {
+        ident
+    } else {
+        let Expr::Name(expr) = unparenthesized(name.expr()?)? else {
+            return None;
+        };
+        expr.ident()?
+    };
+    Some((signature, name.syntax().text_range(), ident.text().into()))
 }
 
 fn is_loop_name(interpolation: &Interpolation, variable: &str) -> bool {

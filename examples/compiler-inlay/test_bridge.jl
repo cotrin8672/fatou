@@ -29,4 +29,20 @@ catch e
     e isa ArgumentError && occursin("recorded source load", string(e))
 end
 @assert stale
+# Preserve exact source spelling even when Julia normalizes identifier symbols.
+mktempdir() do dir
+    source = "function optical()\r\n    ûₖ = 2.0\r\n    P̃ₖᵘ = 3.0\r\n    δ′ = 4.0\r\n    return ûₖ + P̃ₖᵘ + δ′\r\nend\r\n"
+    file = joinpath(dir, "unicode.jl")
+    write(file, source)
+    receipt = load_trusted!(CompilerHintFixture, file)
+    result = Base.invokelatest() do
+        infer(receipt, CompilerHintFixture.optical, Tuple{})
+    end
+    @assert result.source == replace(source, "\r\n" => "\n")
+    for name in ["ûₖ", "P̃ₖᵘ", "δ′"]
+        hint = only(filter(x -> x.anchor == name, result.hints))
+        @assert hint.inferredType == "Float64"
+        @assert String(collect(codeunits(result.source))[hint.startByte+1:hint.endByte]) == name
+    end
+end
 println("bridge: concrete specializations, Any, bottom, small Union, UTF-8 and stale world passed")

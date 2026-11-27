@@ -796,12 +796,21 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
     /// HTTP's Messages submodule) or an explicit Reexport.jl declaration.
     /// Values are confirmed by qualified_member_origin before publication.
     pub(crate) fn using_projection_names(&self, path: &[SmolStr]) -> Vec<String> {
-        const MAX_PROVIDERS: usize = 48;
-        const MAX_NAMES: usize = 2048;
         let Some(module) = self.environment_module_at(path) else {
             return Vec::new();
         };
-        let mut pending = self.projection_providers(path, &module, true);
+        self.projected_names(path, &module, true)
+    }
+
+    fn projected_names(
+        &self,
+        path: &[SmolStr],
+        module: &ModuleIndex,
+        include_relative: bool,
+    ) -> Vec<String> {
+        const MAX_PROVIDERS: usize = 48;
+        const MAX_NAMES: usize = 2048;
+        let mut pending = self.projection_providers(path, module, include_relative);
         pending.reverse();
         let mut visited = std::collections::HashSet::new();
         let mut names = std::collections::BTreeSet::new();
@@ -834,6 +843,30 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             );
         }
         names.into_iter().collect()
+    }
+
+    /// Real function and type bindings exported through a re-export facade.
+    /// Filter before origin resolution so auto-import only checks the typed prefix.
+    pub(crate) fn auto_import_reexports(
+        &self,
+        root: &ModuleIndex,
+        prefix: &str,
+    ) -> Vec<(String, QualifiedMemberKind)> {
+        if !root.usings.iter().any(|entry| entry.reexport) {
+            return Vec::new();
+        }
+        let owner = [SmolStr::new(&root.name)];
+        self.projected_names(&owner, root, false)
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .filter_map(|name| match self.qualified_member_origin(&owner, &name)? {
+                QualifiedMember::Symbol {
+                    kind: kind @ (QualifiedMemberKind::Function | QualifiedMemberKind::Type),
+                    ..
+                } => Some((name, kind)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn projection_providers(
@@ -1189,7 +1222,23 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             if !using_paths.insert(path) {
                 continue;
             }
-            for name in exported_names(&module, namespace) {
+            let projected = if module.usings.iter().any(|u| u.reexport) {
+                let owner = Self::provider_path(&module);
+                self.projected_names(&owner, &module, false)
+                    .into_iter()
+                    .filter(|name| {
+                        in_namespace(name, namespace)
+                            && self.qualified_member_origin(&owner, name).is_some()
+                    })
+                    .map(SmolStr::new)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for name in exported_names(&module, namespace)
+                .into_iter()
+                .chain(projected)
+            {
                 if seen.insert(name.clone()) {
                     using_names.insert(name.clone());
                     out.push(Candidate {
@@ -1501,7 +1550,14 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         wanted: &SmolStr,
         providers: impl Iterator<Item = UsingProvider>,
     ) -> Result<Option<UsingProvider>, ()> {
-        let mut exports = providers.filter(|(_, module)| module_exports(module, wanted));
+        let mut exports = providers.filter(|(_, module)| {
+            module_exports(module, wanted)
+                || (module.usings.iter().any(|u| u.reexport) && {
+                    let owner = Self::provider_path(module);
+                    self.effectively_exports(&owner, module, wanted, &mut Vec::new())
+                        && self.qualified_member_origin(&owner, wanted).is_some()
+                })
+        });
         let Some(first) = exports.next() else {
             return Ok(None);
         };
@@ -1527,6 +1583,12 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             }
         }
         Ok(Some(first))
+    }
+
+    fn provider_path(module: &ModuleIndexHandle) -> ModulePath {
+        let mut path = vec![SmolStr::new(&module.pkg.name)];
+        path.extend_from_slice(&module.rest);
+        path
     }
 
     /// Identity that does not require evaluating arbitrary Julia expressions.

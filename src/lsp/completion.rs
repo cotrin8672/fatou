@@ -524,6 +524,18 @@ fn completion_via_db_impl(
             encoding,
             &mut items,
         );
+        auto_import::direct_module(
+            snapshot,
+            file,
+            path,
+            model,
+            &root,
+            workspace.as_ref(),
+            text,
+            offset,
+            encoding,
+            &mut items,
+        );
         append_auto_imports(
             snapshot, file, path, model, &root, workspace, text, offset, encoding, &mut items,
         );
@@ -874,6 +886,7 @@ fn append_auto_imports(
     else {
         return;
     };
+    let resolver = Resolver::new(model, snapshot).with_workspace_at(workspace.clone(), Some(&path));
     let mut offers =
         std::collections::BTreeMap::<String, Option<(String, CompletionItemKind)>>::new();
     for (dep, uuid) in project_details.deps {
@@ -920,6 +933,19 @@ fn append_auto_imports(
                     }
                 })
                 .or_insert_with(|| Some((dep.clone(), kind)));
+        }
+        for (name, kind) in resolver.auto_import_reexports(module, prefix) {
+            if !simple_auto_import_symbol(&name) {
+                continue;
+            }
+            offers
+                .entry(name)
+                .and_modify(|offer| {
+                    if offer.as_ref().is_some_and(|(owner, _)| owner != &dep) {
+                        *offer = None;
+                    }
+                })
+                .or_insert_with(|| Some((dep.clone(), auto_import::imported_kind(kind))));
         }
     }
     if offers.values().all(Option::is_none)
@@ -1030,7 +1056,6 @@ fn append_auto_imports(
             }
         }
     }
-    let resolver = Resolver::new(model, snapshot).with_workspace_at(workspace, Some(&path));
     let range = super::documentation::lsp_range(callee, &text.line_index(), encoding);
     let at = text.line_index().byte_to_position(anchor, encoding);
     for (name, (dep, kind)) in offers
@@ -1410,6 +1435,46 @@ fn completions_for<P: PackageSource>(
                 .visible(offset, Namespace::Macro),
             Namespace::Macro,
         ),
+        Context::Value
+            if let Some(site) = declaration_names::comprehension_binder(root, offset) =>
+        {
+            let resolver = Resolver::new(model, packages).with_workspace(workspace);
+            let mut names = std::collections::BTreeMap::new();
+            for read in model.free_reads().filter(|read| {
+                read.access == crate::semantic::Access::Read
+                    && site.body.contains_range(read.range)
+                    && read.name.starts_with(&site.prefix)
+                    && declaration_names::direct_comprehension_read(root, read.range, site.body)
+                    && resolver.resolve(&read.name, read.range.start(), Namespace::Value)
+                        == Resolution::Unresolved
+            }) {
+                names
+                    .entry(read.name.as_str())
+                    .and_modify(|at: &mut TextSize| {
+                        *at = (*at).max(read.range.end());
+                    })
+                    .or_insert(read.range.end());
+            }
+            let mut names: Vec<_> = names.into_iter().collect();
+            names.sort_by_key(|&(_, at)| std::cmp::Reverse(at));
+            let range = super::documentation::lsp_range(site.replace, lines, encoding);
+            names
+                .into_iter()
+                .take(16)
+                .enumerate()
+                .map(|(rank, (label, _))| CompletionItem {
+                    label: label.into(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some("Name used in the comprehension body".into()),
+                    sort_text: Some(format!("!fatou-comprehension:{rank:02}")),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range,
+                        new_text: label.into(),
+                    })),
+                    ..Default::default()
+                })
+                .collect()
+        }
         Context::Value if declaration_names::introduces_name(root, model, offset) => Vec::new(),
         Context::Value => {
             if let Some(site) = call_keywords::site_at(root, offset)
@@ -2169,7 +2234,10 @@ fn append_imported_members<P: PackageSource>(
         if label == &module.name
             || (prefix_only
                 && !prefix.is_empty()
-                && !label.trim_start_matches('@').to_lowercase().starts_with(&prefix))
+                && !label
+                    .trim_start_matches('@')
+                    .to_lowercase()
+                    .starts_with(&prefix))
             || label.starts_with('@') != macro_member
             || !visited.insert(label.as_str())
         {
@@ -2867,7 +2935,7 @@ mod tests {
             let root = dir.join(name);
             fs::create_dir_all(root.join("src")).unwrap();
             fs::write(root.join("src").join(format!("{name}.jl")), format!(
-                "module {name}\nexport calculate, ghost, calculator\ncalculate() = 2\nstruct calculator end\nend\n"
+                "module {name}\nexport calculate, ghost, calculator\ncalculate() = 2\nstruct calculator end\nmacro spawn(x) x end\nend\n"
             )).unwrap();
             Package {
                 syntax_edition: crate::parser::SyntaxEdition::OLDEST,
@@ -2982,6 +3050,47 @@ mod tests {
         assert_eq!(text(item(&actual, "empty_doc")), None);
         assert_eq!(text(item(&actual, "opaque_doc")), Some("Fallback static"));
         assert_eq!(text(item(&actual, "undoc")), None);
+    }
+
+    #[test]
+    fn direct_dependency_module_auto_import_inside_an_incomplete_array() {
+        let items = auto_import_fixture(
+            "module Tester\nusing Random\nfunction run()\n tasks = [\n Too|\nend\nend\n",
+            "direct",
+        );
+        let tools = item(&items, "Tools");
+        assert_eq!(
+            tools.additional_text_edits.as_ref().unwrap()[0].new_text,
+            "import Tools\n"
+        );
+    }
+
+    #[test]
+    fn direct_dependency_qualified_macro_keeps_sigil_and_adds_import() {
+        let items = auto_import_fixture(
+            "module Tester\nfunction run()\n tasks = [\n Tools.@s|\n ]\nend\nend\n",
+            "direct",
+        );
+        let mac = item(&items, "@spawn");
+        assert_eq!(mac.filter_text.as_deref(), Some("spawn"));
+        assert_eq!(
+            mac.additional_text_edits.as_ref().unwrap()[0].new_text,
+            "import Tools\n"
+        );
+    }
+
+    #[test]
+    fn comprehension_binder_suggests_unbound_body_name_not_outer_variables() {
+        for iterable in ["", " in interaction_m1_list"] {
+            let src = format!(
+                "function run(interaction_mode, interaction_coef, interaction_m1_list, u)\n x = [\n @. (interaction_coef / 2) * (u == interaction_mode) + interaction_m1 / 2 * (u == -1)\n for intera{iterable}\n ]\nend"
+            );
+            let items = completions_bare(&src, "for intera");
+            assert_eq!(labels(&items), ["interaction_m1"], "{src}");
+            assert!(items[0].sort_text.is_some());
+        }
+        let outside = "f(xs, interaction_m1) = [interaction_m1 for intera in xs]";
+        assert!(completions_bare(outside, "for intera").is_empty());
     }
 
     #[test]

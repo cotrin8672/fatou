@@ -99,7 +99,7 @@ class Lsp {
   }
 }
 
-async function check(rootUri, title, uri = `${rootUri}/source%20folder/entry.jl`) {
+async function check(rootUri, title, uri = `${rootUri}/entry.jl`) {
   const lsp = new Lsp();
   try {
     await lsp.request('initialize', {
@@ -110,7 +110,7 @@ async function check(rootUri, title, uri = `${rootUri}/source%20folder/entry.jl`
     });
     lsp.send({ method: 'initialized', params: {} });
     let version = 0;
-    const complete = async (marked, ready = (items) => items.some(({ kind }) => kind === folderKind || kind === fileKind)) => {
+    const complete = async (marked, ready = (items) => items.some(({ kind }) => kind === folderKind || kind === fileKind), context) => {
       const [before, after] = marked.split('¦');
       assert.notEqual(after, undefined);
       const text = before + after;
@@ -129,7 +129,7 @@ async function check(rootUri, title, uri = `${rootUri}/source%20folder/entry.jl`
       // class or member, never just for a non-empty response.
       let items;
       for (let i = 0; i < 30; i++) {
-        const result = await lsp.request('textDocument/completion', { textDocument: { uri }, position });
+        const result = await lsp.request('textDocument/completion', { textDocument: { uri }, position, context });
         items = Array.isArray(result) ? result : (result?.items ?? []);
         if (ready(items)) return items;
         await new Promise((resolve) => setTimeout(resolve, 250));
@@ -165,6 +165,23 @@ async function check(rootUri, title, uri = `${rootUri}/source%20folder/entry.jl`
       items = await complete(source, matching);
       assert.ok(matching(items), `${title}: missing ${label} in ${source}; got ${items.slice(0, 15).map(({ label }) => label)}`);
     }
+    const same = (label) => (candidates) => candidates.some((item) => item.label === label);
+    const taskSource = 'using Random\nfunction run()\n    tasks = [\n        ';
+    items = await complete(taskSource + 'Dag¦\n    ]\nend', same('Dagger'));
+    const dagger = items.find((item) => item.label === 'Dagger');
+    assert.match(dagger?.additionalTextEdits?.[0]?.newText ?? '', /^import Dagger\r?\n$/);
+    for (const [name, prefix, context, mustImport] of [
+      ['unimported', '', { triggerKind: 2, triggerCharacter: '@' }, true],
+      ['unimported retry', '', { triggerKind: 3 }, true],
+      ['imported', 'using Dagger\n', { triggerKind: 1 }, false],
+    ]) {
+      items = await complete(prefix + taskSource + 'Dagger.@s¦\n    ]\nend', same('@spawn'), context);
+      const spawn = items.find((item) => item.label === '@spawn');
+      assert.equal(spawn?.textEdit?.newText, 'spawn', `${title}: ${name} macro must preserve @`);
+      assert.equal(!!spawn.additionalTextEdits?.some((edit) => /^import Dagger\r?\n$/.test(edit.newText)), mustImport);
+    }
+    items = await complete('using FFTW\nfunction run(xs)\n    map(xs) do x\n        abs2.(ff¦(x))\n    end\nend', same('fft'));
+    assert.ok(same('fft')(items), `${title}: FFTW re-export is missing`);
     await lsp.request('shutdown', null);
     lsp.send({ method: 'exit' });
     console.log(`PASS: ${title} ${rootUri}`);
@@ -173,10 +190,10 @@ async function check(rootUri, title, uri = `${rootUri}/source%20folder/entry.jl`
   }
 }
 
-await check(`file://${host}/${encode(share.join('/'))}`, 'UNC authority');
-await check(`file:////${host}/${encode(share.join('/'))}`, 'UNC path');
+await check(`file://${host}/${encode(share.join('/'))}/source%20folder`, 'UNC authority');
+await check(`file:////${host}/${encode(share.join('/'))}/source%20folder`, 'UNC path');
 // vim.uri_from_fname in Neovim 0.11 does not normalize a backslash UNC filename
 // as it does a drive path; the UNC is percent-encoded after file://.
-const nvimUnc = `file://${encodeURIComponent(uncRoot)}`;
-await check(nvimUnc, 'UNC Neovim 0.11', `${nvimUnc}%5Csource%20folder%5Centry.jl`);
-await check(`file:///${drive.slice(0, 3)}${encode(drive.slice(3))}`.replace(/\/$/, ''), 'SMB mapped drive');
+const nvimUnc = `file://${encodeURIComponent(uncRoot)}%5Csource%20folder`;
+await check(nvimUnc, 'UNC Neovim 0.11', `${nvimUnc}%5Centry.jl`);
+await check(`file:///${drive.slice(0, 3)}${encode(drive.slice(3))}`.replace(/\/$/, '') + '/source%20folder', 'SMB mapped drive');

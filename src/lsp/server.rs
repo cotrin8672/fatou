@@ -587,7 +587,7 @@ fn spawn_workspace_harvester(
                 workspace_roots[0].clone(),
             ));
             'resolve: loop {
-                let mut metadata = EnvironmentFiles::scan(&workspace_roots, version.as_deref());
+                let mut metadata = EnvironmentFiles::scan(&workspace_roots, version.as_deref(), None);
                 // Report the full pass (initial resolve, and every re-resolve a
                 // `continue 'resolve` restarts) as one begin/report/end cycle.
                 progress.begin("Indexing Julia environment", "Resolving environment");
@@ -659,7 +659,7 @@ fn spawn_workspace_harvester(
                             Err(_) => return,
                         },
                         recv(poll) -> _ => {
-                            let next = EnvironmentFiles::scan(&workspace_roots, version.as_deref());
+                            let next = EnvironmentFiles::scan(&workspace_roots, version.as_deref(), Some(&metadata));
                             let changes = metadata.changes_to(&next);
                             metadata = next;
                             if !changes.is_empty()

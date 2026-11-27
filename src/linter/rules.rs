@@ -151,6 +151,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(performance::LengthFindall),
         Box::new(performance::FixedRegex),
         Box::new(readability::ComparisonNegation),
+        Box::new(readability::DuplicateUsing),
         Box::new(readability::LengthZero),
         Box::new(readability::RedundantBoolean),
         Box::new(readability::StringBoundary),

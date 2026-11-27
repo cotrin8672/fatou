@@ -394,8 +394,8 @@ impl Harvester<'_> {
                     }
                 }
                 if let Some(methods) = generated::literal_eval_loop(node) {
-                    for (signature, range) in methods.signatures {
-                        for name in &methods.names {
+                    for (signature, range, names) in methods.signatures {
+                        for name in &names {
                             self.add_method(
                                 signature.clone(),
                                 file,
@@ -2005,6 +2005,23 @@ end
                     assert_eq!(name_of(&method.return_type), Some(vec!["Bool"]));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn eval_loop_indexes_literal_prefixed_symbols_used_by_fft_interfaces() {
+        let source = "for f in (:fft, :bfft)\n pf = Symbol(\"plan_\", f)\n @eval begin\n $f(x::AbstractArray) = $pf(x)\n $pf(x; kws...) = x\n end\nend";
+        let model = harvest_tree(&crate::parser::parse(source).cst);
+        for name in ["fft", "bfft", "plan_fft", "plan_bfft"] {
+            assert!(model.functions.iter().any(|f| f.name == name), "{name}");
+        }
+        for input in [
+            source.replace("\"plan_\"", "computed()"),
+            format!("Symbol(x, y) = :other\n{source}"),
+            source.replace("Symbol(\"plan_\", f)", "Symbol(\"plan_\", g)"),
+        ] {
+            let model = harvest_tree(&crate::parser::parse(&input).cst);
+            assert!(!model.functions.iter().any(|f| f.name == "plan_fft"));
         }
     }
 

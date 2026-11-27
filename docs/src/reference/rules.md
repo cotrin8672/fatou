@@ -1393,6 +1393,24 @@ After applying the fix:
 found = lookup(key) !== nothing
 ```
 
+## `duplicate-using`
+
+Report an identical `using` entry repeated in the same module and file. Distinct modules, names, and aliases are not duplicates.
+
+The second `sin` repeats the original entry:
+
+```julia
+using Base: sin, sin
+```
+
+```text
+warning: duplicate-using
+ --> example.jl:1:18
+  |
+1 | using Base: sin, sin
+  |                  ^^^ duplicate using entry `sin`
+```
+
 ## `length-zero`
 
 Prefer `isempty(x)` or `!isempty(x)` when a length comparison tests whether a collection is empty. This includes `length(x) == 0`, `length(x) < 1`, and their reversed forms.
