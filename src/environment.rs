@@ -269,7 +269,9 @@ impl EnvContext {
             workspace_root,
             julia_project: std::env::var("JULIA_PROJECT").ok(),
             julia_depot_path: std::env::var("JULIA_DEPOT_PATH").ok(),
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            // Julia's homedir() uses the platform home (USERPROFILE on
+            // Windows), not the HOME set by some Unix compatibility shells.
+            home: std::env::home_dir(),
             julia_bindir: std::env::var("JULIA_BINDIR").ok(),
             path: std::env::var("PATH").ok(),
         }
@@ -408,7 +410,10 @@ fn locate_project(ctx: &EnvContext, depots: &[PathBuf]) -> Option<(PathBuf, EnvS
         return Some((path, EnvSource::WorkspaceWalkUp));
     }
 
-    newest_default_env(ctx).map(|path| (path, EnvSource::DefaultEnv))
+    depots
+        .iter()
+        .find_map(|depot| newest_default_env(depot))
+        .map(|path| (path, EnvSource::DefaultEnv))
 }
 
 fn julia_project_setting(ctx: &EnvContext) -> Option<&str> {
@@ -498,20 +503,19 @@ pub(crate) fn find_manifest(project_dir: &Path, version: Option<&str>) -> Option
         .map(|(_, path)| path)
 }
 
-/// The newest `~/.julia/environments/vX.Y` project, by `(major, minor)`.
-fn newest_default_env(ctx: &EnvContext) -> Option<PathBuf> {
-    let envs = ctx.home.as_ref()?.join(".julia").join("environments");
-    let dir = std::fs::read_dir(&envs)
+/// The newest `environments/vX.Y` project in this depot, by `(major, minor)`.
+fn newest_default_env(depot: &Path) -> Option<PathBuf> {
+    let envs = depot.join("environments");
+    std::fs::read_dir(&envs)
         .ok()?
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name();
             let version = parse_version(name.to_str()?.strip_prefix('v')?)?;
-            Some((version, entry.path()))
+            Some((version, project_file_in(&entry.path())?))
         })
         .max_by_key(|(version, _)| *version)
-        .map(|(_, path)| path)?;
-    project_file_in(&dir)
+        .map(|(_, path)| path)
 }
 
 /// Parse a `major.minor` (or longer) version prefix into a comparable tuple.
@@ -524,23 +528,42 @@ fn parse_version(s: &str) -> Option<(u32, u32)> {
 
 // --- Depots ----------------------------------------------------------------
 
-/// The ordered depot roots: `JULIA_DEPOT_PATH` (empty entries expand to the
-/// default), falling back to `~/.julia`.
+/// The ordered user depot roots. A leading empty component keeps the default
+/// user depot; later empty components only request Julia's bundled depots,
+/// whose stdlib sources are handled separately by Julia install discovery.
 pub(crate) fn depot_roots(ctx: &EnvContext) -> Vec<PathBuf> {
     let default = ctx.home.as_ref().map(|home| home.join(".julia"));
-    match ctx.julia_depot_path.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => raw
-            .split(depot_separator())
-            .flat_map(|entry| {
-                if entry.is_empty() {
-                    default.clone()
-                } else {
-                    Some(PathBuf::from(entry))
-                }
-            })
-            .collect(),
-        _ => default.into_iter().collect(),
+    let Some(raw) = ctx.julia_depot_path.as_deref() else {
+        return default.into_iter().collect();
+    };
+    if raw.is_empty() {
+        // Julia distinguishes an explicitly empty depot from an unset variable.
+        return Vec::new();
     }
+    let mut depots = Vec::new();
+    for (i, entry) in raw.split(depot_separator()).enumerate() {
+        let path = Path::new(entry);
+        let depot = if entry.is_empty() {
+            if i != 0 {
+                continue;
+            }
+            let Some(default) = default.as_ref() else {
+                continue;
+            };
+            default.clone()
+        } else if !cfg!(windows)
+            && let (Some(home), Ok(relative)) = (&ctx.home, path.strip_prefix("~"))
+        {
+            // Julia's expanduser expands ~/ only on non-Windows hosts.
+            home.join(relative)
+        } else {
+            path.to_path_buf()
+        };
+        if !depots.contains(&depot) {
+            depots.push(depot);
+        }
+    }
+    depots
 }
 
 const fn depot_separator() -> char {
@@ -1437,9 +1460,9 @@ projects = ["sub"]
     }
 
     #[test]
-    fn depot_roots_expand_empty_entry_to_default() {
+    fn depot_roots_include_default_only_for_a_leading_empty_entry() {
         let sep = depot_separator();
-        let ctx = EnvContext {
+        let mut ctx = EnvContext {
             workspace_root: PathBuf::from("/ws"),
             julia_project: None,
             julia_depot_path: Some(format!("/custom{sep}")),
@@ -1447,10 +1470,23 @@ projects = ["sub"]
             julia_bindir: None,
             path: None,
         };
+        assert_eq!(depot_roots(&ctx), vec![PathBuf::from("/custom")]);
+        ctx.julia_depot_path = Some(format!("{sep}/custom{sep}/custom{sep}"));
         assert_eq!(
             depot_roots(&ctx),
-            vec![PathBuf::from("/custom"), PathBuf::from("/home/u/.julia")]
+            vec![PathBuf::from("/home/u/.julia"), PathBuf::from("/custom")]
         );
+        ctx.julia_depot_path = Some(sep.to_string());
+        assert_eq!(depot_roots(&ctx), vec![PathBuf::from("/home/u/.julia")]);
+        ctx.julia_depot_path = Some(String::new());
+        assert!(depot_roots(&ctx).is_empty());
+        ctx.julia_depot_path = Some("~/custom".to_owned());
+        let expected = if cfg!(windows) {
+            PathBuf::from("~/custom")
+        } else {
+            PathBuf::from("/home/u").join("custom")
+        };
+        assert_eq!(depot_roots(&ctx), vec![expected]);
     }
 
     #[test]

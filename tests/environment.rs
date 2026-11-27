@@ -340,6 +340,32 @@ fn falls_back_to_newest_default_env() {
 }
 
 #[test]
+fn default_environment_respects_the_selected_depots() {
+    let tmp = TempDir::new();
+    let home = tmp.path().join("home");
+    let custom = tmp.path().join("custom");
+    let home_project = home.join(".julia/environments/v1.11/Project.toml");
+    let custom_project = custom.join("environments/v1.11/Project.toml");
+    write(&home_project, "name = \"HomeDefault\"\n");
+    write(&custom_project, "name = \"CustomDefault\"\n");
+
+    let mut ctx = EnvContext {
+        workspace_root: tmp.path().join("empty/ws"),
+        julia_project: None,
+        julia_depot_path: Some(custom.to_str().unwrap().to_owned()),
+        home: Some(home),
+        julia_bindir: None,
+        path: None,
+    };
+    let env = environment::resolve(&ctx).unwrap().unwrap();
+    assert_eq!(env.source, EnvSource::DefaultEnv);
+    assert_eq!(env.project_file, custom_project);
+
+    ctx.julia_depot_path = Some(String::new());
+    assert!(environment::resolve(&ctx).unwrap().is_none());
+}
+
+#[test]
 fn dev_package_detected_for_named_project_with_entry() {
     let tmp = TempDir::new();
     let ws = tmp.path().join("MyPkg");

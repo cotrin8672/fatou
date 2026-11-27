@@ -18,6 +18,36 @@ pub(crate) fn to_path(uri: &Uri) -> Option<PathBuf> {
         .decode()
         .into_string_lossy()
         .into_owned();
+    #[cfg(windows)]
+    if let Some(authority) = uri
+        .authority()
+        .filter(|authority| !authority.as_str().is_empty())
+    {
+        // A Windows file URI's authority is the UNC server, not disposable
+        // metadata. Do not reinterpret URI credentials/ports as SMB paths.
+        if authority.userinfo().is_some() || authority.port().is_some() {
+            return None;
+        }
+        let host = authority.host().as_str();
+        if !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            || host == "."
+            || host == ".."
+        {
+            return None;
+        }
+        if !host.eq_ignore_ascii_case("localhost") || !has_windows_drive(&decoded) {
+            let share = decoded.strip_prefix('/')?.split('/').next()?;
+            if share.is_empty() || share == "." || share == ".." || share.contains(['\\', ':']) {
+                return None;
+            }
+            return Some(PathBuf::from(format!(
+                r"\\{host}{}",
+                decoded.replace('/', "\\")
+            )));
+        }
+    }
     Some(from_uri_path(&decoded))
 }
 
@@ -26,11 +56,14 @@ fn from_uri_path(p: &str) -> PathBuf {
     // "/C:/Users/x" → "C:\Users\x"; without a drive letter the leading slash
     // stays, so "/work/x" maps to the rooted "\work\x" rather than a relative
     // path.
-    let bytes = p.as_bytes();
-    let has_drive =
-        bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
-    let trimmed = if has_drive { &p[1..] } else { p };
+    let trimmed = if has_windows_drive(p) { &p[1..] } else { p };
     PathBuf::from(trimmed.replace('/', "\\"))
+}
+
+#[cfg(windows)]
+fn has_windows_drive(p: &str) -> bool {
+    let bytes = p.as_bytes();
+    bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
 }
 
 #[cfg(not(windows))]
@@ -111,15 +144,33 @@ pub(crate) fn anchor_dir(path: &Path) -> Option<&Path> {
 pub(crate) fn from_path(path: &Path) -> Option<Uri> {
     let text = path.to_str()?;
     let mut encoded = String::from("file://");
-    // On Windows the path is drive-rooted (`C:\...`); a `file:` URI needs a
-    // leading slash and forward slashes.
+    // Preserve UNC authority; a drive path uses an empty authority and
+    // leading slash. Canonicalized Windows paths can use the verbatim prefix.
     #[cfg(windows)]
-    let text = {
+    let text = text.replace('\\', "/");
+    #[cfg(windows)]
+    let text = if let Some(unc) = text
+        .strip_prefix("//?/UNC/")
+        .or_else(|| text.strip_prefix("//?/unc/"))
+    {
+        unc
+    } else if let Some(verbatim) = text.strip_prefix("//?/") {
+        let bytes = verbatim.as_bytes();
+        if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b":/" {
+            return None;
+        }
         encoded.push('/');
-        text.replace('\\', "/")
+        verbatim
+    } else if text.starts_with("//./") {
+        return None;
+    } else if let Some(unc) = text.strip_prefix("//") {
+        unc
+    } else {
+        if !text.starts_with('/') {
+            encoded.push('/');
+        }
+        text.as_str()
     };
-    #[cfg(windows)]
-    let text = text.as_str();
     for &byte in text.as_bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
@@ -151,6 +202,34 @@ mod tests {
         // Percent-encoded drive colons (as sent by VS Code) decode the same.
         let uri = Uri::from_str("file:///c%3A/work/a.jl").unwrap();
         assert_eq!(to_path(&uri), Some(PathBuf::from("c:\\work\\a.jl")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn unc_and_mapped_drive_uri_round_trip() {
+        let uri = Uri::from_str("file://nixos/share/%E6%97%A5%20%23/probe.jl").unwrap();
+        let path = PathBuf::from(r"\\nixos\share\日 #\probe.jl");
+        assert_eq!(to_path(&uri).as_ref(), Some(&path));
+        assert_eq!(from_path(&path).as_ref(), Some(&uri));
+        assert_eq!(
+            from_path(Path::new(r"\\?\UNC\nixos\share\日 #\probe.jl")).as_ref(),
+            Some(&uri)
+        );
+        let old_uri = Uri::from_str("file:////nixos/share/%E6%97%A5%20%23/probe.jl").unwrap();
+        assert_eq!(to_path(&old_uri).as_ref(), Some(&path));
+        for text in [
+            "file:///Z:/dir/probe.jl",
+            "file:///Z://dir/probe.jl",
+            "file:///z%3A/dir/probe.jl",
+        ] {
+            let uri = Uri::from_str(text).unwrap();
+            let path = to_path(&uri).unwrap();
+            assert!(path.is_absolute(), "{path:?}");
+            assert_eq!(path.extension().unwrap(), "jl");
+            assert_eq!(to_path(&from_path(&path).unwrap()), Some(path));
+        }
+        assert!(to_path(&Uri::from_str("file://nixos:123/share/file.jl").unwrap()).is_none());
+        assert!(to_path(&Uri::from_str("file://nixos//file.jl").unwrap()).is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! Julia source files and folders for a confirmed `include("literal")`.
+//! Path completion for confirmed Julia file loading and document-relative joins.
 //! The edit stays inside one source path component; relative lookup follows the
 //! including document, not the process or workspace directory.
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use lsp_types::{CompletionItem, CompletionItemKind, CompletionTextEdit, Range, TextEdit};
 use rowan::{TextSize, TokenAtOffset};
@@ -15,7 +15,7 @@ use crate::semantic::{BindingKind, SemanticModel};
 use crate::syntax::{SyntaxKind, SyntaxNode};
 use crate::text::{PositionEncoding, TextBuffer};
 
-pub(super) struct IncludePath {
+pub(super) struct LiteralPath {
     callee: Loader,
     content_start: usize,
     content_end: usize,
@@ -23,12 +23,22 @@ pub(super) struct IncludePath {
 }
 
 enum Loader {
-    Include { offset: TextSize, in_module: bool },
+    Include {
+        offset: TextSize,
+        in_module: bool,
+    },
     Includet(TextSize),
     QualifiedIncludet(SmolStr, TextSize),
+    JoinPath {
+        offset: TextSize,
+        qualified: bool,
+        dir_macro: TextSize,
+        prior_parts: PathBuf,
+        julia_only: bool,
+    },
 }
 
-pub(super) fn context_at(root: &SyntaxNode, offset: TextSize) -> Option<IncludePath> {
+pub(super) fn context_at(root: &SyntaxNode, offset: TextSize) -> Option<LiteralPath> {
     let (left, right) = match root.token_at_offset(offset) {
         TokenAtOffset::None => return None,
         TokenAtOffset::Single(token) => (Some(token), None),
@@ -41,7 +51,7 @@ pub(super) fn context_at(root: &SyntaxNode, offset: TextSize) -> Option<IncludeP
             .ancestors()
             .skip(1)
             .find_map(CallExpr::cast)?;
-        let callee = loader_at(&call, &literal)?;
+        let callee = joinpath_at(&call, &literal).or_else(|| loader_at(&call, &literal))?;
         let mut tokens = literal
             .syntax()
             .children_with_tokens()
@@ -59,13 +69,101 @@ pub(super) fn context_at(root: &SyntaxNode, offset: TextSize) -> Option<IncludeP
         if offset < start || offset > end {
             return None;
         }
-        Some(IncludePath {
+        Some(LiteralPath {
             callee,
             content_start: start.into(),
             content_end: end.into(),
             unterminated: close.is_none(),
         })
     })
+}
+
+// Only the statically known @__DIR__ origin is supported. In particular,
+// pwd(), variables, interpolations and shadowed Base bindings are not guessed.
+fn joinpath_at(call: &CallExpr, literal: &StringLiteral) -> Option<Loader> {
+    if call
+        .syntax()
+        .ancestors()
+        .find_map(ModuleDef::cast)
+        .is_some_and(|module| {
+            module
+                .syntax()
+                .first_token()
+                .is_some_and(|token| token.text() == "baremodule")
+        })
+    {
+        return None;
+    }
+    let (offset, qualified) = if let Some(name) = call.callee_ident() {
+        if name.text() != "joinpath" {
+            return None;
+        }
+        (name.syntax().text_range().start(), false)
+    } else {
+        let Expr::BinaryExpr(dot) = call.callee()? else {
+            return None;
+        };
+        if dot.op()?.syntax().kind() != SyntaxKind::DOT
+            || dot.rhs()?.name_ident()?.text() != "joinpath"
+        {
+            return None;
+        }
+        let receiver = dot.lhs()?.name_ident()?;
+        if receiver.text() != "Base" {
+            return None;
+        }
+        (receiver.syntax().text_range().start(), true)
+    };
+    let args = call.arg_list()?;
+    if args.keyword_args().next().is_some() {
+        return None;
+    }
+    let mut args = args.args();
+    let Expr::MacroCall(dir) = args.next()?.expr()? else {
+        return None;
+    };
+    if dir.syntax().text().to_string() != "@__DIR__" {
+        return None;
+    }
+    let dir_macro = dir.syntax().text_range().start();
+    let mut prior_parts = PathBuf::new();
+    for arg in args {
+        let Expr::StringLiteral(part) = arg.expr()? else {
+            return None;
+        };
+        if part.prefix().is_some() || part.interpolations().next().is_some() {
+            return None;
+        }
+        if part.syntax() == literal.syntax() {
+            return Some(Loader::JoinPath {
+                offset,
+                qualified,
+                dir_macro,
+                prior_parts,
+                julia_only: call
+                    .syntax()
+                    .ancestors()
+                    .skip(1)
+                    .find_map(CallExpr::cast)
+                    .is_some_and(|outer| {
+                        outer
+                            .callee_ident()
+                            .is_some_and(|name| matches!(name.text(), "include" | "includet"))
+                    }),
+            });
+        }
+        let text = part.syntax().text().to_string();
+        let raw = text.strip_prefix('"')?.strip_suffix('"')?;
+        if raw.contains(['"', '\r', '\n']) {
+            return None;
+        }
+        let decoded = crate::parser::string_value(raw).ok()?;
+        if !relative_path(&decoded) {
+            return None;
+        }
+        prior_parts.push(decoded);
+    }
+    None
 }
 
 fn loader_at(call: &CallExpr, literal: &StringLiteral) -> Option<Loader> {
@@ -140,6 +238,24 @@ fn resolves_loader(
             _ => false,
         };
     }
+    if let Loader::JoinPath {
+        offset,
+        qualified,
+        dir_macro,
+        ..
+    } = loader
+    {
+        let system_base = |name, offset, namespace| {
+            matches!(resolver.resolve(name, offset, namespace),
+                Resolution::System { module, .. } if module == "Base")
+        };
+        return system_base("__DIR__", dir_macro, Namespace::Macro)
+            && if qualified {
+                system_base("Base", offset, value)
+            } else {
+                system_base("joinpath", offset, value)
+            };
+    }
     // No package-free fallback for Revise: the indexed module must have
     // includet and the receiver or imported binding must match it.
     let owner = SmolStr::new("Revise");
@@ -180,12 +296,12 @@ fn resolves_loader(
                 .as_deref()
                 == Some(&[owner])
         }
-        Loader::Include { .. } => unreachable!(),
+        Loader::Include { .. } | Loader::JoinPath { .. } => unreachable!(),
     }
 }
 
 pub(super) fn complete(
-    context: IncludePath,
+    context: LiteralPath,
     snapshot: &Analysis,
     model: &SemanticModel,
     path: &Path,
@@ -202,7 +318,7 @@ pub(super) fn complete(
         Loader::Include {
             in_module: false,
             ..
-        }
+        } | Loader::JoinPath { .. }
     ) && workspace.as_ref().is_some_and(|(package, host)| {
         let host: Vec<_> = host.iter().map(SmolStr::as_str).collect();
         resolve_submodule(&package.root, &host).is_some_and(|module| module.bare)
@@ -231,6 +347,15 @@ pub(super) fn complete(
     } else {
         resolver.with_scripts(contexts)
     };
+    let base = path.parent()?;
+    let (base, julia_only) = match &context.callee {
+        Loader::JoinPath {
+            prior_parts,
+            julia_only,
+            ..
+        } => (base.join(prior_parts), *julia_only),
+        _ => (base.to_path_buf(), true),
+    };
     if !resolves_loader(context.callee, &resolver, model) {
         return None;
     }
@@ -243,7 +368,7 @@ pub(super) fn complete(
         raw
     };
     let cursor = usize::from(offset).checked_sub(context.content_start)?;
-    let items = complete_literal(raw, cursor, path.parent()?, |byte| {
+    let items = complete_literal(raw, cursor, &base, julia_only, |byte| {
         text.line_index()
             .byte_to_position(context.content_start + byte, encoding)
     });
@@ -256,6 +381,7 @@ fn complete_literal(
     raw: &str,
     cursor: usize,
     base: &Path,
+    julia_only: bool,
     position: impl Fn(usize) -> lsp_types::Position,
 ) -> Option<Vec<CompletionItem>> {
     if raw.contains(['\r', '\n']) {
@@ -270,14 +396,9 @@ fn complete_literal(
     let prefix = crate::parser::string_value(&raw[start..cursor]).ok()?;
     // Only document-relative paths; do not look up absolute paths, volumes,
     // UNC hosts, or escaped separators that cannot map to this source edit.
-    if dir.starts_with(['/', '\\'])
-        || dir.get(..2).is_some_and(|s| s.ends_with(':'))
-        || dir.contains('\\')
-        || Path::new(&dir)
-            .components()
-            .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+    if !relative_path(&dir)
         || prefix.contains('/')
-        || (cfg!(windows) && prefix.contains('\\'))
+        || (cfg!(windows) && (prefix.contains('\\') || prefix.contains(':')))
     {
         return None;
     }
@@ -305,7 +426,9 @@ fn complete_literal(
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("jl"));
-        if !directory && (!kind.is_file() || !julia_source || following_slash.is_some()) {
+        if !directory
+            && (!kind.is_file() || (julia_only && !julia_source) || following_slash.is_some())
+        {
             continue;
         }
         let escaped = escape_component(&label);
@@ -327,6 +450,15 @@ fn complete_literal(
     }
     items.sort_unstable_by(|a, b| a.label.cmp(&b.label));
     Some(items)
+}
+
+fn relative_path(path: &str) -> bool {
+    !path.starts_with(['/', '\\'])
+        && !path.get(..2).is_some_and(|s| s.ends_with(':'))
+        && !path.contains('\\')
+        && !Path::new(path)
+            .components()
+            .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
 }
 
 fn escape_component(name: &str) -> String {
@@ -360,6 +492,9 @@ mod tests {
             "include(\"par|",
             "includet(\"|\")",
             "Revise.includet(\"|\")",
+            "joinpath(@__DIR__, \"res|t_stdout\")",
+            "Base.joinpath(@__DIR__, \"out\", \"res|\")",
+            "include(joinpath(@__DIR__, \"res|\"))",
             "module A\ninclude(\"pa|\")\nend",
         ] {
             assert!(context(source), "{source}");
@@ -367,6 +502,10 @@ mod tests {
         for source in [
             "# include(\"x|\")",
             "chores(\"|\")",
+            "joinpath(pwd(), \"res|\")",
+            "joinpath(@__DIR__, root, \"res|\")",
+            "joinpath(@__DIR__, \"$root/res|\")",
+            "baremodule A\nBase.joinpath(@__DIR__, \"res|\")\nend",
             "Base.include(Me, \"|\")",
             "include(map, \"|\")",
             "include(raw\"|\")",
@@ -394,7 +533,7 @@ mod tests {
         std::fs::write(dir.path().join(".hidden.jl"), "").unwrap();
         std::fs::write(dir.path().join("sub/model.jl"), "").unwrap();
         let items = |raw: &str, cursor| {
-            complete_literal(raw, cursor, dir.path(), |byte| {
+            complete_literal(raw, cursor, dir.path(), true, |byte| {
                 Position::new(0, byte as u32)
             })
             .unwrap()
