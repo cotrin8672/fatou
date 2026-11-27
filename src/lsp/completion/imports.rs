@@ -16,7 +16,7 @@ use crate::incremental::Analysis;
 use crate::index::PackageIndex;
 use crate::parse_context::EditionSource;
 use crate::parser::{is_ident_continue, is_ident_start};
-use crate::resolve::{ModulePath, PackageSource, resolve_submodule};
+use crate::resolve::{ModulePath, PackageSource, Resolver, resolve_submodule};
 use crate::semantic::{BindingKind, ScopeId, SemanticModel};
 use crate::syntax::{SyntaxKind, SyntaxNode};
 use crate::text::{LineIndex, PositionEncoding};
@@ -36,6 +36,7 @@ pub(super) struct ImportContext<'a> {
     prefix: &'a str,
     start: usize,
     end: usize,
+    statement_start: TextSize,
 }
 
 fn atom(name: &str) -> bool {
@@ -158,6 +159,7 @@ pub(super) fn context_at<'a>(
             prefix: "",
             start: offset.into(),
             end: offset.into(),
+            statement_start: stmt.text_range().start(),
         });
     }
     let mut clause_start = stmt.text_range().start();
@@ -271,6 +273,7 @@ pub(super) fn context_at<'a>(
         prefix,
         start,
         end,
+        statement_start: stmt.text_range().start(),
     })
 }
 
@@ -406,6 +409,76 @@ impl ImportContext<'_> {
             }
 
             let mut candidates = Vec::new();
+            if self.parent.dots > 0 {
+                // Resolve the lexical module that owns the first relative
+                // component, before applying the rest of the written path.
+                let keep = target.len() - mode.len();
+                let base = &target[..keep];
+                let resolver = Resolver::new(model, packages).with_workspace(workspace.cloned());
+                if let Some(base_local) = base.strip_prefix(host.as_slice()) {
+                    for (i, _) in model
+                        .scopes()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.kind.is_global())
+                    {
+                        let scope = ScopeId(i as u32);
+                        let path = model.enclosing_module_path(scope);
+                        let skip = usize::from(
+                            lexical_has_root
+                                && path
+                                    .first()
+                                    .is_some_and(|n| Some(n.as_str()) == outer_package),
+                        );
+                        if (lexical_has_root && skip == 0)
+                            || !path[skip..]
+                                .iter()
+                                .map(|n| n.as_str())
+                                .eq(base_local.iter().copied())
+                        {
+                            continue;
+                        }
+                        for (alias, imported) in
+                            resolver.prior_imported_modules(scope, self.statement_start)
+                        {
+                            let Some((name, tail)) = mode.split_first() else {
+                                candidates.push(module_item(alias.as_str()));
+                                continue;
+                            };
+                            if *name != alias.as_str() {
+                                continue;
+                            }
+                            let Some((package, rest)) = imported.split_first() else {
+                                continue;
+                            };
+                            let Some(pkg) = workspace
+                                .map(|(pkg, _)| pkg)
+                                .filter(|pkg| pkg.name == package.as_str())
+                                .cloned()
+                                .or_else(|| packages.package(package.as_str()))
+                            else {
+                                continue;
+                            };
+                            let mut parts =
+                                rest.iter().map(|part| part.as_str()).collect::<Vec<_>>();
+                            parts.extend_from_slice(tail);
+                            let Some(module) = resolve_submodule(&pkg.root, &parts) else {
+                                continue;
+                            };
+                            let path = std::iter::once(package.to_string())
+                                .chain(parts.iter().map(|name| (*name).to_string()))
+                                .collect::<Vec<_>>();
+                            candidates.extend(indexed_items(
+                                module,
+                                &resolver,
+                                &path,
+                                self.symbols,
+                                self.prefix,
+                            ));
+                        }
+                    }
+                }
+            }
             if let Some((pkg, _)) = workspace
                 && self.parent.dots != 0
                 && let Some(module) = resolve_submodule(&pkg.root, &target)
@@ -413,7 +486,17 @@ impl ImportContext<'_> {
                 let indexed_path = std::iter::once(pkg.name.clone())
                     .chain(target.iter().map(|name| (*name).to_string()))
                     .collect::<Vec<_>>();
-                candidates.extend(indexed_items(module, &indexed_path, self.symbols));
+                let resolver = Resolver::new(model, packages).with_workspace(Some((
+                    Arc::clone(pkg),
+                    host.iter().map(|part| (*part).into()).collect(),
+                )));
+                candidates.extend(indexed_items(
+                    module,
+                    &resolver,
+                    &indexed_path,
+                    self.symbols,
+                    self.prefix,
+                ));
             }
             let local = if self.parent.dots == 0 && workspace.is_none() {
                 Some(target.as_slice())
@@ -461,23 +544,19 @@ impl ImportContext<'_> {
             }
             candidates
         } else {
-            let Some((head, tail)) = mode.split_first() else {
+            let Some(model) = model else {
                 return Vec::new();
             };
-            let pkg = workspace
-                .map(|(p, _)| p)
-                .filter(|pkg| pkg.name == *head)
-                .cloned()
-                .or_else(|| packages.package(head));
-            let Some(pkg) = pkg else { return Vec::new() };
-            let Some(module) = resolve_submodule(&pkg.root, tail) else {
+            let resolver = Resolver::new(model, packages).with_workspace(workspace.cloned());
+            let path = mode.iter().map(|name| (*name).into()).collect::<Vec<_>>();
+            let Some((canonical, module)) = resolver.completion_import_module(&path) else {
                 return Vec::new();
             };
-            let path = mode
+            let canonical = canonical
                 .iter()
-                .map(|name| (*name).to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>();
-            indexed_items(module, &path, self.symbols)
+            indexed_items(&module, &resolver, &canonical, self.symbols, self.prefix)
         };
         let folded = self.prefix.to_lowercase();
         let range = Range::new(
@@ -499,18 +578,29 @@ impl ImportContext<'_> {
     }
 }
 
-fn indexed_items(
+fn indexed_items<P: PackageSource>(
     module: &crate::index::ModuleIndex,
+    resolver: &Resolver<'_, P>,
     path: &[String],
     symbols: bool,
+    prefix: &str,
 ) -> Vec<CompletionItem> {
     if symbols {
         let mut items = super::member_items(module, path, false);
-        items.extend(super::member_items(module, path, true));
-        items.extend(module.imported_names.iter().map(|name| CompletionItem {
-            label: name.clone(),
-            ..Default::default()
-        }));
+        // Julia also allows an explicit selective import of the module itself.
+        items.push(super::member_item(
+            &module.name,
+            CompletionItemKind::MODULE,
+            path,
+        ));
+        let canonical = path
+            .iter()
+            .map(|name| name.as_str().into())
+            .collect::<Vec<_>>();
+        super::append_imported_members(resolver, module, &canonical, false, prefix, true, &mut items);
+        let mut macros = super::member_items(module, path, true);
+        super::append_imported_members(resolver, module, &canonical, true, prefix, true, &mut macros);
+        items.extend(macros);
         items
     } else {
         module
@@ -685,6 +775,75 @@ mod tests {
             candidates(&format!("{src}using .Utils: ans as al│")).unwrap(),
             []
         );
+    }
+
+    #[test]
+    fn relative_imports_find_preceding_bound_modules_and_their_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(
+            src.join("GeoTools.jl"),
+            "module GeoTools\nexport GeoUnit\nstruct GeoUnit end\nmodule Sub end\nend\n",
+        )
+        .unwrap();
+        let package = Arc::new(crate::index::harvest_package_named(dir.path(), "GeoTools"));
+        let packages = std::collections::BTreeMap::from([("GeoTools".to_owned(), package)]);
+        for (source, required) in [
+            (
+                "module Audit\nimport GeoTools\nusing .Ge│\nend",
+                Some("GeoTools"),
+            ),
+            (
+                "module Audit\nimport GeoTools as Gt\nusing .Gt: Geo│\nend",
+                Some("GeoUnit"),
+            ),
+            (
+                "module Audit\nimport GeoTools\nimport .GeoTools.S│\nend",
+                Some("Sub"),
+            ),
+            (
+                "module Audit\nimport GeoTools\nmodule Child\nusing ..GeoTools: Geo│\nend\nend",
+                Some("GeoUnit"),
+            ),
+            (
+                "module Audit\nimport GeoTools: GeoTools as Gt\nusing .G│\nend",
+                Some("Gt"),
+            ),
+            ("import GeoTools: GeoT│", Some("GeoTools")),
+            ("module Audit\nusing .GeoT│\nend", None),
+            (
+                "module Audit\nimport GeoTools: GeoUnit\nusing .GeoU│\nend",
+                None,
+            ),
+            ("module Audit\nusing .GeoT│\nimport GeoTools\nend", None),
+            (
+                "module Audit\nimport GeoTools\nmodule Child\nusing .GeoT│\nend\nend",
+                None,
+            ),
+        ] {
+            let (source, offset) = marked(source);
+            let root = parse(&source).cst;
+            let model = SemanticModel::build(&root);
+            let context = context_at(&root, &source, offset).unwrap();
+            let items = context.complete(
+                Some(&model),
+                &packages,
+                None,
+                BTreeSet::new(),
+                offset,
+                &LineIndex::new(&source),
+                PositionEncoding::Utf16,
+            );
+            if let Some(required) = required {
+                assert!(
+                    items.iter().any(|item| item.label == required),
+                    "{source}: {items:?}"
+                );
+            } else {
+                assert!(items.is_empty(), "{source}: {items:?}");
+            }
+        }
     }
 
     #[test]

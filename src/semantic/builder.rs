@@ -118,9 +118,17 @@ fn struct_field_form(stmt: &SyntaxNode) -> Option<(SyntaxNode, Vec<SyntaxNode>)>
     }
 }
 
+/// The RHS of a defaulted field, excluding its type annotation.
+fn field_default(node: &SyntaxNode) -> Option<SyntaxNode> {
+    match node.kind() {
+        SyntaxKind::CONST_STMT => field_default(&node.first_child()?),
+        SyntaxKind::ASSIGNMENT_EXPR => node.children().nth(1),
+        _ => None,
+    }
+}
+
 /// A `name = value` argument directly under a `MACRO_CALL` is a keyword
-/// argument (`@warn msg key=val`, `@test x rtol=eps(T)`), not an assignment that
-/// binds `key` in the surrounding scope.
+/// argument, not an assignment that binds the name.
 fn is_macro_kwarg(node: &SyntaxNode) -> bool {
     node.kind() == SyntaxKind::ASSIGNMENT_EXPR
         && assign_op(node) == AssignOp::Plain
@@ -578,7 +586,11 @@ struct ScopeBindingIndex {
 }
 
 impl ScopeBindingIndex {
-    fn insert(&mut self, b: &Binding, id: BindingId) {
+    fn insert(&mut self, b: &Binding, id: BindingId, visible_from: ScopeId) {
+        // Fields belong to the type's property namespace, not lexical lookup.
+        if b.kind == BindingKind::Field && b.scope == visible_from {
+            return;
+        }
         self.names.insert(b.name.clone(), id);
         match b.kind {
             BindingKind::Macro => {
@@ -688,12 +700,12 @@ impl Builder {
         let bindings = &mut self.model.scopes[i].bindings;
         bindings.push(id);
         if let Some(index) = self.binding_lookup[i].as_mut() {
-            index.insert(&self.model.bindings[id.0 as usize], id);
+            index.insert(&self.model.bindings[id.0 as usize], id, scope);
         } else if bindings.len() == INDEX_BINDINGS_AT {
             let mut index = ScopeBindingIndex::default();
             index.names.reserve(bindings.len());
             for &b in bindings.iter() {
-                index.insert(&self.model.bindings[b.0 as usize], b);
+                index.insert(&self.model.bindings[b.0 as usize], b, scope);
             }
             self.binding_lookup[i] = Some(Box::new(index));
         }
@@ -745,7 +757,8 @@ impl Builder {
             .find(|&id| {
                 let binding = self.model.binding(id);
                 if !is_macro {
-                    return binding.name == name;
+                    return (binding.kind != BindingKind::Field || binding.scope != scope)
+                        && binding.name == name;
                 }
                 match binding.kind {
                     BindingKind::Macro => binding.name == name,
@@ -1897,6 +1910,21 @@ impl Builder {
                 }
             }
             self.finish_macro_declarations();
+            let kwdef = node.parent().is_some_and(|parent| {
+                MacroCall::cast(parent).is_some_and(|call| {
+                    call.syntax()
+                        .children()
+                        .find(|n| n.kind() == SyntaxKind::MACRO_NAME)
+                        .is_some_and(|n| {
+                            let text = n.text().to_string();
+                            text == "Base.@kwdef"
+                                || text == "@Base.kwdef"
+                                || (text == "@kwdef"
+                                    && self.resolve_macro_read("kwdef", scope).is_none())
+                        })
+                })
+            });
+            let mut preceding_fields = Vec::new();
             for stmt in body.children() {
                 let attachment = DocAttachment::cast(stmt.clone());
                 let target = attachment
@@ -1905,9 +1933,27 @@ impl Builder {
                     .unwrap_or_else(|| stmt.clone());
                 if let Some((pattern, extras)) = struct_field_form(&target) {
                     let binding = self.bind_field(&pattern, struct_scope);
+                    let default = kwdef.then(|| field_default(&target)).flatten();
                     for extra in extras {
-                        self.walk_node(&extra, struct_scope);
+                        if Some(&extra) == default.as_ref() && !preceding_fields.is_empty() {
+                            // Base.@kwdef reuses earlier keywords in later
+                            // defaults, never in field type annotations. Alias
+                            // those same bindings only inside the default.
+                            let scope = self.push_scope(
+                                ScopeKind::Function,
+                                Some(struct_scope),
+                                extra.text_range(),
+                            );
+                            self.model.scopes[scope.0 as usize]
+                                .bindings
+                                .clone_from(&preceding_fields);
+                            self.declare_in(&extra, scope);
+                            self.walk_node(&extra, scope);
+                        } else {
+                            self.walk_node(&extra, struct_scope);
+                        }
                     }
+                    preceding_fields.extend(binding);
                     if let Some(attachment) = attachment {
                         self.walk_doc_macro_name(&attachment, struct_scope);
                         self.walk_node(attachment.payload(), struct_scope);

@@ -26,6 +26,7 @@ use super::model::*;
 use super::typeexpr::{TypeExpr, lower_type, lower_type_args, lower_type_params, normalized_text};
 
 mod generated;
+mod paths;
 
 /// Harvest the package rooted at `source_root` (the directory containing
 /// `src/`), taking the package name from the directory's file name.
@@ -383,6 +384,15 @@ impl Harvester<'_> {
             }
             SyntaxKind::MODULE_DEF => self.handle_module(node, file, dest, at_root, pending_doc),
             SyntaxKind::FOR_EXPR => {
+                if self.follow_includes
+                    && self.has_ordinary_path_bindings(dest)
+                    && let Some(parent) = node.parent()
+                    && let Some(paths) = paths::literal_loop_paths(node, &parent)
+                {
+                    for path in paths {
+                        self.walk_extended_include(&path, file, dest, at_root);
+                    }
+                }
                 if let Some(methods) = generated::literal_eval_loop(node) {
                     for (signature, range) in methods.signatures {
                         for name in &methods.names {
@@ -425,8 +435,78 @@ impl Harvester<'_> {
             Some("doc") => {}
             Some("kwdef") => {
                 if let Some(target) = args.first() {
+                    let before = dest.types.len();
                     self.walk_item(target, file, dest, at_root, pending_doc);
+                    // A field default by itself does not prove a constructor:
+                    // arbitrary macros may transform the input struct. Record
+                    // the explicit Base macro only, not a user's @kwdef.
+                    if target.kind() == SyntaxKind::STRUCT_DEF
+                        && node.first_child().is_some_and(|callee| {
+                            let text = normalized_text(&callee);
+                            text == "Base.@kwdef" || text == "@Base.kwdef"
+                        })
+                        && dest.types.len() == before + 1
+                    {
+                        dest.types[before].keyword_constructor = true;
+                    }
                 }
+            }
+            Some("reexport") if reexport_macro(node, dest) => {
+                if let [using] = args.as_slice()
+                    && using.kind() == SyntaxKind::USING_STMT
+                    && collect_import_clauses(using).1.is_none()
+                {
+                    let first = dest.usings.len();
+                    self.handle_load(using, dest);
+                    for clause in &mut dest.usings[first..] {
+                        clause.reexport = true;
+                    }
+                }
+            }
+            Some(name)
+                if !dest
+                    .imported_names
+                    .iter()
+                    .any(|n| n.strip_prefix('@') == Some(name))
+                    && let Some((generated_name, loc, structure)) =
+                        generated::named_struct_at_call(node, name, &args) =>
+            {
+                let Some(start) = signature_start(&structure) else {
+                    return;
+                };
+                let header = header_parts(&start);
+                let mut fields = Vec::new();
+                if let Some(block) = body_of(&structure) {
+                    // Constructor bodies belong to the macro template; retain
+                    // direct fields only, and never harvest foreign methods.
+                    for child in block.children() {
+                        if child.kind() == SyntaxKind::TYPE_ANNOTATION {
+                            push_annotated_field(&child, None, None, &mut fields);
+                        } else if child.kind() == SyntaxKind::NAME
+                            && let Some(name) = node_name_text(&child)
+                        {
+                            fields.push(Field {
+                                name,
+                                type_annotation: None,
+                                default: None,
+                                doc: None,
+                            });
+                        }
+                    }
+                }
+                dest.types.push(TypeDef {
+                    name: generated_name,
+                    kind: TypeKind::Struct {
+                        mutable: has_token(&structure, SyntaxKind::MUTABLE_KW),
+                    },
+                    type_params: header.type_params,
+                    supertype: header.supertype,
+                    fields,
+                    keyword_constructor: false,
+                    constructor_shape: false,
+                    doc: pending_doc,
+                    loc: self.loc(file, loc),
+                });
             }
             _ => {
                 // Transparent wrapper: recurse only into definition-shaped
@@ -463,6 +543,10 @@ impl Harvester<'_> {
                     from: file.to_path_buf(),
                 }),
             }
+        } else if self.has_ordinary_path_bindings(dest)
+            && let Some(path) = paths::include_path(&call, None)
+        {
+            self.walk_extended_include(&path, file, dest, at_root);
         } else if is_include_callee(&call) {
             // A dynamic/interpolated/qualified `include` we cannot resolve.
             self.diagnostics.push(HarvestDiagnostic::UnresolvedInclude {
@@ -470,6 +554,45 @@ impl Harvester<'_> {
                     .arg_list()
                     .map(|l| normalized_text(l.syntax()))
                     .unwrap_or_default(),
+                from: file.to_path_buf(),
+            });
+        }
+    }
+
+    fn has_ordinary_path_bindings(&self, dest: &ModuleIndex) -> bool {
+        !dest.bare
+            && !self.base_includes
+            && !dest
+                .imported_names
+                .iter()
+                .any(|n| matches!(n.as_str(), "include" | "joinpath"))
+            && !dest
+                .consts
+                .iter()
+                .any(|d| matches!(d.name.as_str(), "include" | "joinpath"))
+            && !dest
+                .functions
+                .iter()
+                .any(|d| d.owner.is_none() && matches!(d.name.as_str(), "include" | "joinpath"))
+    }
+
+    fn walk_extended_include(
+        &mut self,
+        path: &str,
+        file: &Path,
+        dest: &mut ModuleIndex,
+        at_root: bool,
+    ) {
+        let Some(target) = resolve_target(path, file.parent()) else {
+            return;
+        };
+        // Reject absolute/traversing expansions and links escaping the root
+        // before reading any newly-discovered file.
+        if target.is_file() && canonical(&target).starts_with(canonical(&self.root)) {
+            self.walk_file(&target, dest, at_root);
+        } else {
+            self.diagnostics.push(HarvestDiagnostic::UnresolvedInclude {
+                raw: path.to_string(),
                 from: file.to_path_buf(),
             });
         }
@@ -542,6 +665,7 @@ impl Harvester<'_> {
         let Some(start) = signature_start(node) else {
             return;
         };
+        record_constructor_shape(dest, &start, body_of(node), false);
         self.add_method(start, file, dest, doc, None);
     }
 
@@ -556,6 +680,7 @@ impl Harvester<'_> {
         let Some(lhs) = node.children().next() else {
             return;
         };
+        record_constructor_shape(dest, &lhs, node.children().nth(1), false);
         self.add_method(lhs, file, dest, doc, None);
     }
 
@@ -665,7 +790,25 @@ impl Harvester<'_> {
         };
 
         let mut fields = Vec::new();
+        let mut constructor_shape = matches!(kind, TypeKind::Struct { .. });
         if let Some(block) = body_of(node) {
+            for stmt in block.children() {
+                if stmt.kind() == SyntaxKind::FUNCTION_DEF {
+                    constructor_shape &= signature_start(&stmt).is_some_and(|sig| {
+                        constructor_signature_matches(&sig, &name)
+                            && body_of(&stmt)
+                                .is_some_and(|body| constructor_like(&body, &name, true))
+                    });
+                } else if stmt.kind() == SyntaxKind::ASSIGNMENT_EXPR && is_short_form_def(&stmt) {
+                    constructor_shape &= stmt.first_child().is_some_and(|sig| {
+                        constructor_signature_matches(&sig, &name)
+                            && stmt
+                                .children()
+                                .nth(1)
+                                .is_some_and(|body| constructor_like(&body, &name, true))
+                    });
+                }
+            }
             self.collect_struct_body(&block, &name, file, dest, &mut fields);
         }
 
@@ -675,6 +818,8 @@ impl Harvester<'_> {
             type_params: header.type_params,
             supertype: header.supertype,
             fields,
+            keyword_constructor: false,
+            constructor_shape,
             doc,
             loc: self.loc(file, name_range),
         });
@@ -791,7 +936,20 @@ impl Harvester<'_> {
             let mut parts = inner.children();
             let lhs = parts.next();
             let value = parts.next();
-            let names = lhs.map(|n| collect_names(&n)).unwrap_or_default();
+            let names = lhs
+                .map(|n| {
+                    if n.kind() == SyntaxKind::CURLY_EXPR {
+                        // A parameterized constant type alias binds its head only.
+                        // The parameter names never introduce module bindings.
+                        type_name_of(&n)
+                            .and_then(|name| Some((node_name_text(&name)?, name.text_range())))
+                            .into_iter()
+                            .collect()
+                    } else {
+                        collect_names(&n)
+                    }
+                })
+                .unwrap_or_default();
             // A value preview is only unambiguous for a single-name const.
             let value_repr = match (names.len(), value) {
                 (1, Some(v)) => Some(truncate(&normalized_text(&v), 120)),
@@ -868,6 +1026,7 @@ impl Harvester<'_> {
                     if is_using {
                         let path = clause.path();
                         dest.usings.push(ModuleUsing {
+                            reexport: false,
                             leading_dots: path.leading_dots,
                             components: path.components.iter().map(|c| c.to_string()).collect(),
                         });
@@ -1361,6 +1520,85 @@ fn push_method(
     }
 }
 
+/// A Julia constructor can return anything. Keep only conventional shapes
+/// rather than assuming every method spelled like a struct will return it.
+fn record_constructor_shape(
+    dest: &mut ModuleIndex,
+    signature: &SyntaxNode,
+    body: Option<SyntaxNode>,
+    inner: bool,
+) {
+    if dest.types.is_empty() {
+        return;
+    }
+    let (Some(core), _, _) = peel_signature(signature.clone()) else {
+        return;
+    };
+    if core.kind() != SyntaxKind::CALL_EXPR {
+        return;
+    }
+    let Some((name, None, _)) = callee_name(&core) else {
+        return;
+    };
+    if let Some(ty) = dest.types.iter_mut().find(|ty| ty.name == name) {
+        ty.constructor_shape &= body.is_some_and(|body| constructor_like(&body, &name, inner));
+    }
+}
+
+fn constructor_signature_matches(signature: &SyntaxNode, name: &str) -> bool {
+    let (core, _, _) = peel_signature(signature.clone());
+    core.filter(|c| c.kind() == SyntaxKind::CALL_EXPR)
+        .and_then(|core| callee_name(&core))
+        .is_some_and(|(callee, owner, _)| owner.is_none() && callee == name)
+}
+
+fn constructor_like(body: &SyntaxNode, name: &str, inner: bool) -> bool {
+    fn tail(node: &SyntaxNode, name: &str, inner: bool, depth: usize) -> bool {
+        if depth > 12 {
+            return false;
+        }
+        match node.kind() {
+            SyntaxKind::BLOCK | SyntaxKind::PAREN_EXPR | SyntaxKind::RETURN_EXPR => node
+                .children()
+                .last()
+                .is_some_and(|child| tail(&child, name, inner, depth + 1)),
+            SyntaxKind::TERNARY_EXPR => {
+                let arms: Vec<_> = node.children().skip(1).collect();
+                arms.len() == 2 && arms.iter().all(|arm| tail(arm, name, inner, depth + 1))
+            }
+            SyntaxKind::CALL_EXPR => {
+                let Some(call) = CallExpr::cast(node.clone()) else {
+                    return false;
+                };
+                let Some(callee) = call.callee() else {
+                    return false;
+                };
+                let callee_name = normalized_text(callee.syntax());
+                if callee_name == name || (inner && callee_name == "new") {
+                    return true;
+                }
+                // Julia's parse(T, string) convention is a constructor-like
+                // result. Only recognize the literal same-type argument and
+                // never arbitrary factories, conversion calls or parse names.
+                if !matches!(callee_name.as_str(), "parse" | "Base.parse") {
+                    return false;
+                }
+                call.arg_list()
+                    .and_then(|args| args.args().next())
+                    .and_then(|arg| arg.expr())
+                    .and_then(|arg| arg.name_ident())
+                    .is_some_and(|literal| literal.text() == name)
+            }
+            _ => false,
+        }
+    }
+    tail(body, name, inner, 0)
+        && body
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::RETURN_EXPR)
+            .all(|node| tail(&node, name, inner, 0))
+}
+
 /// The final component of a `MACRO_NAME` inside a macro call (`@doc` → `doc`,
 /// `Base.@kwdef` → `kwdef`).
 fn macro_call_name(node: &SyntaxNode) -> Option<String> {
@@ -1368,6 +1606,40 @@ fn macro_call_name(node: &SyntaxNode) -> Option<String> {
         .children()
         .find(|c| c.kind() == SyntaxKind::MACRO_NAME)?;
     last_ident(&macro_name).map(|t| t.text().to_string())
+}
+
+/// Recognize Reexport.jl only when the lexical binding is known. Don't
+/// interpret unrelated macros that happen to have the same final token.
+fn reexport_macro(node: &SyntaxNode, dest: &ModuleIndex) -> bool {
+    let Some(call) = MacroCall::cast(node.clone()) else {
+        return false;
+    };
+    let Some(name) = call.name() else {
+        return false;
+    };
+    let path = name
+        .ident_tokens()
+        .map(|token| token.text().to_string())
+        .collect::<Vec<_>>();
+    match path.as_slice() {
+        [name] if name == "reexport" => {
+            !dest.macros.iter().any(|m| m.name == "@reexport")
+                && (dest
+                    .usings
+                    .iter()
+                    .any(|u| u.leading_dots == 0 && u.components == ["Reexport"])
+                    || dest.import_bindings.iter().any(|b| {
+                        b.local == "@reexport"
+                            && b.leading_dots == 0
+                            && b.components == ["Reexport", "@reexport"]
+                    }))
+        }
+        [module, name] if module == "Reexport" && name == "reexport" => dest
+            .import_bindings
+            .iter()
+            .any(|b| b.local == "Reexport" && b.leading_dots == 0 && b.components == ["Reexport"]),
+        _ => false,
+    }
 }
 
 /// The non-name argument nodes of a macro call, unwrapping an `ARG_LIST`/`ARG`.
@@ -1517,6 +1789,103 @@ mod tests {
         };
         harvester.walk_text(text, Path::new("/pkg/src/Pkg.jl"), &mut root, true);
         root
+    }
+
+    #[test]
+    fn literal_include_loops_read_only_provable_package_local_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("src");
+        std::fs::create_dir_all(source.join("types")).unwrap();
+        for name in ["alpha", "beta", "static", "extra"] {
+            std::fs::write(
+                source.join(format!("types/{name}.jl")),
+                format!("struct {name} end"),
+            )
+            .unwrap();
+        }
+        std::fs::write(source.join("extra.jl"), "struct Missing end").unwrap();
+        std::fs::write(directory.path().join("Escape.jl"), "struct Escaped end").unwrap();
+        std::fs::write(
+            source.join("Demo.jl"),
+            r#"
+module Demo
+const names = ["alpha", "beta"]
+for n in names
+    include(joinpath("types", "$(n).jl"))
+end
+include(joinpath("types", "static.jl"))
+const mutated = ["extra"]
+push!(mutated, "beta")
+for n in mutated
+    include(joinpath("types", "$n.jl"))
+end
+for n in ["extra"]
+    include(joinpath("types", "$(uppercase(n)).jl"))
+end
+for n in ["Escape"]
+    include("../../$n.jl")
+end
+end
+"#,
+        )
+        .unwrap();
+        let index = harvest_package_named(directory.path(), "Demo");
+        let names: Vec<_> = index.root.types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["alpha", "beta", "static"],
+            "{:?}",
+            index.diagnostics
+        );
+    }
+
+    #[test]
+    fn parametric_const_alias_binds_head_not_parameters() {
+        let index = harvest_str("module Pkg\nconst Alias{T,N} = Array{T,N}\nend", "Pkg");
+        assert_eq!(index.consts.len(), 1);
+        assert_eq!(index.consts[0].name, "Alias");
+        assert!(
+            index.consts[0]
+                .value_repr
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Array"))
+        );
+    }
+
+    #[test]
+    fn named_struct_macros_require_a_verified_unconditional_template() {
+        let module = harvest_str(
+            r#"
+module Pkg
+export Weight, NotDefined, Other
+"Emit a type"
+macro generate(name)
+    return quote
+        mutable struct $name{T}
+            x::T
+        end
+        $(esc(name))(x) = $(esc(name)){typeof(x)}(x)
+    end
+end
+@generate Weight
+@generate "bad"
+@different NotDefined
+macro guarded(name)
+    if name == :Other
+        quote
+            struct $name end
+        end
+    end
+end
+@guarded Other
+end
+"#,
+            "Pkg",
+        );
+        assert_eq!(module.types.len(), 1, "{:?}", module.types);
+        assert_eq!(module.types[0].name, "Weight");
+        assert_eq!(module.types[0].fields[0].name, "x");
+        assert_eq!(module.types[0].kind, TypeKind::Struct { mutable: true });
     }
 
     fn name_of(t: &Option<TypeExpr>) -> Option<Vec<&str>> {

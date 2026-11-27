@@ -709,6 +709,8 @@ mod tests {
                 path: vec!["AbstractDict".into()],
             }),
             fields: Vec::new(),
+            keyword_constructor: false,
+            constructor_shape: false,
             doc: doc("A hash table."),
             loc: loc(),
         });

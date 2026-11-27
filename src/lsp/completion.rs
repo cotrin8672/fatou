@@ -27,10 +27,12 @@
 //! (`Base.`, `LinearAlgebra.`, nested `A.B.`); value and type receivers are out
 //! of scope until there is type inference.
 
+mod auto_import;
 mod call_keywords;
 mod declaration_names;
 mod imports;
 mod paths;
+mod value_members;
 
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -157,6 +159,105 @@ pub(super) fn compact_items(items: &mut [CompletionItem]) -> Option<serde_json::
     Some(completion_list(items, defaults))
 }
 
+/// Fold an identical simple edit range into the standard LSP 3.17 default.
+/// Only items whose edit text is already the displayed label are permitted,
+/// so clients can restore every edit without resolving a new private field.
+/// Keep mixed edit ranges, insert/replace edits, and implicit edits untouched.
+pub(super) fn compact_items_edit_range(
+    items: &mut [CompletionItem],
+    pack_data: bool,
+) -> Option<serde_json::Value> {
+    if items.len() < 8 {
+        return None;
+    }
+    let Some(CompletionTextEdit::Edit(first)) = items[0].text_edit.as_ref() else {
+        return None;
+    };
+    let range = first.range;
+    if !items.iter().all(|item| {
+        item.insert_text.is_none()
+            && matches!(&item.text_edit,
+                Some(CompletionTextEdit::Edit(edit))
+                    if edit.range == range && edit.new_text == item.label)
+    }) {
+        return None;
+    }
+    for item in items.iter_mut() {
+        item.text_edit = None;
+    }
+    if pack_data && let Some(mut list) = compact_items(items) {
+        list["itemDefaults"]["editRange"] = serde_json::to_value(range).expect("range serializes");
+        return Some(list);
+    }
+    let items = serde_json::to_value(items).expect("completion items serialize");
+    Some(completion_list(
+        items,
+        serde_json::json!({"editRange": range}),
+    ))
+}
+
+/// The corresponding final-response transform for merged analysis contexts.
+/// Previous data defaults and the list's incomplete flag stay untouched.
+pub(super) fn compact_response_edit_range(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    let items = if value.is_array() {
+        value.as_array()
+    } else if value
+        .get("itemDefaults")
+        .is_none_or(|d| d.is_object() && d.get("editRange").is_none())
+    {
+        value.get("items").and_then(Value::as_array)
+    } else {
+        None
+    };
+    let Some(items) = items.filter(|items| items.len() >= 8) else {
+        return;
+    };
+    let Some(range) = items[0].get("textEdit").and_then(|e| e.get("range")) else {
+        return;
+    };
+    if !items.iter().all(|item| {
+        item.get("insertText").is_none()
+            && item.get("textEditText").is_none()
+            && item
+                .get("textEdit")
+                .and_then(Value::as_object)
+                .is_some_and(|edit| {
+                    edit.len() == 2
+                        && edit.get("range") == Some(range)
+                        && edit.get("newText").is_some()
+                        && edit.get("newText") == item.get("label")
+                })
+    }) {
+        return;
+    }
+    let range = range.clone();
+    if let Some(items) = value.as_array_mut() {
+        for item in items.iter_mut() {
+            item.as_object_mut()
+                .expect("item has edit")
+                .remove("textEdit");
+        }
+        *value = completion_list(
+            Value::Array(std::mem::take(items)),
+            serde_json::json!({"editRange": range}),
+        );
+    } else {
+        for item in value
+            .get_mut("items")
+            .and_then(Value::as_array_mut)
+            .expect("list has items")
+        {
+            item.as_object_mut()
+                .expect("item has edit")
+                .remove("textEdit");
+        }
+        let list = value.as_object_mut().expect("value is a completion list");
+        list.entry("itemDefaults")
+            .or_insert_with(|| serde_json::json!({}))["editRange"] = range;
+    }
+}
+
 /// Normalize before dispatching the resolve job, so path routing, scoped
 /// lookups, and fallback responses see exactly the same key as old clients.
 pub(super) fn expand_resolve_data(item: &mut CompletionItem) {
@@ -224,6 +325,48 @@ mod transport_tests {
         let mut items: Vec<CompletionItem> = serde_json::from_value(mixed.clone()).unwrap();
         assert!(compact_items(&mut items).is_none());
         assert_eq!(serde_json::to_value(items).unwrap(), mixed);
+    }
+
+    #[test]
+    fn identical_text_edits_pack_and_reexpand_even_with_mixed_data() {
+        let mut raw = homogeneous();
+        let mut original: Vec<CompletionItem> = serde_json::from_value(raw.clone()).unwrap();
+        let range = lsp_types::Range::new(Position::new(0, 2), Position::new(0, 5));
+        original[0].data = None;
+        for item in &mut original {
+            item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: item.label.clone(),
+            }));
+        }
+        raw = serde_json::to_value(&original).unwrap();
+        compact_response_edit_range(&mut raw);
+        let mut items = original.clone();
+        let packed = compact_items_edit_range(&mut items, true).unwrap();
+        assert_eq!(packed, raw);
+        assert_eq!(
+            packed["itemDefaults"]["editRange"],
+            serde_json::to_value(range).unwrap()
+        );
+        assert!(packed["itemDefaults"].get("data").is_none());
+        let mut reexpanded: Vec<CompletionItem> =
+            serde_json::from_value(packed["items"].clone()).unwrap();
+        for item in &mut reexpanded {
+            item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: item.label.clone(),
+            }));
+        }
+        assert_eq!(original, reexpanded);
+
+        // All items get a common default only when none has an implicit edit.
+        items[0].text_edit = None;
+        assert!(compact_items_edit_range(&mut items, true).is_none());
+        let mut mixed = original;
+        mixed[0].text_edit = None;
+        let mut mixed_raw = serde_json::to_value(&mixed).unwrap();
+        compact_response_edit_range(&mut mixed_raw);
+        assert_eq!(mixed_raw, serde_json::to_value(&mixed).unwrap());
     }
 
     #[test]
@@ -368,6 +511,18 @@ fn completion_via_db_impl(
             encoding,
             &text.line_index(),
             Some((snapshot, file)),
+        );
+        auto_import::isolated_module(
+            snapshot,
+            file,
+            path,
+            model,
+            &root,
+            workspace.as_ref(),
+            text,
+            offset,
+            encoding,
+            &mut items,
         );
         append_auto_imports(
             snapshot, file, path, model, &root, workspace, text, offset, encoding, &mut items,
@@ -665,7 +820,11 @@ fn append_auto_imports(
     let Some(context) = snapshot.context() else {
         return;
     };
-    let EditionSource::Project { path: project, role } = &context.source else {
+    let EditionSource::Project {
+        path: project,
+        role,
+    } = &context.source
+    else {
         return;
     };
     let editions = snapshot.source_editions(file);
@@ -691,7 +850,9 @@ fn append_auto_imports(
                 if !host.is_empty() || local_module.as_slice() != [package.name.as_str()] {
                     return;
                 }
-            } else if crate::resolve::module_at(&package.root, host).is_none_or(|module| module.bare) {
+            } else if crate::resolve::module_at(&package.root, host)
+                .is_none_or(|module| module.bare)
+            {
                 return;
             }
             auto_import_anchor(root, text, &local_module)
@@ -720,9 +881,7 @@ fn append_auto_imports(
         let Ok(uuid) = uuid.into_inner().parse() else {
             continue;
         };
-        if !simple_import_name(&dep)
-            || workspace.as_ref().is_some_and(|(pkg, _)| dep == pkg.name)
-        {
+        if !simple_import_name(&dep) || workspace.as_ref().is_some_and(|(pkg, _)| dep == pkg.name) {
             continue;
         }
         let Some(index) = snapshot.auto_import_package(project, &dep, uuid) else {
@@ -764,7 +923,8 @@ fn append_auto_imports(
         }
     }
     if offers.values().all(Option::is_none)
-        || (*role == SourceRole::Script && snapshot.script_import_host_uncertain(&context.entry, project))
+        || (*role == SourceRole::Script
+            && snapshot.script_import_host_uncertain(&context.entry, project))
     {
         return;
     }
@@ -809,16 +969,35 @@ fn append_auto_imports(
         {
             return;
         }
-        occupied.extend(sem.bindings().iter().filter(|binding| {
-            sem.scope(binding.scope).kind.is_global() && binding.name.starts_with(prefix)
-        }).map(|binding| binding.name.clone()));
-        occupied.extend(sem.free_reads().filter(|read| {
-            !read.is_macro
-                && read.name.starts_with(prefix)
-                && (member != &path || read.range != callee)
-        }).map(|read| read.name.clone()));
-        occupied.extend(sem.exports().iter().filter(|export| export.name.starts_with(prefix)).map(|export| export.name.clone()));
-        occupied.extend(sem.potential_import_reads().iter().filter(|(_, name)| name.starts_with(prefix)).map(|(_, name)| name.clone()));
+        occupied.extend(
+            sem.bindings()
+                .iter()
+                .filter(|binding| {
+                    sem.scope(binding.scope).kind.is_global() && binding.name.starts_with(prefix)
+                })
+                .map(|binding| binding.name.clone()),
+        );
+        occupied.extend(
+            sem.free_reads()
+                .filter(|read| {
+                    !read.is_macro
+                        && read.name.starts_with(prefix)
+                        && (member != &path || read.range != callee)
+                })
+                .map(|read| read.name.clone()),
+        );
+        occupied.extend(
+            sem.exports()
+                .iter()
+                .filter(|export| export.name.starts_with(prefix))
+                .map(|export| export.name.clone()),
+        );
+        occupied.extend(
+            sem.potential_import_reads()
+                .iter()
+                .filter(|(_, name)| name.starts_with(prefix))
+                .map(|(_, name)| name.clone()),
+        );
         for load in sem.module_loads() {
             if load.path.components.is_empty() {
                 return;
@@ -828,17 +1007,26 @@ fn append_auto_imports(
             }
             if load.kind == crate::semantic::LoadKind::Using && load.items.is_none() {
                 let mut parts = load.path.components.iter();
-                let Some(package) = parts.next().and_then(|name| snapshot.package(name.as_str())) else {
+                let Some(package) = parts
+                    .next()
+                    .and_then(|name| snapshot.package(name.as_str()))
+                else {
                     return;
                 };
                 let parts: Vec<_> = parts.map(|name| name.as_str()).collect();
                 let Some(module) = resolve_submodule(&package.root, &parts) else {
                     return;
                 };
-                occupied.extend(module.exports.iter().filter(|export| {
-                    export.visibility == crate::index::Visibility::Exported
-                        && export.name.starts_with(prefix)
-                }).map(|export| export.name.as_str().into()));
+                occupied.extend(
+                    module
+                        .exports
+                        .iter()
+                        .filter(|export| {
+                            export.visibility == crate::index::Visibility::Exported
+                                && export.name.starts_with(prefix)
+                        })
+                        .map(|export| export.name.as_str().into()),
+                );
             }
         }
     }
@@ -849,7 +1037,10 @@ fn append_auto_imports(
         .into_iter()
         .filter_map(|(name, offer)| Some((name, offer?)))
     {
-        if occupied.contains(name.as_str())
+        if items
+            .iter()
+            .any(|item| item.label == name && item.additional_text_edits.is_some())
+            || occupied.contains(name.as_str())
             || loaded.contains(dep.as_str())
             || resolver.resolve(&name, callee.start(), Namespace::Value) != Resolution::Unresolved
         {
@@ -938,22 +1129,41 @@ fn auto_import_site<'a>(
 /// Allow only literal includes that execute in top-level module scope.
 fn safe_auto_import_file(root: &SyntaxNode, model: &SemanticModel) -> bool {
     use crate::ast::{AstNode, CallExpr};
-    if model.bindings().iter().any(|binding| {
-        binding.name == "include" && model.scope(binding.scope).kind.is_global()
-    }) || model.qualified_reads().iter().any(|read| {
-        read.path.last().is_some_and(|name| matches!(name.as_str(), "eval" | "include" | "include_string"))
-    }) || root.descendants().any(|node| {
-        node.kind() == SyntaxKind::MACRO_CALL
-            && model.scope(model.scope_at(node.text_range().start())).kind.is_global()
-    }) {
+    if model
+        .bindings()
+        .iter()
+        .any(|binding| binding.name == "include" && model.scope(binding.scope).kind.is_global())
+        || model.qualified_reads().iter().any(|read| {
+            read.path
+                .last()
+                .is_some_and(|name| matches!(name.as_str(), "eval" | "include" | "include_string"))
+        })
+        || root.descendants().any(|node| {
+            node.kind() == SyntaxKind::MACRO_CALL
+                && model
+                    .scope(model.scope_at(node.text_range().start()))
+                    .kind
+                    .is_global()
+        })
+    {
         return false;
     }
-    let literal_includes = root.descendants().filter_map(CallExpr::cast).filter(|call| {
-        crate::project::include_target(call).is_some()
-            && call.syntax().ancestors().skip(1).all(|node| {
-                matches!(node.kind(), SyntaxKind::ROOT | SyntaxKind::BLOCK | SyntaxKind::BEGIN_EXPR | SyntaxKind::MODULE_DEF)
-            })
-    }).count();
+    let literal_includes = root
+        .descendants()
+        .filter_map(CallExpr::cast)
+        .filter(|call| {
+            crate::project::include_target(call).is_some()
+                && call.syntax().ancestors().skip(1).all(|node| {
+                    matches!(
+                        node.kind(),
+                        SyntaxKind::ROOT
+                            | SyntaxKind::BLOCK
+                            | SyntaxKind::BEGIN_EXPR
+                            | SyntaxKind::MODULE_DEF
+                    )
+                })
+        })
+        .count();
     let mut bare_includes = 0;
     for read in model.idents() {
         match read.name.as_str() {
@@ -970,7 +1180,10 @@ fn auto_import_anchor<'a>(
     text: &'a str,
     modules: &[smol_str::SmolStr],
 ) -> Option<(usize, &'a str)> {
-    let eol = if text.find('\n').is_some_and(|end| text[..end].ends_with('\r')) {
+    let eol = if text
+        .find('\n')
+        .is_some_and(|end| text[..end].ends_with('\r'))
+    {
         "\r\n"
     } else {
         "\n"
@@ -982,7 +1195,10 @@ fn auto_import_anchor<'a>(
         // comments (trivia) and keeping the edit on a separate line.
         let start = usize::from(first.text_range().start());
         let line_start = text[..start].rfind('\n').map_or(0, |end| end + 1);
-        return text[line_start..start].trim().is_empty().then_some((line_start, eol));
+        return text[line_start..start]
+            .trim()
+            .is_empty()
+            .then_some((line_start, eol));
     }
     let [expected] = modules else {
         return None;
@@ -993,7 +1209,8 @@ fn auto_import_anchor<'a>(
     let start = usize::from(first.text_range().start());
     let header_end = start + text.get(start..)?.find('\n')?;
     let mut header = text[start..header_end].split_whitespace();
-    if header.next()? != "module" || header.next()? != expected.as_str() || header.next().is_some() {
+    if header.next()? != "module" || header.next()? != expected.as_str() || header.next().is_some()
+    {
         return None;
     }
     Some((header_end + 1, eol))
@@ -1156,15 +1373,31 @@ fn completions_for<P: PackageSource>(
             receiver,
             macro_member,
         } => {
+            let start = receiver_start(text, offset, &receiver, macro_member);
             let mut items = member_completions(
                 model,
                 packages,
-                workspace,
+                workspace.clone(),
                 &receiver,
                 offset,
-                receiver_start(text, offset, &receiver, macro_member),
+                (start, take_ident_back(&text[..offset_bytes]).0),
                 macro_member,
             );
+            if items.is_empty()
+                && !macro_member
+                && string_context_at(root, offset) == StringContext::Code
+                && let Some(start) = start
+                && let Some(fields) = value_members::items(
+                    model,
+                    root,
+                    packages,
+                    workspace.as_ref(),
+                    &receiver,
+                    start,
+                )
+            {
+                items = fields;
+            }
             if macro_member && !items.is_empty() {
                 qualified_macro_edits(&mut items, text, offset_bytes, lines, encoding);
             }
@@ -1238,7 +1471,7 @@ fn reference_completions<P: PackageSource>(
             workspace,
             &receiver,
             semantic_offset,
-            None,
+            (None, take_ident_back(&target[..usize::from(offset)]).0),
             macro_member,
         ),
         Context::Macro => candidate_items(
@@ -1862,7 +2095,7 @@ fn member_completions<P: PackageSource>(
     workspace: Option<(Arc<PackageIndex>, ModulePath)>,
     receiver: &[String],
     offset: TextSize,
-    receiver_start: Option<TextSize>,
+    (receiver_start, prefix): (Option<TextSize>, &str),
     macro_member: bool,
 ) -> Vec<CompletionItem> {
     let written: ModulePath = receiver.iter().map(Into::into).collect();
@@ -1887,7 +2120,15 @@ fn member_completions<P: PackageSource>(
     };
     let resolved_strings: Vec<String> = resolved.iter().map(ToString::to_string).collect();
     let mut items = cached_member_items(&pkg, module, &resolved_strings, macro_member);
-    append_imported_members(&resolver, module, &resolved, macro_member, &mut items);
+    append_imported_members(
+        &resolver,
+        module,
+        &resolved,
+        macro_member,
+        prefix,
+        false,
+        &mut items,
+    );
     items
 }
 
@@ -1898,11 +2139,15 @@ fn append_imported_members<P: PackageSource>(
     module: &ModuleIndex,
     path: &[smol_str::SmolStr],
     macro_member: bool,
+    prefix: &str,
+    prefix_only: bool,
     items: &mut Vec<CompletionItem>,
 ) {
-    if module.import_bindings.is_empty() && module.exports.is_empty() {
+    if module.import_bindings.is_empty() && module.exports.is_empty() && module.usings.is_empty() {
         return;
     }
+    let prefix = prefix.trim_start_matches('@').to_lowercase();
+    let projected = resolver.using_projection_names(path);
     let mut visited: std::collections::HashSet<&str> =
         items.iter().map(|item| item.label.as_str()).collect();
     let mut imported = Vec::new();
@@ -1911,8 +2156,23 @@ fn append_imported_members<P: PackageSource>(
         .iter()
         .map(|import| &import.local)
         .chain(module.exports.iter().map(|export| &export.name))
+        .chain(projected.iter().filter(|label| {
+            // An untyped dot still discovers the facade. When the user has
+            // begun an identifier, don't resolve unseen projection labels.
+            prefix.is_empty()
+                || label
+                    .trim_start_matches('@')
+                    .to_lowercase()
+                    .starts_with(&prefix)
+        }))
     {
-        if label.starts_with('@') != macro_member || !visited.insert(label.as_str()) {
+        if label == &module.name
+            || (prefix_only
+                && !prefix.is_empty()
+                && !label.trim_start_matches('@').to_lowercase().starts_with(&prefix))
+            || label.starts_with('@') != macro_member
+            || !visited.insert(label.as_str())
+        {
             continue;
         }
         let Some(origin) = resolver.qualified_member_origin(path, label) else {
@@ -2443,7 +2703,10 @@ mod tests {
             "ordinary = (1, vis│)",
         ] {
             let names = labels(&at_declaration_marker(body));
-            assert!(names.iter().any(|name| name == "visible_candidate"), "{body}");
+            assert!(
+                names.iter().any(|name| name == "visible_candidate"),
+                "{body}"
+            );
         }
     }
 
@@ -2592,7 +2855,11 @@ mod tests {
         )).unwrap();
         fs::create_dir(dir.join("src")).unwrap();
         fs::write(dir.join("src").join("sibling.jl"), "helper() = 1\n").unwrap();
-        let entry = dir.join("src").join("Tester.jl");
+        let mut entry = dir.join("src").join("Tester.jl");
+        if mode == "isolated" {
+            fs::write(&entry, "module Tester\nend\n").unwrap();
+            entry = dir.join("src").join("isolated.jl");
+        }
         let (left, right) = source.split_once('|').unwrap();
         let text = format!("{left}{right}");
         fs::write(&entry, &text).unwrap();
@@ -2627,6 +2894,9 @@ mod tests {
         db.set_project_files(indexed.project_files);
         db.set_library(indexed.packages, indexed.roots, indexed.workspaces);
         db.seed_workspace_members();
+        if mode == "isolated" {
+            db.upsert_file(&entry, text.as_str());
+        }
         let snapshot = db.snapshot();
         let (context, selection) = snapshot
             .capture_source_editions(&entry)
@@ -2751,6 +3021,58 @@ mod tests {
                 .iter()
                 .all(|item| item.label != "ghost")
         );
+    }
+
+    #[test]
+    fn isolated_module_imports_are_scoped_and_suffix_safe() {
+        for (source, label, exact_import) in [
+            (
+                "module Audit; x = Tools.ca|lz; end",
+                "calculate",
+                "import Tools;",
+            ),
+            (
+                "module Audit; x = calc|; end",
+                "calculate",
+                "using Tools: calculate;",
+            ),
+            (
+                "module Audit\r\n    x = Tools.ca|\r\nend",
+                "calculate",
+                "import Tools\r\n",
+            ),
+            (
+                "module Audit\n    x = calc|\nend",
+                "calculate",
+                "using Tools: calculate\n",
+            ),
+        ] {
+            let offered = auto_import_fixture(source, "isolated");
+            let candidate = item(&offered, label);
+            let r = candidate
+                .additional_text_edits
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing binding edit for {source:?}; {candidate:?}"));
+            assert_eq!(r[0].new_text, exact_import);
+            let (_, edit) = edit(candidate);
+            assert!(r[0].range.end < edit.start, "ranges overlap at {source:?}");
+        }
+        for source in [
+            "module Audit; Tools = 1; x = Tools.ca|; end",
+            "module Audit; other = Tools; x = Tools.ca|; end",
+            "module Audit; import Tools; x = Tools.ca|; end",
+            "module Audit; include(\"x.jl\"); x = calc|; end",
+            "module Audit; x = Tools.ca|; end; outside = 1",
+            "baremodule Audit; x = Tools.ca|; end",
+            "module Audit; @eval thing(); x = Tools.ca|; end",
+        ] {
+            assert!(
+                auto_import_fixture(source, "isolated")
+                    .iter()
+                    .all(|item| item.additional_text_edits.is_none()),
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -3149,6 +3471,40 @@ mod tests {
     }
 
     #[test]
+    fn projected_relative_facades_and_reexport_use_the_same_verified_import_surface() {
+        let harvested = |source: &str| {
+            let tree = crate::parser::parse(source);
+            assert!(tree.diagnostics.is_empty(), "{:?}", tree.diagnostics);
+            let mut root = crate::index::harvest_tree(&tree.cst);
+            package(root.submodules.remove(0))
+        };
+        let provider = harvested(
+            "module Provider\nexport Alias, @thing, Missing\nstruct Alias end\nmacro thing(x); x; end\nend",
+        );
+        let host = harvested(
+            "module Host\nmodule Internal\nexport Request, do_it\nstruct Request end\ndo_it() = 1\nend\nusing .Internal\nusing Reexport\n@reexport using Provider\nend",
+        );
+        let ambiguous = harvested(
+            "module Ambiguous\nmodule One\nexport clash\nclash() = 1\nend\nmodule Two\nexport clash\nclash() = 2\nend\nusing .One, .Two\nend",
+        );
+        let lib = library(vec![provider, host, ambiguous]);
+        for (src, at, name) in [
+            ("Host.Re", "Host.Re", "Request"),
+            ("using Host: Re", "using Host: Re", "Request"),
+            ("import Host: Al", "import Host: Al", "Alias"),
+            ("Host.@th", "Host.@th", "@thing"),
+            ("import Host: @th", "import Host: @th", "@thing"),
+        ] {
+            let names = labels(&completions_at(src, at, &lib));
+            assert!(names.contains(&name.to_string()), "{src}: {names:?}");
+        }
+        assert!(!labels(&completions_at("Host.", "Host.", &lib)).contains(&"Missing".into()));
+        assert!(
+            !labels(&completions_at("Ambiguous.", "Ambiguous.", &lib)).contains(&"clash".into())
+        );
+    }
+
+    #[test]
     fn qualified_members_reexport_only_proven_implicit_system_bindings() {
         let mut base = module("Base", &["base_fn", "unlisted", "contested", "unknown"]);
         for name in ["base_fn", "unlisted", "contested"] {
@@ -3164,6 +3520,7 @@ mod tests {
         other.functions.push(func("contested"));
         let mut conflict = module("Conflict", &["contested"]);
         conflict.usings.push(crate::index::ModuleUsing {
+            reexport: false,
             leading_dots: 0,
             components: vec!["Other".into()],
         });
@@ -3192,6 +3549,8 @@ mod tests {
             type_params: Vec::new(),
             supertype: None,
             fields: Vec::new(),
+            keyword_constructor: false,
+            constructor_shape: false,
             doc: None,
             loc: loc(),
         });

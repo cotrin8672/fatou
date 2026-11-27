@@ -158,7 +158,7 @@ pub(crate) fn spawn_analysis_thread(
                 deferred_edits: Vec::new(),
                 scripts: ScriptProjects::new(encoding),
                 pending_script_load: None,
-                db: IncrementalDatabase::default(),
+                db: bootstrap_database(),
                 out_tx,
                 done_tx,
                 inflight: None,
@@ -174,6 +174,15 @@ pub(crate) fn spawn_analysis_thread(
             worker.run(&read_rx, library_rx, &sync_rx, &done_rx);
         })
         .expect("spawn analysis thread")
+}
+
+/// Seed stable, bundled system exports before serving any completion. The
+/// background harvest replaces this with the real install and project data.
+fn bootstrap_database() -> IncrementalDatabase {
+    let mut db = IncrementalDatabase::default();
+    let fallback = crate::index::build_system_library(None);
+    db.set_library(fallback.packages, fallback.roots, fallback.workspaces);
+    db
 }
 
 /// Signal from a finished read-phase ([`AnalysisWorker::start`]) back to the
@@ -453,8 +462,11 @@ impl AnalysisWorker {
     }
 
     fn dispatch_read(&self, job: ReadJob) {
-        let mut job =
-            job.with_membership_generation(self.membership_generation.load(Ordering::Acquire));
+        let mut job = job
+            .with_membership_generation(self.membership_generation.load(Ordering::Acquire))
+            .with_pending_library_completion(
+                self.full_harvest.is_some() || self.syntax_harvest.is_some(),
+            );
         if job.is_cancelled() {
             return;
         }
@@ -464,7 +476,27 @@ impl AnalysisWorker {
         self.read_spawner.spawn(move || {
             // Cancellation never interrupts a running Salsa query. State
             // already answered the client and will drop any raced reply.
-            if !job.is_cancelled() {
+            if job.is_cancelled() {
+                return;
+            }
+            if let ReadJob::Completion { id, sender, .. } = &job {
+                let (id, sender) = (id.clone(), sender.clone());
+                if salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                    run_read(snapshot, job, encoding, contexts)
+                }))
+                .is_err()
+                {
+                    // A library/context write invalidated this snapshot.
+                    // A retryable protocol error is better than a lost reply.
+                    let _ = sender.send(lsp_server::Message::Response(
+                        lsp_server::Response::new_err(
+                            id,
+                            lsp_server::ErrorCode::ContentModified as i32,
+                            "completion context changed; retry".into(),
+                        ),
+                    ));
+                }
+            } else {
                 run_read(snapshot, job, encoding, contexts);
             }
         });
@@ -1040,6 +1072,54 @@ mod tests {
                 package_graph_diags: BTreeMap::new(),
                 import_projections: HashMap::new(),
             }
+        }
+    }
+
+    #[test]
+    fn startup_completion_has_base_names_and_reports_pending_index() {
+        use crate::lsp::completion::CompletionTrigger;
+        use crate::lsp::read_jobs::ReadReply;
+        use crate::lsp::task_pool::TaskPool;
+
+        let pool = TaskPool::new("test-startup-completion", 1);
+        let mut worker = AnalysisWorker {
+            db: bootstrap_database(),
+            full_harvest: Some(0),
+            read_spawner: pool.spawner(),
+            ..AnalysisWorker::for_test()
+        };
+        let (sender, replies) = crossbeam_channel::unbounded();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.jl");
+        for (index, pending) in [true, false].into_iter().enumerate() {
+            if !pending {
+                worker.full_harvest = None;
+            }
+            worker.dispatch_read(ReadJob::Completion {
+                id: ((index + 1) as i32).into(),
+                path: path.clone(),
+                text: Arc::new(TextBuffer::new("At_in::Vec = data[\nBt_in = 0\n")),
+                position: lsp_types::Position::new(0, 10),
+                trigger: CompletionTrigger::Standard,
+                sender: ReadReply::new(sender.clone()),
+            });
+            let Outbound::ReadReply {
+                message: lsp_server::Message::Response(response),
+                ..
+            } = replies
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            else {
+                panic!("expected completion response");
+            };
+            let value = response.response_result.unwrap();
+            let items = if pending {
+                assert_eq!(value["isIncomplete"], true);
+                value["items"].as_array().unwrap()
+            } else {
+                value.as_array().unwrap()
+            };
+            assert!(items.iter().any(|item| item["label"] == "Vector"));
         }
     }
 

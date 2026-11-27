@@ -47,6 +47,7 @@
 mod analysis_thread;
 mod call_hierarchy;
 mod code_action;
+mod compiler_hints;
 mod completion;
 mod config;
 mod cross_file;

@@ -5311,9 +5311,8 @@ impl PreservedComment {
 
 /// One source line of a block body: zero or more statements (`; `-joined) plus an
 /// optional comment.
-#[derive(Default)]
-struct BodyLine {
-    stmts: Vec<Ir>,
+struct BodyLine<T> {
+    stmts: Vec<T>,
     comment: Option<PreservedComment>,
     /// Set when a **top-level** statement is written with a trailing `;` output
     /// suppressor (`x = 1;`) — the last `;` of a `TOPLEVEL_SEMICOLON` wrapper,
@@ -5331,7 +5330,18 @@ struct BodyLine {
     range: Option<TextRange>,
 }
 
-impl BodyLine {
+impl<T> Default for BodyLine<T> {
+    fn default() -> Self {
+        Self {
+            stmts: Vec::new(),
+            comment: None,
+            trailing_semi: false,
+            range: None,
+        }
+    }
+}
+
+impl<T> BodyLine<T> {
     /// A line carrying neither a statement nor a comment — a blank line.
     fn is_blank(&self) -> bool {
         self.stmts.is_empty() && self.comment.is_none()
@@ -5364,12 +5374,15 @@ impl BodyLine {
 /// model: two adjacent statement nodes with no separator, a node or `;` after a
 /// comment (which would land it on the wrong side of the recorded comment), or a
 /// second comment on one line.
-fn collect_body_lines(node: &SyntaxNode) -> Option<Vec<BodyLine>> {
+fn collect_body_lines<T>(
+    node: &SyntaxNode,
+    statement: impl Fn(SyntaxNode) -> T + Copy,
+) -> Option<Vec<BodyLine<T>>> {
     // `expect_sep` guards against two adjacent statement nodes with no `;`/newline
     // between them, and against a node following a comment on the same line.
-    let mut lines: Vec<BodyLine> = vec![BodyLine::default()];
+    let mut lines = vec![BodyLine::default()];
     let mut expect_sep = false;
-    collect_body_elements(node, &mut lines, &mut expect_sep, false)?;
+    collect_body_elements(node, &mut lines, &mut expect_sep, false, statement)?;
     Some(lines)
 }
 
@@ -5383,11 +5396,12 @@ fn collect_body_lines(node: &SyntaxNode) -> Option<Vec<BodyLine>> {
 /// `top_level` is set only while walking a `TOPLEVEL_SEMICOLON` wrapper's children,
 /// where a trailing `;` (the last one, with no statement after it) is a preserved
 /// output suppressor rather than a dropped separator (see [`BodyLine::trailing_semi`]).
-fn collect_body_elements(
+fn collect_body_elements<T>(
     node: &SyntaxNode,
-    lines: &mut Vec<BodyLine>,
+    lines: &mut Vec<BodyLine<T>>,
     expect_sep: &mut bool,
     top_level: bool,
+    statement: impl Fn(SyntaxNode) -> T + Copy,
 ) -> Option<()> {
     for el in node.children_with_tokens() {
         match el {
@@ -5397,15 +5411,15 @@ fn collect_body_elements(
                 // than lowering it as one opaque statement. Its `;` tokens are the
                 // only place a top-level trailing suppressor can appear.
                 if child.kind() == SyntaxKind::TOPLEVEL_SEMICOLON {
-                    collect_body_elements(&child, lines, expect_sep, true)?;
+                    collect_body_elements(&child, lines, expect_sep, true, statement)?;
                     continue;
                 }
                 if *expect_sep {
                     return None;
                 }
                 let line = lines.last_mut().unwrap();
-                line.stmts.push(lower_node(&child));
                 line.cover(child.text_range());
+                line.stmts.push(statement(child));
                 // A statement follows any earlier `;` on this line, so that `;` was
                 // an internal separator, not a trailing suppressor — clear the mark.
                 line.trailing_semi = false;
@@ -5485,7 +5499,7 @@ fn collect_body_elements(
 /// (not bare `;` tokens at the root); [`collect_body_lines`] flattens that wrapper
 /// so each such statement reflows onto its own line, exactly as a block body's do.
 fn lower_root(root: &SyntaxNode) -> Ir {
-    let Some(lines) = collect_body_lines(root) else {
+    let Some(lines) = collect_body_lines(root, |node| lower_node(&node)) else {
         return lower_transparent(root);
     };
     // An empty or whitespace-only file lowers to nothing.
@@ -5568,7 +5582,7 @@ fn lower_block_body(block: &SyntaxNode) -> Option<Ir> {
 /// vertically-broken lines without any indent wrapper, or `None` for an empty
 /// block or any shape this does not model.
 fn build_block_body(block: &SyntaxNode) -> Option<Ir> {
-    let lines = collect_body_lines(block)?;
+    let lines = collect_body_lines(block, |node| lower_node(&node))?;
 
     // Only module bodies retain boundary blanks, regardless of nesting or indent.
     // One empty line on each side is absorbed into the framing break.
@@ -5655,7 +5669,9 @@ pub(crate) fn lower_body_range(
     container: &SyntaxNode,
     range: TextRange,
 ) -> Option<(Ir, TextRange)> {
-    let lines = collect_body_lines(container)?;
+    // Preserve the complete body's trivia and validity checks, but do not
+    // construct formatter IR for statements outside the widened selection.
+    let lines = collect_body_lines(container, |node| node)?;
 
     // Widen the selection to the run of source lines whose significant span
     // overlaps `range`. The closed comparison keeps an empty (cursor) range
@@ -5713,7 +5729,7 @@ pub(crate) fn lower_body_range(
                 if emitted {
                     inner.push(Ir::HardLine);
                 }
-                inner.push(stmt.clone());
+                inner.push(lower_node(stmt));
                 if j == last_stmt {
                     if line.trailing_semi {
                         inner.push(Ir::text(";"));

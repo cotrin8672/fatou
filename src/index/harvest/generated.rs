@@ -8,8 +8,8 @@
 use rowan::TextRange;
 
 use crate::ast::{
-    Arg, AstNode, AstToken, CallExpr, Expr, ForBinding, ForExpr, HasBody, Interpolation, MacroCall,
-    Operator, body_of,
+    Arg, AstNode, AstToken, CallExpr, Expr, ForBinding, ForExpr, HasArgList, HasBody,
+    Interpolation, MacroCall, Operator, body_of,
 };
 use crate::semantic::signature::peel_signature;
 use crate::syntax::{SyntaxKind, SyntaxNode};
@@ -149,4 +149,140 @@ fn unparenthesized(mut expr: Expr) -> Option<Expr> {
         expr = paren.expr()?;
     }
     Some(expr)
+}
+
+/// Recognize a locally defined, exact one-argument macro whose entire return
+/// is a quote with one unconditionally emitted struct. The struct name is the
+/// supplied identifier; optional sibling definitions must be its constructors.
+/// This recognizes e.g. a family of weight types, not arbitrary macro calls.
+pub(super) fn named_struct_at_call(
+    node: &SyntaxNode,
+    name: &str,
+    args: &[SyntaxNode],
+) -> Option<(String, TextRange, SyntaxNode)> {
+    let [argument] = args else { return None };
+    if argument.kind() != SyntaxKind::NAME
+        || MacroCall::cast(node.clone())?
+            .name()?
+            .ident_tokens()
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let parent = node.parent()?;
+    let mut defs = parent
+        .children()
+        .take_while(|child| child != node)
+        .filter_map(|child| {
+            let child = crate::ast::DocAttachment::cast(child.clone())
+                .map(|doc| doc.target().clone())
+                .unwrap_or(child);
+            if child.kind() != SyntaxKind::MACRO_DEF {
+                return None;
+            }
+            let signature = CallExpr::cast(signature_start(&child)?)?;
+            let Expr::Name(callee) = signature.callee()? else {
+                return None;
+            };
+            (callee.ident()?.text() == name).then_some((child, signature))
+        });
+    let (definition, signature) = defs.next()?;
+    if defs.next().is_some() {
+        return None;
+    }
+    let arg_list = signature.arg_list()?;
+    let mut params = arg_list.args();
+    let Expr::Name(parameter) = params.next()?.expr()? else {
+        return None;
+    };
+    if params.next().is_some() || arg_list.keyword_args().next().is_some() {
+        return None;
+    }
+    let parameter = parameter.ident()?;
+    let body = only_child(&body_of(&definition)?)?;
+    let quoted = if body.kind() == SyntaxKind::RETURN_EXPR {
+        only_child(&body)?
+    } else {
+        body
+    };
+    if quoted.kind() != SyntaxKind::QUOTE_EXPR {
+        return None;
+    }
+    let template = body_of(&quoted)?;
+    let mut statements = template.children();
+    let structure = statements.next()?;
+    if structure.kind() != SyntaxKind::STRUCT_DEF {
+        return None;
+    }
+    let mut head = signature_start(&structure)?;
+    if head.kind() == SyntaxKind::BINARY_EXPR && super::has_subtype(&head) {
+        head = head.children().next()?;
+    }
+    let head = interpolated_base(Expr::cast(head)?)?;
+    if !is_template_arg(&head, parameter.text()) {
+        return None;
+    }
+    // Definition-shaped trailing statements are allowed only when their
+    // callee is the same template name. No arbitrary quote-time evaluation.
+    for statement in statements {
+        if !is_short_form_def(&statement) {
+            return None;
+        }
+        let (signature, _, _) = peel_signature(statement.children().next()?);
+        let callee = CallExpr::cast(signature?)?.callee()?;
+        if !is_template_arg(&interpolated_base(callee)?, parameter.text()) {
+            return None;
+        }
+    }
+    // All interpolation in the result must be the parameter, or esc(parameter).
+    // Evaluating other expressions could alter the template before emitting it.
+    if quoted
+        .descendants()
+        .filter_map(Interpolation::cast)
+        .any(|interpolated| !is_template_arg(&interpolated, parameter.text()))
+    {
+        return None;
+    }
+    Some((node_name_text(argument)?, argument.text_range(), structure))
+}
+
+fn only_child(node: &SyntaxNode) -> Option<SyntaxNode> {
+    let mut children = node.children();
+    let first = children.next()?;
+    children.next().is_none().then_some(first)
+}
+
+fn interpolated_base(expr: Expr) -> Option<Interpolation> {
+    match expr {
+        Expr::Interpolation(node) => Some(node),
+        Expr::CurlyExpr(curly) => match curly.base()? {
+            Expr::Interpolation(node) => Some(node),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_template_arg(arg: &Interpolation, name: &str) -> bool {
+    if is_loop_name(arg, name) {
+        return true;
+    }
+    let Some(Expr::CallExpr(call)) = arg.expr().and_then(unparenthesized) else {
+        return false;
+    };
+    let Some(Expr::Name(callee)) = call.callee() else {
+        return false;
+    };
+    if !callee.ident().is_some_and(|i| i.text() == "esc") {
+        return false;
+    }
+    let Some(args) = call.arg_list() else {
+        return false;
+    };
+    let mut iter = args.args();
+    matches!(
+        iter.next().and_then(|arg| arg.expr()),
+        Some(Expr::Name(var)) if var.ident().is_some_and(|i| i.text() == name)
+    ) && iter.next().is_none()
 }

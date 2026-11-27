@@ -166,6 +166,7 @@ impl ScriptFile {
                     ScriptEvent::Using(
                         model.enclosing_module_path(load.scope),
                         ModuleUsing {
+                            reexport: false,
                             leading_dots: load.path.leading_dots,
                             components: load
                                 .path

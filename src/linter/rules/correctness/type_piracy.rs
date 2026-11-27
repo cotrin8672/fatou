@@ -449,6 +449,8 @@ mod tests {
                         kind: TypeKind::Abstract,
                         type_params: Vec::new(),
                         supertype: None,
+                        keyword_constructor: false,
+                        constructor_shape: false,
                         fields: Vec::new(),
                         doc: None,
                         loc: loc(),

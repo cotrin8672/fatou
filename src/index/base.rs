@@ -303,6 +303,8 @@ fn merge_index(acc: &mut PackageIndex, other: PackageIndex) {
     root.consts.extend(other.root.consts);
     root.macros.extend(other.root.macros);
     root.submodules.extend(other.root.submodules);
+    root.usings.extend(other.root.usings);
+    root.imported_names.extend(other.root.imported_names);
     root.import_bindings.extend(other.root.import_bindings);
     for group in other.root.functions {
         match root

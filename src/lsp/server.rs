@@ -68,14 +68,17 @@ pub fn serve(connection: &Connection) -> Result<(), DynError> {
     let register_watchers =
         supports_watched_files_registration(&params.capabilities) && !workspace_roots.is_empty();
     let pull_diagnostics = supports_pull_diagnostics(&params.capabilities);
-    let completion_data_defaults = params
+    let completion_defaults = params
         .capabilities
         .text_document
         .as_ref()
         .and_then(|text| text.completion.as_ref())
         .and_then(|completion| completion.completion_list.as_ref())
-        .and_then(|list| list.item_defaults.as_ref())
-        .is_some_and(|fields| fields.iter().any(|field| field == "data"));
+        .and_then(|list| list.item_defaults.as_ref());
+    let completion_data_defaults =
+        completion_defaults.is_some_and(|fields| fields.iter().any(|field| field == "data"));
+    let completion_edit_range_defaults =
+        completion_defaults.is_some_and(|fields| fields.iter().any(|field| field == "editRange"));
     let diagnostic_refresh = supports_diagnostic_refresh(&params.capabilities);
     let inlay_hint_refresh = supports_inlay_hint_refresh(&params.capabilities);
     let semantic_tokens_refresh = params
@@ -100,6 +103,7 @@ pub fn serve(connection: &Connection) -> Result<(), DynError> {
         work_done_progress,
         semantic_tokens_refresh,
         completion_data_defaults,
+        completion_edit_range_defaults,
         params.initialization_options,
     )
 }
@@ -371,6 +375,7 @@ fn main_loop(
     work_done_progress: bool,
     semantic_tokens_refresh: bool,
     completion_data_defaults: bool,
+    completion_edit_range_defaults: bool,
     initialization_options: Option<serde_json::Value>,
 ) -> Result<(), DynError> {
     let (out_tx, out_rx) = crossbeam_channel::unbounded::<Outbound>();
@@ -438,6 +443,7 @@ fn main_loop(
 
     state.semantic_tokens_refresh = semantic_tokens_refresh;
     state.completion_data_defaults = completion_data_defaults;
+    state.completion_edit_range_defaults = completion_edit_range_defaults;
 
     // `initialize_finish` has already consumed the client's `initialized`
     // notification (lsp-server handles it inside the handshake), so the

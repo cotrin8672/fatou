@@ -65,6 +65,7 @@ pub(crate) struct ReadReply {
     cancelled: Option<Arc<AtomicBool>>,
     membership_generation: Option<u64>,
     completion_data_defaults: bool,
+    completion_edit_range_defaults: bool,
     incomplete_completion: bool,
 }
 
@@ -76,6 +77,7 @@ impl ReadReply {
             cancelled: None,
             membership_generation: None,
             completion_data_defaults: false,
+            completion_edit_range_defaults: false,
             incomplete_completion: false,
         }
     }
@@ -87,6 +89,11 @@ impl ReadReply {
 
     pub(crate) fn with_completion_data_defaults(mut self, supported: bool) -> Self {
         self.completion_data_defaults = supported;
+        self
+    }
+
+    pub(crate) fn with_completion_edit_range_defaults(mut self, supported: bool) -> Self {
+        self.completion_edit_range_defaults = supported;
         self
     }
 
@@ -113,6 +120,9 @@ impl ReadReply {
             {
                 if self.completion_data_defaults {
                     super::completion::compact_response(value);
+                }
+                if self.completion_edit_range_defaults {
+                    super::completion::compact_response_edit_range(value);
                 }
                 if self.incomplete_completion {
                     // Compaction may already have created a list with defaults.
@@ -411,6 +421,20 @@ impl ReadJob {
     pub(crate) fn with_membership_generation(mut self, generation: u64) -> Self {
         if self.produces_edits() {
             self.sender_mut().membership_generation = Some(generation);
+        }
+        self
+    }
+
+    pub(crate) fn with_pending_library_completion(mut self, pending: bool) -> Self {
+        if pending
+            && let Self::Completion {
+                trigger, sender, ..
+            } = &mut self
+            && !matches!(trigger, CompletionTrigger::Path)
+        {
+            // Clients should request a fresh list on more input if reachable
+            // names are still being indexed. A bare array would mean complete.
+            sender.incomplete_completion = true;
         }
         self
     }
@@ -1160,6 +1184,19 @@ fn run_read_single(
                     completion_via_db(&snapshot, &path, &text, position, encoding)
                 }
             };
+            if sender.captured.is_none()
+                && sender.completion_edit_range_defaults
+                && let Some(packed) = super::completion::compact_items_edit_range(
+                    &mut items,
+                    sender.completion_data_defaults,
+                )
+            {
+                let _ = sender.send(Message::Response(Response {
+                    id,
+                    response_result: Ok(packed),
+                }));
+                return;
+            }
             if sender.captured.is_none()
                 && sender.completion_data_defaults
                 && let Some(packed) = super::completion::compact_items(&mut items)

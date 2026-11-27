@@ -214,8 +214,8 @@ impl SemanticModel {
         let mut cursor = Some(scope);
         while let Some(id) = cursor {
             let scope = self.scope(id);
-            if let Some(binding) = scope.bindings.iter().rev().copied().find(|&id| {
-                let binding = self.binding(id);
+            if let Some(binding) = scope.bindings.iter().rev().copied().find(|&candidate| {
+                let binding = self.binding(candidate);
                 if is_macro {
                     match binding.kind {
                         BindingKind::Macro => binding.name == name,
@@ -223,7 +223,8 @@ impl SemanticModel {
                         _ => false,
                     }
                 } else {
-                    binding.name == name
+                    (binding.kind != BindingKind::Field || binding.scope != id)
+                        && binding.name == name
                 }
             }) {
                 return Some(binding);
@@ -291,7 +292,11 @@ impl SemanticModel {
         while let Some(id) = cursor {
             let scope = self.scope(id);
             for &b in scope.bindings.iter().rev() {
-                let name = &self.binding(b).name;
+                let binding = self.binding(b);
+                if binding.kind == BindingKind::Field && binding.scope == id {
+                    continue;
+                }
+                let name = &binding.name;
                 if !seen.contains(&name) {
                     seen.push(name);
                     out.push(b);
@@ -1272,6 +1277,66 @@ end",
         assert_eq!(scope_kind_of(&m, "x"), ScopeKind::Struct);
         assert!(m.binding(find(&m, "T")).read, "supertype and field read T");
         assert_eq!(free_read_names(&m), ["Real", "Bar"]);
+    }
+
+    #[test]
+    fn field_names_do_not_shadow_types_modules_or_kwdef_defaults() {
+        let m = model_of(
+            "module Lib; const T = Int; end\nBase.@kwdef struct S\n Lib::Lib.T = Lib.T(1)\nend",
+        );
+        let module = m
+            .bindings()
+            .iter()
+            .position(|b| b.name == "Lib" && b.kind == BindingKind::Module)
+            .unwrap();
+        let field = m
+            .bindings()
+            .iter()
+            .position(|b| b.name == "Lib" && b.kind == BindingKind::Field)
+            .unwrap();
+        let module = BindingId(module as u32);
+        let field = BindingId(field as u32);
+        let receives = m
+            .idents()
+            .iter()
+            .filter(|ident| ident.name == "Lib" && ident.access == Access::Read)
+            .collect::<Vec<_>>();
+        assert_eq!(receives.len(), 2);
+        assert!(receives.iter().all(|ident| ident.binding == Some(module)));
+        assert!(!m.binding(field).def_range.is_empty());
+        assert!(
+            m.names_in_scope_at(receives[0].range.start())
+                .contains(&module)
+        );
+        assert!(
+            !m.names_in_scope_at(receives[0].range.start())
+                .contains(&field)
+        );
+    }
+
+    #[test]
+    fn kwdef_prior_fields_are_visible_only_in_defaults() {
+        let m = model_of("const a = Int\nBase.@kwdef struct S\n a = 1\n b::a = a\nend");
+        let a = m
+            .bindings()
+            .iter()
+            .position(|b| b.name == "a" && b.kind == BindingKind::Const)
+            .unwrap();
+        let field = m
+            .bindings()
+            .iter()
+            .position(|b| b.name == "a" && b.kind == BindingKind::Field)
+            .unwrap();
+        let reads = m
+            .idents()
+            .iter()
+            .filter(|id| id.name == "a" && id.access == Access::Read)
+            .map(|id| id.binding)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reads,
+            [Some(BindingId(a as u32)), Some(BindingId(field as u32))]
+        );
     }
 
     #[test]

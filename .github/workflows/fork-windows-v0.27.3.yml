@@ -1,0 +1,159 @@
+name: Publish Fatou v0.27.3 for Windows
+on:
+  push:
+    branches: [release/windows-v0.27.3]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fatou-fork-v0.27.3
+  cancel-in-progress: true
+jobs:
+  windows-x64:
+    if: github.repository == 'cotrin8672/fatou' && github.ref == 'refs/heads/release/windows-v0.27.3'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    outputs:
+      asset_sha256: ${{ steps.build.outputs.asset_sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build and run the hermetic Rust and Windows network tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((git rev-parse HEAD) -ne $env:GITHUB_SHA) { throw 'Release source mismatch' }
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup target add --toolchain 1.100.0 x86_64-pc-windows-msvc
+          cargo +1.100.0 test --locked --workspace
+          cargo +1.100.0 build --locked --release --target x86_64-pc-windows-msvc -p fatou --bin fatou
+          ./scripts/windows-network-smoke.ps1 -Fatou 'target/x86_64-pc-windows-msvc/release/fatou.exe'
+      - name: Install Julia 1.13.4 for the real-package regression
+        uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9
+        with:
+          version: '1.13.4'
+          arch: x64
+      - name: Verify real Julia projects and package the release
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:JULIA_PKG_PRECOMPILE_AUTO = '0'
+          $env:JULIA_DEPOT_PATH = Join-Path $env:RUNNER_TEMP 'fatou-real-package-depot'
+          $env:JULIA_BINDIR = & julia --startup-file=no -e 'print(Sys.BINDIR)'
+          $fixture = Join-Path $env:RUNNER_TEMP 'fatou-real-package-project'
+          New-Item -ItemType Directory -Path $fixture | Out-Null
+          Copy-Item -LiteralPath ./scripts/fixtures/release-completion/Project.toml,./scripts/fixtures/release-completion/Manifest.toml -Destination $fixture
+          julia --startup-file=no "--project=$fixture" -e 'using Pkg; Pkg.instantiate()'
+          node ./scripts/completion-release-smoke.mjs 'target/x86_64-pc-windows-msvc/release/fatou.exe' $fixture
+          julia --startup-file=no ./examples/compiler-inlay/test_bridge.jl
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          $env:PYTHONUTF8 = '1'
+          $reports = @()
+          foreach ($name in @('callers', 'any', 'bottom', 'optional')) {
+            $report = Join-Path $env:RUNNER_TEMP "fatou-inlay-$name.json"
+            julia --startup-file=no ./examples/compiler-inlay/demo.jl $name | Set-Content -LiteralPath $report -Encoding utf8
+            $reports += $report
+          }
+          python ./examples/compiler-inlay/test_lsp.py 'target/x86_64-pc-windows-msvc/release/fatou.exe' @reports
+          New-Item -ItemType Directory -Path dist | Out-Null
+          New-Item -ItemType Directory -Path dist/examples/compiler-inlay | Out-Null
+          foreach ($file in @('README.md', 'bridge.jl', 'demo.jl', 'fixture.jl', 'nvim.lua')) {
+            Copy-Item -LiteralPath "examples/compiler-inlay/$file" -Destination dist/examples/compiler-inlay
+          }
+          Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/fatou.exe' -Destination dist
+          Copy-Item -LiteralPath LICENSE,README.md -Destination dist
+          Compress-Archive -Path dist/* -DestinationPath fatou-windows-x64.zip
+          Expand-Archive -LiteralPath fatou-windows-x64.zip -DestinationPath smoke
+          $version = & './smoke/fatou.exe' --version
+          if ($version -ne 'fatou 0.27.3') { throw "Unexpected executable version: $version" }
+          if ((Get-FileHash './smoke/fatou.exe').Hash -ne (Get-FileHash './dist/fatou.exe').Hash) { throw 'ZIP verification failed' }
+          $assetHash = (Get-FileHash ./fatou-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "Windows asset SHA-256: $assetHash"
+          "asset_sha256=$assetHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fatou-windows-x64
+          path: fatou-windows-x64.zip
+          if-no-files-found: error
+
+  publish:
+    needs: windows-x64
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: fatou-windows-x64
+      - name: Publish the verified Windows build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA256: ${{ needs.windows-x64.outputs.asset_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'Missing expected ZIP hash' }
+          if ((Get-FileHash ./fatou-windows-x64.zip -Algorithm SHA256).Hash -ne $env:EXPECTED_SHA256) { throw 'Build artifact mismatch' }
+          $existingTag = gh api repos/cotrin8672/fatou/git/matching-refs/tags/v0.27.3 --jq '.[] | select(.ref == "refs/tags/v0.27.3") | .object.sha'
+          if ($existingTag) { throw 'Tag v0.27.3 already exists; refusing to attach a build to an unchecked ref' }
+          gh release create v0.27.3 ./fatou-windows-x64.zip --repo cotrin8672/fatou --target "$env:GITHUB_SHA" --latest --title 'Fatou v0.27.3 (Windows x64)' --notes 'Prebuilt Fatou for Windows x64. Completion fixes for Base startup, project dependencies, module imports, typed fields, and keyword arguments. Also adds faster range formatting, smaller compatible completion replies, and opt-in Julia compiler inlay hints. Keeps the v0.27.2 path and UNC fixes.'
+          $publishedCommit = gh api repos/cotrin8672/fatou/git/ref/tags/v0.27.3 --jq '.object.sha'
+          if ($publishedCommit -ne $env:GITHUB_SHA) { throw "Release tag points to $publishedCommit, not $env:GITHUB_SHA" }
+          gh release view v0.27.3 --repo cotrin8672/fatou --json tagName,isDraft,isPrerelease,assets,url
+
+  verify-public-windows-install:
+    needs: [windows-x64, publish]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Verify public ZIP and run Fatou with mise
+        shell: pwsh
+        env:
+          EXPECTED_SHA256: ${{ needs.windows-x64.outputs.asset_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $scratch = Join-Path $env:RUNNER_TEMP 'fatou-public-install-check'
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          Set-Location $scratch
+          curl.exe --fail --silent --show-error --location --retry 5 --retry-all-errors --max-time 180 --output fatou-windows-x64.zip https://github.com/cotrin8672/fatou/releases/download/v0.27.3/fatou-windows-x64.zip
+          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'Missing expected ZIP hash' }
+          if ((Get-FileHash ./fatou-windows-x64.zip -Algorithm SHA256).Hash -ne $env:EXPECTED_SHA256) { throw 'Public ZIP mismatch' }
+          Expand-Archive -LiteralPath ./fatou-windows-x64.zip -DestinationPath public-fatou-zip
+          $publicExeHash = (Get-FileHash ./public-fatou-zip/fatou.exe -Algorithm SHA256).Hash
+          curl.exe --fail --silent --show-error --location --retry 3 --max-time 180 --output mise.zip https://github.com/jdx/mise/releases/download/v2026.11.12/mise-v2026.11.12-windows-x64.zip
+          if ((Get-FileHash ./mise.zip -Algorithm SHA256).Hash -ne '706fecc47fba7e4da63f59dccd3262502c59e4699035548f1113df95fcfca96e') { throw 'Pinned mise ZIP mismatch' }
+          Expand-Archive -LiteralPath ./mise.zip -DestinationPath mise-cli
+          $mise = @(Get-ChildItem ./mise-cli -Filter mise.exe -File -Recurse)
+          if ($mise.Count -ne 1) { throw 'Expected one mise.exe in the official ZIP' }
+          $misePath = $mise[0].FullName
+          $env:MISE_DATA_DIR = Join-Path $scratch 'data'
+          $env:MISE_CACHE_DIR = Join-Path $scratch 'cache'
+          $env:MISE_CONFIG_DIR = Join-Path $scratch 'config'
+          $env:MISE_STATE_DIR = Join-Path $scratch 'state'
+          & $misePath --version
+          $PSNativeCommandUseErrorActionPreference = $false
+          $reported = & $misePath exec 'github:cotrin8672/fatou@0.27.3' -- fatou --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Normal exact request failed; checking direct GitHub with an isolated mise cache.'
+            $env:MISE_USE_VERSIONS_HOST = 'false'
+            $env:MISE_CACHE_DIR = Join-Path $scratch 'direct-cache'
+            $PSNativeCommandUseErrorActionPreference = $true
+            $reported = & $misePath exec 'github:cotrin8672/fatou@0.27.3' -- fatou --version
+          }
+          if ($LASTEXITCODE -ne 0 -or $reported -ne 'fatou 0.27.3') { throw "Unexpected mise-installed FATOU version: $reported" }
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installedExe = @(& $misePath exec 'github:cotrin8672/fatou@0.27.3' -- where.exe fatou)
+          $root = [IO.Path]::GetFullPath($env:MISE_DATA_DIR) + [IO.Path]::DirectorySeparatorChar
+          if ($installedExe.Count -eq 0 -or -not $installedExe[0].StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw 'mise did not select an isolated install' }
+          if ((Get-FileHash -LiteralPath $installedExe[0] -Algorithm SHA256).Hash -ne $publicExeHash) { throw 'mise-installed executable does not match public ZIP' }
+          Write-Output "mise exact version and executable hash verified: $reported"

@@ -246,6 +246,7 @@ mod tests {
         pkg.root.usings = usings
             .iter()
             .map(|components| ModuleUsing {
+                reexport: false,
                 leading_dots: 0,
                 components: components.iter().map(|c| c.to_string()).collect(),
             })

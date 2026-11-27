@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.27.3 (fork)
+
+- Improve Base completion during initialization and report incomplete startup lists.
+- Improve dependency and module-member completion, typed fields, and keyword arguments.
+- Add opt-in Julia compiler type hints for explicitly imported, source-verified snapshots, including Any and inferred returns.
+- Reduce work during range formatting; compact shared completion edit ranges when the client supports them.
+- Add regression coverage against installed Julia packages and keep the Windows network-path tests.
+
 ## [0.27.0](https://github.com/jolars/fatou/compare/v0.26.1...v0.27.0) (2026-11-18)
 
 ### Features

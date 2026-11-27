@@ -46,6 +46,7 @@ use crate::parser::Edit;
 use crate::text::{PositionEncoding, TextBuffer, apply_content_changes};
 
 use super::analysis_thread::{AnalysisRequest, SyncMessage};
+use super::compiler_hints;
 use super::config::{ConfigStore, ResolvedConfig};
 use super::read_jobs::{ReadJob, ReadReply};
 use super::uri;
@@ -207,6 +208,11 @@ pub(crate) struct GlobalState {
     metadata_signatures: HashMap<PathBuf, crate::parse_context::MetadataSignature>,
     project_updates: Option<super::project_updates::ProjectUpdates>,
     documents: HashMap<Uri, Document>,
+    /// Compiler snapshots are explicitly imported by the editor and never run
+    /// code. One report and one outstanding import ticket per connection.
+    compiler_hints: Option<compiler_hints::ImportedHints>,
+    compiler_ticket: Option<(Uri, i32, String)>,
+    compiler_ticket_seq: u64,
     sender: Sender<Message>,
     /// The analysis thread's outbound channel, cloned into every dispatched
     /// [`ReadReply`] so a finished read job routes back here for version-gating
@@ -244,6 +250,7 @@ pub(crate) struct GlobalState {
     /// beside a UUID until the user happens to edit or scroll it.
     inlay_hint_refresh: bool,
     pub(crate) completion_data_defaults: bool,
+    pub(crate) completion_edit_range_defaults: bool,
     pub(crate) semantic_tokens_refresh: bool,
     /// Sequence number for server-to-client refresh requests, so each carries
     /// a fresh JSON-RPC id.
@@ -301,6 +308,9 @@ impl GlobalState {
             metadata_signatures: HashMap::new(),
             project_updates: None,
             documents: HashMap::new(),
+            compiler_hints: None,
+            compiler_ticket: None,
+            compiler_ticket_seq: 0,
             parse_diags: HashMap::new(),
             graph_diags: HashMap::new(),
             graph_versions: HashMap::new(),
@@ -317,6 +327,7 @@ impl GlobalState {
             inlay_hint_refresh,
             semantic_tokens_refresh: false,
             completion_data_defaults: false,
+            completion_edit_range_defaults: false,
             refresh_seq: 0,
             config,
         };
@@ -335,6 +346,12 @@ impl GlobalState {
             FoldingRangeRequest::METHOD => self.on_folding_ranges(req),
             DocumentLinkRequest::METHOD => self.on_document_links(req),
             InlayHintRequest::METHOD => self.on_inlay_hints(req),
+            compiler_hints::TARGET => self.on_compiler_hints_target(req),
+            compiler_hints::IMPORT => self.on_compiler_hints_import(req),
+            compiler_hints::CLEAR => {
+                self.clear_compiler_hints();
+                self.respond_ok(req.id, serde_json::Value::Null);
+            }
             SelectionRangeRequest::METHOD => self.on_selection_ranges(req),
             SemanticTokensFullRequest::METHOD => self.on_semantic_tokens_full(req),
             SemanticTokensFullDeltaRequest::METHOD => self.on_semantic_tokens_full_delta(req),
@@ -604,6 +621,80 @@ impl GlobalState {
     /// versions beside compat bounds. A Julia document answers an empty list
     /// rather than `null` — the capability is advertised globally, and an empty
     /// list is the honest answer to "what hints does this file have".
+    fn on_compiler_hints_target(&mut self, req: Request) {
+        let id = req.id.clone();
+        let Ok((_, target)) = req.extract::<compiler_hints::Target>(compiler_hints::TARGET) else {
+            self.respond_err(id, "invalid compiler hints target");
+            return;
+        };
+        let Some(doc) = self
+            .documents
+            .get(&target.uri)
+            .filter(|doc| doc.kind == DocumentKind::Julia && uri::to_path(&target.uri).is_some())
+        else {
+            self.respond_err(id, "compiler hints target is not an open Julia file");
+            return;
+        };
+        let version = doc.version;
+        self.compiler_ticket_seq += 1;
+        let ticket = self.compiler_ticket_seq.to_string();
+        self.compiler_ticket = Some((target.uri, version, ticket.clone()));
+        self.respond_ok(
+            id,
+            serde_json::json!({"version": version, "ticket": ticket}),
+        );
+    }
+
+    fn on_compiler_hints_import(&mut self, req: Request) {
+        let id = req.id.clone();
+        let Ok((_, params)) = req.extract::<compiler_hints::Import>(compiler_hints::IMPORT) else {
+            self.respond_err(id, "invalid compiler hints import");
+            return;
+        };
+        if !self
+            .compiler_ticket
+            .as_ref()
+            .is_some_and(|(uri, version, ticket)| {
+                *uri == params.uri && *version == params.version && *ticket == params.ticket
+            })
+        {
+            self.respond_err(id, "expired compiler hints import ticket");
+            return;
+        }
+        self.compiler_ticket = None; // one-use, bound to this already-open document
+        let Some(doc) = self
+            .documents
+            .get(&params.uri)
+            .filter(|doc| doc.kind == DocumentKind::Julia && doc.version == params.version)
+        else {
+            self.respond_err(id, "compiler hints target version is stale");
+            return;
+        };
+        let result = compiler_hints::ImportedHints::validate(
+            params.uri,
+            params.version,
+            params.snapshot,
+            &doc.text,
+            self.encoding,
+        );
+        match result {
+            Ok(snapshot) => {
+                let count = snapshot.len();
+                self.compiler_hints = Some(snapshot);
+                self.respond_ok(id, serde_json::json!({"imported": count}));
+                self.send_inlay_hint_refresh();
+            }
+            Err(err) => self.respond_err(id, err),
+        }
+    }
+
+    fn clear_compiler_hints(&mut self) {
+        self.compiler_ticket = None;
+        if self.compiler_hints.take().is_some() {
+            self.send_inlay_hint_refresh();
+        }
+    }
+
     fn on_inlay_hints(&mut self, req: Request) {
         let id = req.id.clone();
         let Ok((_, params)) = req.extract::<InlayHintParams>(InlayHintRequest::METHOD) else {
@@ -612,7 +703,18 @@ impl GlobalState {
         };
         let uri = params.text_document.uri;
         let Some(text) = self.project_text(&uri) else {
-            self.respond_ok(id, serde_json::json!([]));
+            let hints = self
+                .compiler_hints
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot.uri == uri
+                        && self.documents.get(&uri).is_some_and(|doc| {
+                            doc.kind == DocumentKind::Julia && doc.version == snapshot.version
+                        })
+                })
+                .map(|snapshot| snapshot.in_range(params.range).collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.respond_ok(id, serde_json::json!(hints));
             return;
         };
         let reply = self.read_reply(id.clone(), Some(&uri));
@@ -728,6 +830,7 @@ impl GlobalState {
             trigger,
             sender: reply
                 .with_completion_data_defaults(self.completion_data_defaults)
+                .with_completion_edit_range_defaults(self.completion_edit_range_defaults)
                 .with_incomplete_completion(incomplete),
         });
     }
@@ -1177,6 +1280,17 @@ impl GlobalState {
     }
 
     pub(crate) fn on_notification(&mut self, note: Notification) {
+        if matches!(
+            note.method.as_str(),
+            DidChangeTextDocument::METHOD
+                | DidCloseTextDocument::METHOD
+                | DidChangeWatchedFiles::METHOD
+                | DidRenameFiles::METHOD
+                | DidChangeConfiguration::METHOD
+                | "workspace/didChangeWorkspaceFolders"
+        ) {
+            self.clear_compiler_hints();
+        }
         match note.method.as_str() {
             Cancel::METHOD => {
                 if let Ok(params) = note.extract::<CancelParams>(Cancel::METHOD) {
@@ -1188,6 +1302,9 @@ impl GlobalState {
                     note.extract::<DidOpenTextDocumentParams>(DidOpenTextDocument::METHOD)
                 {
                     let uri = params.text_document.uri;
+                    if self.documents.contains_key(&uri) {
+                        self.clear_compiler_hints();
+                    }
                     let kind = DocumentKind::of(&uri);
                     if kind == DocumentKind::Julia {
                         self.rewrite_epoch += 1;
@@ -1249,6 +1366,7 @@ impl GlobalState {
                     note.extract::<DidSaveTextDocumentParams>(DidSaveTextDocument::METHOD)
                     && let Some(path) = uri::to_path(&params.text_document.uri)
                 {
+                    self.clear_compiler_hints();
                     if is_environment_file(&path) {
                         self.send_disk_change(SyncMessage::RefreshLibrary);
                     } else {

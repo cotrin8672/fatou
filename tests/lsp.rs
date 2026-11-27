@@ -54,6 +54,19 @@ impl ResponseResultExt for lsp_server::Response {
     }
 }
 
+fn completion_items(value: serde_json::Value) -> Vec<CompletionItem> {
+    match serde_json::from_value(value).expect("valid LSP completion response") {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => items_with_defaults(list),
+    }
+}
+
+fn items_with_defaults(list: lsp_types::CompletionList) -> Vec<CompletionItem> {
+    // These tests inspect names or explicit per-item edits, and don't
+    // advertise shared edit ranges. Accept the standard List shape too.
+    list.items
+}
+
 /// A `file:` URI on a platform-native absolute path: `native_file_uri("/work/a.jl")`
 /// is `file:///work/a.jl` on Unix and `file:///C:/work/a.jl` on Windows. A
 /// driveless `/work` path is not absolute on Windows, so the server's lexical
@@ -3901,8 +3914,7 @@ fn static_include_completes_only_julia_files_and_directories() {
             }))
             .unwrap();
         let response = recv_response(&client, id);
-        let items =
-            serde_json::from_value::<Vec<CompletionItem>>(response.result().unwrap()).unwrap();
+        let items = completion_items(response.result().unwrap());
         let labels = items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>();
         assert_eq!(labels, expected, "{body}");
         if let Some(item) = items.first() {
@@ -3982,7 +3994,7 @@ fn declaration_name_completion_preserves_the_neighboring_reference_slots() {
             .unwrap();
         let response = recv_response(&client, id);
         let result = response.result().expect("completion result");
-        let items = serde_json::from_value::<Vec<CompletionItem>>(result).unwrap();
+        let items = completion_items(result);
         if suppressed {
             assert!(items.is_empty(), "{body}: {items:?}");
         } else {
@@ -4055,7 +4067,7 @@ fn import_completion_triggers_are_contextual_and_do_not_require_a_depot() {
             }))
             .unwrap();
         let response = recv_response(&client, RequestId::from(id));
-        serde_json::from_value::<Vec<CompletionItem>>(response.result().unwrap()).unwrap()
+        completion_items(response.result().unwrap())
     };
     let bare = complete(20, 2, 6, Some(" "));
     assert!(bare.iter().any(|item| item.label == "GhostPkg"), "{bare:?}");
@@ -4147,7 +4159,7 @@ fn keyword_completion_punctuation_triggers_are_contextual() {
             }))
             .unwrap();
         let response = recv_response(&client, id);
-        serde_json::from_value::<Vec<CompletionItem>>(response.result().unwrap()).unwrap()
+        completion_items(response.result().unwrap())
     };
     // Ensure the live source reached analysis before asserting a trigger reply.
     assert!(
@@ -9434,7 +9446,7 @@ fn assert_external_environment_refresh(nested: bool) {
             {
                 return response
                     .result()
-                    .and_then(|value| serde_json::from_value::<Vec<CompletionItem>>(value).ok())
+                    .map(completion_items)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|item| item.label)

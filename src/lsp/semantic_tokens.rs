@@ -746,6 +746,8 @@ mod tests {
             kind: TypeKind::Struct { mutable: false },
             type_params: Vec::new(),
             supertype: None,
+            keyword_constructor: false,
+            constructor_shape: false,
             fields: Vec::new(),
             doc: None,
             loc: loc(),

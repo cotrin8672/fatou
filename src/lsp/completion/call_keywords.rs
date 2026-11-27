@@ -8,9 +8,11 @@ use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::ast::{AstNode, AstToken, CallExpr, Expr, HasArgList, KeywordArg, Parameters};
-use crate::index::{Method, PackageIndex, Param, harvest::extract_params};
+use crate::index::{PackageIndex, Param, harvest::extract_params};
 use crate::parser::{is_ident_continue, is_ident_start};
-use crate::resolve::{ModulePath, Namespace, PackageSource, Resolution, Resolver, module_at};
+use crate::resolve::{
+    ModulePath, Namespace, PackageSource, QualifiedMember, Resolution, Resolver, module_at,
+};
 use crate::semantic::{Access, BindingId, BindingKind, SemanticModel};
 use crate::syntax::{SyntaxKind, SyntaxNode};
 use crate::text::{LineIndex, PositionEncoding};
@@ -164,15 +166,36 @@ impl Site {
                 }
                 Resolution::Binding(id) if model.binding(id).kind == BindingKind::Import => {
                     let (path, name) = explicit_import(model, id)?;
-                    indexed_keywords(packages, workspace, &path, &name, argc)?
+                    indexed_keywords(&resolver, packages, workspace, &path, &name, argc)?
                 }
                 Resolution::System { module, name } | Resolution::Using { module, name } => {
                     let path = module.split('.').map(SmolStr::new).collect::<Vec<_>>();
-                    indexed_keywords(packages, workspace, &path, &name, argc)?
+                    indexed_keywords(&resolver, packages, workspace, &path, &name, argc)?
                 }
                 Resolution::Workspace { mut module, name } => {
                     module.insert(0, SmolStr::new(&workspace?.0.name));
-                    indexed_keywords(packages, workspace, &module, &name, argc)?
+                    indexed_keywords(&resolver, packages, workspace, &module, &name, argc)?
+                }
+                Resolution::Binding(id) if model.binding(id).kind == BindingKind::Type => {
+                    let offset = model.binding(id).def_range.start();
+                    let live = crate::index::harvest_tree(root);
+                    let module =
+                        module_at(&live, &model.enclosing_module_path(model.binding(id).scope))?;
+                    let is_current = module
+                        .types
+                        .iter()
+                        .any(|ty| ty.name == name && ty.loc.range.start == u32::from(offset));
+                    if !is_current {
+                        return None;
+                    }
+                    names_for_indexed_definition(module, name, argc)?
+                }
+                Resolution::WorkspaceImport { name } => {
+                    let (package, host) = workspace?;
+                    let mut module = vec![SmolStr::new(&package.name)];
+                    module.extend(host.iter().cloned());
+                    module.extend(model.enclosing_module_path(model.scope_at(offset)));
+                    indexed_keywords(&resolver, packages, workspace, &module, &name, argc)?
                 }
                 _ => return None,
             }
@@ -191,7 +214,7 @@ impl Site {
                 return None;
             }
             let path = resolver.module_receiver_path(receiver, offset, Some(offset))?;
-            indexed_keywords(packages, workspace, &path, name, argc)?
+            indexed_keywords(&resolver, packages, workspace, &path, name, argc)?
         };
         let range = lsp_types::Range::new(
             lines.byte_to_position(self.edit.start().into(), encoding),
@@ -271,7 +294,10 @@ fn local_keywords(
 }
 
 /// The resolver has already identified the exact in-file import binding.
-fn explicit_import(model: &SemanticModel, id: BindingId) -> Option<(ModulePath, SmolStr)> {
+pub(super) fn explicit_import(
+    model: &SemanticModel,
+    id: BindingId,
+) -> Option<(ModulePath, SmolStr)> {
     let binding = model.binding(id);
     if model
         .occurrences(id)
@@ -300,36 +326,91 @@ fn explicit_import(model: &SemanticModel, id: BindingId) -> Option<(ModulePath, 
 }
 
 fn indexed_keywords<P: PackageSource>(
+    resolver: &Resolver<'_, P>,
     packages: &P,
     workspace: Option<&(Arc<PackageIndex>, ModulePath)>,
     path: &[SmolStr],
     name: &str,
     argc: usize,
 ) -> Option<Vec<String>> {
+    // Follow re-export / selected import identity to the owner, but never
+    // assume that a same-spelled indexed package head is a bound receiver.
+    let (path, name) = match resolver.qualified_member_origin(path, name) {
+        Some(QualifiedMember::Symbol { module, name, .. }) => (module, name),
+        Some(QualifiedMember::Module(_)) => return None,
+        None => (path.to_vec(), SmolStr::new(name)),
+    };
     let (head, tail) = path.split_first()?;
     let pkg = match workspace {
         Some((pkg, _)) if pkg.name == head.as_str() => Arc::clone(pkg),
-        _ => packages.package(head)?,
+        _ => packages.environment_package(head)?,
     };
     let module = module_at(&pkg.root, tail)?;
-    if module.types.iter().any(|ty| ty.name == name)
-        || module.consts.iter().any(|value| value.name == name)
-        || workspace.is_some_and(|(ws, _)| {
-            let owner: Vec<_> = path.iter().map(SmolStr::as_str).collect();
-            !ws.root.extension_groups(&owner, name).is_empty()
-        })
-    {
+    if workspace.is_some_and(|(ws, _)| {
+        let owner: Vec<_> = path.iter().map(SmolStr::as_str).collect();
+        !ws.root.extension_groups(&owner, &name).is_empty()
+    }) {
         return None;
     }
-    let group = module
+    names_for_indexed_definition(module, &name, argc)
+}
+
+fn names_for_indexed_definition(
+    module: &crate::index::ModuleIndex,
+    name: &str,
+    argc: usize,
+) -> Option<Vec<String>> {
+    if module.consts.iter().any(|value| value.name == name) {
+        return None;
+    }
+    let ty = module.types.iter().find(|ty| ty.name == name);
+    let methods = module
         .functions
         .iter()
-        .find(|f| f.name == name && f.owner.is_none())?;
-    let [method]: &[Method] = group.methods.as_slice() else {
+        .find(|f| f.name == name && f.owner.is_none())
+        .map(|group| group.methods.as_slice())
+        .unwrap_or(&[]);
+    let candidates = methods
+        .iter()
+        .filter(|m| m.has_body && possible_arity(&m.params, argc));
+
+    // Base.@kwdef defines a zero-positional constructor with exactly its
+    // fields as keywords. An arbitrary macro or a field default is not proof.
+    if argc == 0 && ty.is_some_and(|ty| ty.keyword_constructor) {
+        return Some(ty?.fields.iter().map(|f| f.name.clone()).collect());
+    }
+    if ty.is_some_and(|ty| ty.fields.len() == argc && !ty.keyword_constructor) {
+        // The default positional field constructor can be relevant; we
+        // cannot prove it accepts additional keywords.
         return None;
-    };
-    (method.has_body && !method.is_generated && accepts_arity(&method.params, argc))
-        .then(|| explicit_names(&method.keyword_params))
+    }
+    let mut shared: Option<Vec<String>> = None;
+    for m in candidates {
+        // Hidden/generated signatures can change which keywords are valid.
+        if m.is_generated || m.params.iter().any(|p| p.is_opaque) {
+            return None;
+        }
+        let names = explicit_names(&m.keyword_params);
+        match &mut shared {
+            Some(shared) => shared.retain(|name| names.contains(name)),
+            None => shared = Some(names),
+        }
+    }
+    // Without argument-type inference, only propose names common to every
+    // arity-compatible method. Keep the normal menu when that set is empty.
+    shared.filter(|names| !names.is_empty())
+}
+
+fn possible_arity(params: &[Param], count: usize) -> bool {
+    if params.iter().any(|p| p.is_opaque) {
+        return true;
+    }
+    if let Some((last, fixed)) = params.split_last()
+        && last.is_vararg
+    {
+        return count >= fixed.len() || fixed[count..].iter().all(|p| p.default.is_some());
+    }
+    accepts_arity(params, count)
 }
 
 fn accepts_arity(params: &[Param], count: usize) -> bool {
@@ -511,5 +592,56 @@ mod tests {
             assert_eq!(keywords(&at_with(code, &lib).0), ["safe_mode="], "{code}");
         }
         assert!(keywords(&at_with("let Tools=outer; Tools.runtool(1; |); end", &lib).0).is_empty());
+    }
+    #[test]
+    fn overlapping_overloads_and_statically_known_keyword_constructors() {
+        let cst = crate::parser::parse(
+            "export KDTree, Session, mixed\nstruct KDTree; a; b; c; end\nKDTree(x::AbstractMatrix; leafsize=20, sort=false)=KDTree(x,1,2)\nKDTree(x::AbstractVector, metric=identity; leafsize=20, mutable_data=false)=KDTree(x,1,2)\nBase.@kwdef struct Session\n options::Int=0\n id::Int\nend\nmixed(x::A; alpha=1)=x\nmixed(x::B; beta=2)=x"
+        ).cst;
+        let mut root = crate::index::harvest_tree(&cst);
+        root.name = "Tools".into();
+        let pkg = PackageIndex {
+            name: "Tools".into(),
+            root,
+            members: Vec::new(),
+            member_modules: Default::default(),
+            diagnostics: Vec::new(),
+        };
+        let lib = BTreeMap::from([("Tools".to_string(), Arc::new(pkg))]);
+        for (code, names) in [
+            (
+                "using Tools; KDTree(pts; leaf|size = 10)",
+                vec!["leafsize="],
+            ),
+            (
+                "using Tools: KDTree; KDTree(pts; leafs| = 10)",
+                vec!["leafsize="],
+            ),
+            ("import Tools; Tools.KDTree(pts; |)", vec!["leafsize="]),
+            (
+                "using Tools; KDTree(pts, metric; |)",
+                vec!["leafsize=", "mutable_data="],
+            ),
+            ("using Tools; mixed(thing; |)", vec![]),
+            (
+                "import Tools; Tools.Session(; opti|ons=0)",
+                vec!["options=", "id="],
+            ),
+            (
+                "using Tools: Session; Session(; |)",
+                vec!["options=", "id="],
+            ),
+            ("Tools.Session(; |)", vec![]),
+            ("let Tools = something; Tools.Session(; |); end", vec![]),
+        ] {
+            let (actual, source) = at_with(code, &lib);
+            assert_eq!(keywords(&actual), names, "{code}");
+            if code.contains("leaf|size") || code.contains("leafs|") {
+                assert!(
+                    apply(&source, &actual[0]).contains("leafsize = 10"),
+                    "{code}"
+                );
+            }
+        }
     }
 }

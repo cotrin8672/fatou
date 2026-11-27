@@ -606,21 +606,7 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                             load.scope == binding.scope
                                 && load.range.contains_range(binding.def_range)
                         })?;
-                        if load.path.leading_dots != 0 {
-                            return None;
-                        }
-                        let mut path = load.path.components.clone();
-                        if let Some(items) = &load.items {
-                            let item = items.iter().find(|item| {
-                                item.range.contains_range(binding.def_range)
-                                    && item.alias.as_ref().unwrap_or(&item.name) == head
-                            })?;
-                            path.push(item.name.clone());
-                        }
-                        // A clause can import a function, type, or value rather
-                        // than a module. Confirm the target before using it.
-                        self.canonical_module_path(&path)?;
-                        path
+                        self.imported_module_binding(binding, load)?
                     }
                     _ => return None,
                 }
@@ -674,6 +660,62 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         path.extend_from_slice(tail);
         self.canonical_module_path(&path)
             .or_else(|| (!require_index).then_some(path))
+    }
+
+    fn imported_module_binding(
+        &self,
+        binding: &crate::semantic::Binding,
+        load: &crate::semantic::ModuleLoad,
+    ) -> Option<ModulePath> {
+        if load.path.leading_dots != 0 {
+            return None;
+        }
+        let mut path = load.path.components.clone();
+        if let Some(items) = &load.items {
+            let item = items.iter().find(|item| {
+                item.range.contains_range(binding.def_range)
+                    && item.alias.as_ref().unwrap_or(&item.name) == &binding.name
+            })?;
+            path.push(item.name.clone());
+        }
+        // Selective imports can also introduce ordinary values. Only an
+        // indexed or provable re-exported module can serve as a receiver.
+        self.canonical_module_path(&path)
+    }
+
+    /// The preceding file-local imports in this module that bind actual
+    /// modules. A relative load sees already-established bindings, including
+    /// aliases, but never unimported environment names or the partial clause.
+    pub(crate) fn prior_imported_modules(
+        &self,
+        scope: ScopeId,
+        before: TextSize,
+    ) -> Vec<(SmolStr, ModulePath)> {
+        let mut seen = HashSet::new();
+        self.model
+            .scope(scope)
+            .bindings
+            .iter()
+            .rev()
+            .filter_map(|id| {
+                let binding = self.model.binding(*id);
+                if binding.def_range.end() > before
+                    || !seen.insert(binding.name.clone())
+                    || binding.kind != BindingKind::Import
+                {
+                    return None;
+                }
+                let load = self.model.module_loads().iter().find(|load| {
+                    load.scope == scope
+                        && load.range.end() <= before
+                        && load.range.contains_range(binding.def_range)
+                })?;
+                Some((
+                    binding.name.clone(),
+                    self.imported_module_binding(binding, load)?,
+                ))
+            })
+            .collect()
     }
 
     fn indexed_module_at(&self, path: &[SmolStr]) -> Option<ModuleIndexHandle> {
@@ -740,6 +782,104 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         Some(current)
     }
 
+    /// Find the canonical owner of an absolute package path for import
+    /// completion. The root still has to be visible in the editor context.
+    pub(crate) fn completion_import_module(
+        &self,
+        path: &[SmolStr],
+    ) -> Option<(ModulePath, ModuleIndexHandle)> {
+        let canonical = self.canonical_module_path(path)?;
+        Some((canonical.clone(), self.environment_module_at(&canonical)?))
+    }
+
+    /// Names potentially exposed through same-module relative facades (e.g.
+    /// HTTP's Messages submodule) or an explicit Reexport.jl declaration.
+    /// Values are confirmed by qualified_member_origin before publication.
+    pub(crate) fn using_projection_names(&self, path: &[SmolStr]) -> Vec<String> {
+        const MAX_PROVIDERS: usize = 48;
+        const MAX_NAMES: usize = 2048;
+        let Some(module) = self.environment_module_at(path) else {
+            return Vec::new();
+        };
+        let mut pending = self.projection_providers(path, &module, true);
+        pending.reverse();
+        let mut visited = std::collections::HashSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        while let Some(provider) = pending.pop() {
+            if visited.len() >= MAX_PROVIDERS || names.len() >= MAX_NAMES {
+                break;
+            }
+            if !visited.insert(provider.clone()) {
+                continue;
+            }
+            let Some(opened) = self.environment_module_at(&provider) else {
+                continue;
+            };
+            for entry in opened
+                .exports
+                .iter()
+                .filter(|e| e.visibility == Visibility::Exported)
+            {
+                names.insert(entry.name.clone());
+                if names.len() >= MAX_NAMES {
+                    break;
+                }
+            }
+            // Inside a provider, only explicit reexport extends its exports;
+            // ordinary using makes a member available but does not export it.
+            pending.extend(
+                self.projection_providers(&provider, &opened, false)
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        names.into_iter().collect()
+    }
+
+    fn projection_providers(
+        &self,
+        path: &[SmolStr],
+        module: &ModuleIndex,
+        include_relative: bool,
+    ) -> Vec<ModulePath> {
+        module
+            .usings
+            .iter()
+            .filter(|clause| clause.reexport || (include_relative && clause.leading_dots > 0))
+            .filter_map(|clause| {
+                let target = import_target(path, clause.leading_dots, &clause.components)?;
+                self.verify_import_root(path, &target)?;
+                self.environment_module_at(&target)?;
+                Some(target)
+            })
+            .collect()
+    }
+
+    fn effectively_exports(
+        &self,
+        path: &[SmolStr],
+        module: &ModuleIndex,
+        name: &SmolStr,
+        visited: &mut Vec<ModulePath>,
+    ) -> bool {
+        if module_exports(module, name) {
+            return true;
+        }
+        if visited.len() >= 24 || visited.iter().any(|p| p == path) {
+            return false;
+        }
+        visited.push(path.to_vec());
+        let result = self
+            .projection_providers(path, module, false)
+            .iter()
+            .any(|p| {
+                self.environment_module_at(p)
+                    .is_some_and(|opened| self.effectively_exports(p, &opened, name, visited))
+            });
+        visited.pop();
+        result
+    }
+
     /// Resolve a bound/re-exported qualified symbol to its actual provider.
     /// Never infer a binding solely from an export declaration or textual alias.
     pub(crate) fn qualified_member_origin(
@@ -761,6 +901,11 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             return None;
         }
         let module = self.environment_module_at(path)?;
+        // Julia modules bind their own name (also in baremodules). Selective
+        // loads such as import Pluto: Pluto therefore refer to Pluto itself.
+        if module.name == name.as_str() {
+            return Some(QualifiedMember::Module(path.to_vec()));
+        }
         if module
             .submodules
             .iter()
@@ -805,7 +950,23 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             .iter()
             .filter(|n| *n == name.as_str())
             .count();
-        if !reexported && binding == 0 {
+        let facade = module
+            .usings
+            .iter()
+            .any(|u| u.leading_dots > 0 || u.reexport);
+        // A qualified lookup can name a binding introduced by an ordinary
+        // absolute whole-module using (HTTP.URI from using URIs). This does
+        // not add those exports to the completion menu's enumeration. Bound
+        // the new search and abstain rather than skipping potential conflicts.
+        const MAX_ABSOLUTE_USINGS: usize = 48;
+        let absolute = module
+            .usings
+            .iter()
+            .filter(|using| using.leading_dots == 0 && !using.reexport)
+            .take(MAX_ABSOLUTE_USINGS + 1)
+            .count();
+        let exact_absolute = (1..=MAX_ABSOLUTE_USINGS).contains(&absolute);
+        if !reexported && binding == 0 && !facade && !exact_absolute {
             return None;
         }
         visiting.push((path.to_vec(), name.clone()));
@@ -835,19 +996,39 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
                     add_unique_member(&mut result, origin)?;
                 }
             } else {
+                let mut eligible = reexported;
+                let mut check_implicit_systems = reexported;
                 for using in &module.usings {
-                    let target = import_target(path, using.leading_dots, &using.components)?;
-                    self.verify_import_root(path, &target)?;
-                    let provider = self.module_origin(&target, visiting)?;
-                    let opened = self.environment_module_at(&provider)?;
-                    if module_exports(&opened, name) {
+                    let Some(target) = import_target(path, using.leading_dots, &using.components)
+                    else {
+                        continue;
+                    };
+                    if self.verify_import_root(path, &target).is_none() {
+                        continue;
+                    }
+                    let Some(provider) = self.module_origin(&target, visiting) else {
+                        continue;
+                    };
+                    let Some(opened) = self.environment_module_at(&provider) else {
+                        continue;
+                    };
+                    if self.effectively_exports(&provider, &opened, name, &mut Vec::new()) {
+                        let ordinary_absolute = using.leading_dots == 0 && !using.reexport;
+                        eligible |= !ordinary_absolute || exact_absolute;
+                        check_implicit_systems |= ordinary_absolute && exact_absolute;
                         let origin = self.member_origin(&provider, name, visiting)?;
                         add_unique_member(&mut result, origin)?;
                     }
                 }
+                if !eligible {
+                    return None;
+                }
+                if !check_implicit_systems {
+                    return result;
+                }
                 // Standard modules open Core and Base; baremodule still opens
-                // Core, but not Base. Consider only this explicit re-export,
-                // and reject conflicting binding identities across open modules.
+                // Core but not Base. An exact lookup must not pick an ordinary
+                // whole using over a conflicting implicit system binding.
                 let systems: &[&str] = if module.bare {
                     &["Core"]
                 } else {
@@ -927,7 +1108,8 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
             let parameters_before = completion_scope.parameters_before(id);
             for &b in scope.bindings.iter().rev() {
                 let binding = self.model.binding(b);
-                if crate::semantic::CompletionScope::admits(binding, parameters_before)
+                if (binding.kind != BindingKind::Field || binding.scope != id)
+                    && crate::semantic::CompletionScope::admits(binding, parameters_before)
                     && let Some(name) = namespaced_binding_name(binding, namespace)
                     && seen.insert(name.clone())
                 {
@@ -1265,7 +1447,9 @@ impl<'a, P: PackageSource + ?Sized> Resolver<'a, P> {
         while let Some(id) = cursor {
             let scope = self.model.scope(id);
             let hit = scope.bindings.iter().rev().copied().find(|&b| {
-                namespaced_binding_name(self.model.binding(b), namespace).as_ref() == Some(wanted)
+                let binding = self.model.binding(b);
+                (binding.kind != BindingKind::Field || binding.scope != id)
+                    && namespaced_binding_name(binding, namespace).as_ref() == Some(wanted)
             });
             if hit.is_some() {
                 return hit;
@@ -1840,6 +2024,59 @@ mod tests {
                 name: SmolStr::new("greet"),
             }
         );
+    }
+
+    #[test]
+    fn qualified_exact_lookup_follows_unique_absolute_whole_using_without_listing_it() {
+        let m = model_of("");
+        let lib = BTreeMap::from([
+            (
+                "URIs".to_string(),
+                harvested_package(
+                    "URIs",
+                    "export URI, Both, SystemClash\nstruct URI\n    path::String\nend\nconst Both = 1\nconst SystemClash = 1\nconst private = 2\n",
+                ),
+            ),
+            (
+                "Other".to_string(),
+                harvested_package("Other", "export Both\nconst Both = 2\n"),
+            ),
+            (
+                "HTTP".to_string(),
+                harvested_package("HTTP", "using URIs, Other\nconst private = 3\n"),
+            ),
+            (
+                "Local".to_string(),
+                harvested_package("Local", "using URIs\nconst URI = 1\n"),
+            ),
+            (
+                "Base".to_string(),
+                harvested_package("Base", "export SystemClash\nconst SystemClash = 2\n"),
+            ),
+            ("Core".to_string(), harvested_package("Core", "")),
+        ]);
+        let r = Resolver::new(&m, &lib);
+        let http = [SmolStr::new("HTTP")];
+        assert_eq!(
+            r.qualified_member_origin(&http, "URI"),
+            Some(QualifiedMember::Symbol {
+                module: vec![SmolStr::new("URIs")],
+                name: SmolStr::new("URI"),
+                kind: QualifiedMemberKind::Type,
+            })
+        );
+        assert!(
+            !r.using_projection_names(&http)
+                .iter()
+                .any(|name| name == "URI")
+        );
+        assert!(r.qualified_member_origin(&http, "Both").is_none());
+        assert!(r.qualified_member_origin(&http, "SystemClash").is_none());
+        assert!(matches!(
+            r.qualified_member_origin(&[SmolStr::new("Local")], "URI"),
+            Some(QualifiedMember::Symbol { module, kind: QualifiedMemberKind::Const, .. })
+                if module == [SmolStr::new("Local")]
+        ));
     }
 
     #[test]
@@ -2435,6 +2672,7 @@ mod tests {
         pkg.root.usings = usings
             .iter()
             .map(|components| ModuleUsing {
+                reexport: false,
                 leading_dots: 0,
                 components: components.iter().map(|c| c.to_string()).collect(),
             })
@@ -2517,6 +2755,7 @@ mod tests {
         let mut pkg = (*package("MyPkg", &[])).clone();
         pkg.root.submodules.push(submodule("Sub", &[]));
         pkg.root.submodules[0].usings.push(ModuleUsing {
+            reexport: false,
             leading_dots: 0,
             components: vec!["SubDep".to_string()],
         });
