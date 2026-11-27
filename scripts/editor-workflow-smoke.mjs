@@ -143,6 +143,9 @@ try {
     capabilities: {general: {positionEncodings: ['utf-16']}},
   });
   send({method: 'initialized', params: {}});
+  await has('dagger_first_character', 'function run()\n tasks = [\n D│\n ]\nend', 'Dagger', {
+    retry: true, check: (item) => assert.match(item.additionalTextEdits?.[0]?.newText ?? '', /^import Dagger\r?\n$/),
+  });
   await has('dagger_module', 'module Audit\nrun() = [\n Dag│\n]\n@assert only(run()) === Dagger\nend', 'Dagger', {
     retry: true, check: (item, _result, doc) => importEdit(item, doc, 'Dag', /^import Dagger\r?\n$/),
   });

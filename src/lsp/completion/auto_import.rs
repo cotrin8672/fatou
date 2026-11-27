@@ -312,10 +312,11 @@ pub(super) fn direct_module(
     let n = usize::from(offset);
     let (prefix, before) = take_ident_back(&text[..n]);
     let (head, at, macro_member) = match context_at(text, n) {
+        // Blink (and other clients) filter a complete list as the user
+        // types more letters. The very first capital letter must already
+        // include project modules, even if it is also a visible local name.
         Context::Value
-            if prefix.len() >= 2
-                && simple_import_name(prefix)
-                && prefix.as_bytes()[0].is_ascii_uppercase() =>
+            if simple_import_name(prefix) && prefix.as_bytes()[0].is_ascii_uppercase() =>
         {
             if super::declaration_names::introduces_name(root, model, offset) {
                 return;
@@ -363,9 +364,7 @@ pub(super) fn direct_module(
     // Qualified macros in a recovered tree do not always lower a separate
     // receiver occurrence. The identifier token and the qualified syntax
     // above still delimit the site; ordinary values require a real read.
-    if head.is_none()
-        && !occurrence.is_some_and(|id| id.access == Access::Read && id.binding.is_none())
-    {
+    if head.is_none() && !occurrence.is_some_and(|id| id.access == Access::Read) {
         return;
     }
     let Some(context) = snapshot.context() else {

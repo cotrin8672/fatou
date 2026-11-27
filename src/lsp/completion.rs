@@ -3066,6 +3066,20 @@ mod tests {
     }
 
     #[test]
+    fn direct_module_is_in_first_complete_list_for_client_filtering() {
+        let items = auto_import_fixture(
+            "module Tester\nfunction run()\n T = 1\n tasks = [\n T|\n ]\nend\nend\n",
+            "direct",
+        );
+        let tools = item(&items, "Tools");
+        assert_eq!(
+            tools.additional_text_edits.as_ref().unwrap()[0].new_text,
+            "import Tools\n"
+        );
+        assert!(items.iter().any(|item| item.label == "T"));
+    }
+
+    #[test]
     fn direct_dependency_qualified_macro_keeps_sigil_and_adds_import() {
         let items = auto_import_fixture(
             "module Tester\nfunction run()\n tasks = [\n Tools.@s|\n ]\nend\nend\n",
