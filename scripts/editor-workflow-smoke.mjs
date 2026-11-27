@@ -2,16 +2,17 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as pause } from 'node:timers/promises';
 
+const juliaLoadPath = ['@', '@stdlib'].join(delimiter);
 const [binary, project] = process.argv.slice(2).map(x => resolve(x));
 assert(binary && project && existsSync(join(project, 'Project.toml')));
 const root = pathToFileURL(project).href;
 const child = spawn(binary, ['--no-config', 'lsp'], {
   cwd: project,
-  env: { ...process.env, JULIA_LOAD_PATH: '@:@stdlib' },
+  env: { ...process.env, JULIA_LOAD_PATH: juliaLoadPath },
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 let nextId = 1;
@@ -173,10 +174,12 @@ try {
     },
   });
   const julia = process.env.JULIA_EXECUTABLE || 'julia';
-  const fixture = autoImportPrograms.join('\n') + '\nusing FFTW\n@assert fft([1.0, 2.0]) ≈ ComplexF64[3, -1]\n';
+  // Validate the child process environment before running the applied edits.
+  // Julia uses ';' for LOAD_PATH on Windows and ':' on Unix.
+  const fixture = '@assert Base.identify_package("Dagger") !== nothing\n' + autoImportPrograms.join('\n') + '\nusing FFTW\n@assert fft([1.0, 2.0]) ≈ ComplexF64[3, -1]\n';
   const evalResult = spawnSync(julia, ['--startup-file=no', '--compiled-modules=existing', `--project=${project}`, '-e', fixture], {
     cwd: project, encoding: 'utf8', timeout: 300_000,
-    env: {...process.env, JULIA_LOAD_PATH: '@:@stdlib'},
+    env: {...process.env, JULIA_LOAD_PATH: juliaLoadPath},
   });
   assert.equal(evalResult.status, 0, `${evalResult.error || ''}\n${evalResult.stderr}`);
   console.log('Julia accepted the actual edits, executed Dagger task and computed FFT');
